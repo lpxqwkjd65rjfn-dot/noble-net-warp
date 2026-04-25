@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v6.0 PHOENIX - DEEP TUNED EDITION)
+# VPS Global Optimization Script (v6.1 PHOENIX - HUMAN PROFILE EDITION)
 # ------------------------------------------------------------------------------
 #  - Adaptive TCP/UDP buffers (BDP-aware, scales with RAM)
 #  - Robust BBR/BBR2/BBR3 detection (no blind modprobe)
@@ -14,6 +14,12 @@
 #  - Stealth iOS noise: realistic UA pool, HTTP/3 + HTTP/2, TLS 1.3,
 #    iOS service endpoints (apple, icloud, mzstatic, push), human-like
 #    burst/idle timing, optional curl-impersonate-safari for full JA3.
+#  - RU human profile: Yandex/Mail.ru/Max.ru email + news sites with
+#    configurable session intervals (recommended OR fully custom).
+#  - Phantom APT activity: periodic apt-get update + .deb downloads of
+#    libraries and OS images that are immediately discarded — looks like
+#    a normal Ubuntu host running unattended-upgrades.
+#  - All noise parameters externalised to /etc/vps-noise.conf and editable.
 # ==============================================================================
 
 # Цвета
@@ -33,14 +39,15 @@ RPS_BOOT_SCRIPT="/usr/local/sbin/vps_rps_boot.sh"
 RPS_BOOT_SERVICE="/etc/systemd/system/vps-rps.service"
 EXP_CONF="/etc/sysctl.d/99-vps-experimental.conf"
 SYSCTL_BACKUP="/etc/sysctl.d/.99-vps-optimizer.bak"
+NOISE_CONF="/etc/vps-noise.conf"
 
 print_header() {
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "     ULTRA VPS ACCELERATOR v6.0 (PHOENIX EDITION)              "
+    echo "     ULTRA VPS ACCELERATOR v6.1 (PHOENIX / HUMAN PROFILE)      "
     echo "================================================================="
-    echo -e "  Adaptive Buffers | RPS/RFS | ZRAM | iOS Stealth | Bench"
+    echo -e "  Adaptive Buffers | RPS/RFS | ZRAM | iOS+RU Stealth | APT Phantom"
     echo -e "=================================================================${NC}"
     echo ""
 }
@@ -109,7 +116,8 @@ install_dependencies() {
     apt-get update -y
     apt-get install -y --no-install-recommends \
         curl ca-certificates ethtool iproute2 iputils-ping \
-        dnsmasq util-linux bc zram-tools jq >/dev/null 2>&1
+        dnsmasq util-linux bc zram-tools jq nano \
+        apt-utils dpkg-dev >/dev/null 2>&1
 
     # Локальный DNS-кэш (dnsmasq) — резко снижает RTT на повторные запросы
     cat > /etc/dnsmasq.d/vps-speed.conf <<EOF
@@ -134,7 +142,7 @@ EOF
 }
 
 apply_optimizations() {
-    echo -e "${YELLOW}[*] Глобальный тюнинг системы v6.0 PHOENIX...${NC}"
+    echo -e "${YELLOW}[*] Глобальный тюнинг системы v6.1 PHOENIX...${NC}"
 
     # Сохраняем оригинал, если уже был наш конфиг
     if [ -f "$SYSCTL_CONF" ] && [ ! -f "$SYSCTL_BACKUP" ]; then
@@ -379,15 +387,199 @@ DefaultLimitNPROC=infinity
 EOF
     systemctl daemon-reexec >/dev/null 2>&1 || true
 
-    echo -e "${GREEN}[+] Phoenix v6.0: BBR=${best_bbr}, qdisc=${best_qdisc}, buf_max=${buf_max}.${NC}"
+    echo -e "${GREEN}[+] Phoenix v6.1: BBR=${best_bbr}, qdisc=${best_qdisc}, buf_max=${buf_max}.${NC}"
     echo ""
     read -r -p "Нажмите Enter..."
+}
+
+#
+# ----- Конфиг шумогенератора (рекомендованные значения) -----
+#
+# Что задаём в /etc/vps-noise.conf:
+#   PROFILE             — какие домены крутить: ru | global | mixed
+#   ENABLE_IOS_BURST    — фоновые «листания» iOS Safari (apple/icloud)
+#   ENABLE_APNS         — TCP-keepalive на courier.push.apple.com:5223
+#   ENABLE_EMAIL        — заходы на почту (Яндекс/Mail.ru/Max.ru)
+#   ENABLE_NEWS         — новостные сайты + соцсети РФ
+#   ENABLE_APT_PHANTOM  — фантомные APT-загрузки (пакеты + образы ОС)
+#   *_INTERVAL_MIN/MAX  — диапазон случайной паузы между сессиями
+#   APT_PHANTOM_PACKAGES — какие .deb качать и сразу выкидывать
+#
+# Рекомендованные значения подобраны так, чтобы суточная активность
+# совпадала с поведением реального человека в РФ: ~10 проверок почты
+# в день, ~25–40 заглядываний в новости, ~1–4 «обновления системы».
+#
+write_default_noise_conf() {
+    cat > "$NOISE_CONF" <<'CONF_EOF'
+# ============================================================
+#  Конфиг VPS Noise Generator (Phoenix v6.1)
+#  Все интервалы — в МИНУТАХ. Безопасно редактируется руками,
+#  затем: systemctl restart vps-noise
+# ============================================================
+
+# Профиль доменов: ru | global | mixed
+PROFILE="ru"
+
+# --- Что включено ---
+ENABLE_IOS_BURST=1        # фон iOS Safari (apple.com / icloud.com / ...)
+ENABLE_APNS=1             # TCP-keepalive courier.push.apple.com:5223
+ENABLE_EMAIL=1            # заходы в Яндекс.Почту / Mail.ru / Max.ru
+ENABLE_NEWS=1             # новостные сайты + соцсети РФ
+ENABLE_APT_PHANTOM=1      # фантомные APT-загрузки (libs + OS images)
+
+# --- iOS бёрсты (рекомендованные: каждые 1–6 минут днём) ---
+IOS_BURST_INTERVAL_MIN=1
+IOS_BURST_INTERVAL_MAX=6
+
+# --- Email-сессии (рекомендованные: каждые 45–180 минут) ---
+# Реальный человек открывает почту 5–10 раз в день, по 1–3 минуты.
+EMAIL_INTERVAL_MIN=45
+EMAIL_INTERVAL_MAX=180
+
+# --- News-сессии (рекомендованные: каждые 20–90 минут) ---
+# Чтение новостей/соцсетей: ~25–40 коротких сессий за день.
+NEWS_INTERVAL_MIN=20
+NEWS_INTERVAL_MAX=90
+
+# --- APT phantom (рекомендованные: каждые 6–24 часа = 360–1440 мин) ---
+# unattended-upgrades в Ubuntu тикает раз в сутки, плюс пользователь
+# часто руками вызывает apt update / apt install ~раз в несколько дней.
+APT_PHANTOM_INTERVAL_MIN=360
+APT_PHANTOM_INTERVAL_MAX=1440
+
+# Сколько пакетов качать за один проход (1..N)
+APT_PHANTOM_PKG_MIN=1
+APT_PHANTOM_PKG_MAX=3
+
+# Список «обычных» пакетов — они есть в стандартных репах Ubuntu,
+# их регулярно тянут реальные админы. Можно дополнять.
+APT_PHANTOM_PACKAGES="curl wget vim htop git tmux build-essential nginx \
+ca-certificates net-tools iputils-ping rsync unzip zip jq python3-pip \
+nodejs npm postgresql-client redis-tools mariadb-client tcpdump"
+
+# Иногда (с этим шансом, 0..100) вместо обычной библиотеки качаем
+# тяжёлый «образ ОС» — ядро, ubuntu-server, linux-headers. Это даёт
+# редкие, но крупные всплески трафика, как при апгрейде дистрибутива.
+APT_PHANTOM_OS_CHANCE=20
+APT_PHANTOM_OS_PACKAGES="linux-image-generic linux-headers-generic \
+ubuntu-server ubuntu-minimal cloud-init systemd"
+
+# Если =1, вообще ничего не сохраняем на диск (всё уходит в /dev/null
+# через --print-uris + curl). Если =0 — используется apt-get download
+# во временный каталог с моментальным rm.
+APT_PHANTOM_BLACKHOLE=1
+
+# Глобальный rate-limit для curl (KB/s, диапазон min..max).
+RATE_KB_MIN=500
+RATE_KB_MAX=3500
+
+# Окна суток (часы 0..23). Изменив их, можно подвинуть «график дня».
+NIGHT_HOUR_FROM=1
+NIGHT_HOUR_TO=6
+PEAK_MORNING_FROM=7
+PEAK_MORNING_TO=9
+PEAK_EVENING_FROM=18
+PEAK_EVENING_TO=23
+CONF_EOF
+}
+
+# Показать текущий конфиг
+show_noise_conf() {
+    if [ -f "$NOISE_CONF" ]; then
+        echo -e "${CYAN}--- $NOISE_CONF ---${NC}"
+        cat "$NOISE_CONF"
+    else
+        echo -e "${YELLOW}[i] Конфиг ещё не создан.${NC}"
+    fi
+}
+
+# Интерактивный ввод. Enter — оставить рекомендуемое значение.
+prompt_custom_noise_conf() {
+    [ -f "$NOISE_CONF" ] || write_default_noise_conf
+    # shellcheck disable=SC1090
+    source "$NOISE_CONF"
+
+    echo -e "${CYAN}${BOLD}=== Кастомизация шумогенератора ===${NC}"
+    echo -e "${YELLOW}Enter — оставить рекомендованное значение.${NC}"
+    echo ""
+
+    local v
+    read -r -p "Профиль (ru/global/mixed) [${PROFILE}]: " v;             PROFILE="${v:-$PROFILE}"
+    read -r -p "iOS-бёрсты (1=да/0=нет) [${ENABLE_IOS_BURST}]: " v;      ENABLE_IOS_BURST="${v:-$ENABLE_IOS_BURST}"
+    read -r -p "APNs keepalive (1/0) [${ENABLE_APNS}]: " v;              ENABLE_APNS="${v:-$ENABLE_APNS}"
+    read -r -p "Заходы в почту (1/0) [${ENABLE_EMAIL}]: " v;             ENABLE_EMAIL="${v:-$ENABLE_EMAIL}"
+    read -r -p "Новости/соц.сети РФ (1/0) [${ENABLE_NEWS}]: " v;         ENABLE_NEWS="${v:-$ENABLE_NEWS}"
+    read -r -p "APT-фантом (1/0) [${ENABLE_APT_PHANTOM}]: " v;           ENABLE_APT_PHANTOM="${v:-$ENABLE_APT_PHANTOM}"
+
+    echo ""
+    echo -e "${CYAN}-- Email-сессии --${NC}"
+    echo -e "${YELLOW}Рекомендуется: 45..180 минут (≈10 проверок в день).${NC}"
+    read -r -p "EMAIL_INTERVAL_MIN [мин, ${EMAIL_INTERVAL_MIN}]: " v;    EMAIL_INTERVAL_MIN="${v:-$EMAIL_INTERVAL_MIN}"
+    read -r -p "EMAIL_INTERVAL_MAX [мин, ${EMAIL_INTERVAL_MAX}]: " v;    EMAIL_INTERVAL_MAX="${v:-$EMAIL_INTERVAL_MAX}"
+
+    echo ""
+    echo -e "${CYAN}-- News-сессии --${NC}"
+    echo -e "${YELLOW}Рекомендуется: 20..90 минут.${NC}"
+    read -r -p "NEWS_INTERVAL_MIN [мин, ${NEWS_INTERVAL_MIN}]: " v;      NEWS_INTERVAL_MIN="${v:-$NEWS_INTERVAL_MIN}"
+    read -r -p "NEWS_INTERVAL_MAX [мин, ${NEWS_INTERVAL_MAX}]: " v;      NEWS_INTERVAL_MAX="${v:-$NEWS_INTERVAL_MAX}"
+
+    echo ""
+    echo -e "${CYAN}-- APT-фантом --${NC}"
+    echo -e "${YELLOW}Рекомендуется: 360..1440 минут (раз в 6–24 ч).${NC}"
+    read -r -p "APT_PHANTOM_INTERVAL_MIN [мин, ${APT_PHANTOM_INTERVAL_MIN}]: " v
+    APT_PHANTOM_INTERVAL_MIN="${v:-$APT_PHANTOM_INTERVAL_MIN}"
+    read -r -p "APT_PHANTOM_INTERVAL_MAX [мин, ${APT_PHANTOM_INTERVAL_MAX}]: " v
+    APT_PHANTOM_INTERVAL_MAX="${v:-$APT_PHANTOM_INTERVAL_MAX}"
+    read -r -p "Шанс качнуть «образ ОС» вместо библиотеки (0..100) [${APT_PHANTOM_OS_CHANCE}]: " v
+    APT_PHANTOM_OS_CHANCE="${v:-$APT_PHANTOM_OS_CHANCE}"
+    read -r -p "Сразу в /dev/null без сохранения (1/0) [${APT_PHANTOM_BLACKHOLE}]: " v
+    APT_PHANTOM_BLACKHOLE="${v:-$APT_PHANTOM_BLACKHOLE}"
+
+    # Перезаписываем конфиг
+    cat > "$NOISE_CONF" <<EOF
+# vps-noise.conf (custom, $(date -u +%FT%TZ))
+PROFILE="$PROFILE"
+
+ENABLE_IOS_BURST=$ENABLE_IOS_BURST
+ENABLE_APNS=$ENABLE_APNS
+ENABLE_EMAIL=$ENABLE_EMAIL
+ENABLE_NEWS=$ENABLE_NEWS
+ENABLE_APT_PHANTOM=$ENABLE_APT_PHANTOM
+
+IOS_BURST_INTERVAL_MIN=${IOS_BURST_INTERVAL_MIN}
+IOS_BURST_INTERVAL_MAX=${IOS_BURST_INTERVAL_MAX}
+
+EMAIL_INTERVAL_MIN=$EMAIL_INTERVAL_MIN
+EMAIL_INTERVAL_MAX=$EMAIL_INTERVAL_MAX
+
+NEWS_INTERVAL_MIN=$NEWS_INTERVAL_MIN
+NEWS_INTERVAL_MAX=$NEWS_INTERVAL_MAX
+
+APT_PHANTOM_INTERVAL_MIN=$APT_PHANTOM_INTERVAL_MIN
+APT_PHANTOM_INTERVAL_MAX=$APT_PHANTOM_INTERVAL_MAX
+APT_PHANTOM_PKG_MIN=${APT_PHANTOM_PKG_MIN}
+APT_PHANTOM_PKG_MAX=${APT_PHANTOM_PKG_MAX}
+APT_PHANTOM_PACKAGES="${APT_PHANTOM_PACKAGES}"
+APT_PHANTOM_OS_CHANCE=$APT_PHANTOM_OS_CHANCE
+APT_PHANTOM_OS_PACKAGES="${APT_PHANTOM_OS_PACKAGES}"
+APT_PHANTOM_BLACKHOLE=$APT_PHANTOM_BLACKHOLE
+
+RATE_KB_MIN=${RATE_KB_MIN}
+RATE_KB_MAX=${RATE_KB_MAX}
+NIGHT_HOUR_FROM=${NIGHT_HOUR_FROM}
+NIGHT_HOUR_TO=${NIGHT_HOUR_TO}
+PEAK_MORNING_FROM=${PEAK_MORNING_FROM}
+PEAK_MORNING_TO=${PEAK_MORNING_TO}
+PEAK_EVENING_FROM=${PEAK_EVENING_FROM}
+PEAK_EVENING_TO=${PEAK_EVENING_TO}
+EOF
+    echo -e "${GREEN}[+] Конфиг сохранён в $NOISE_CONF${NC}"
 }
 
 manage_noise_generator() {
     while true; do
         clear
-        echo -e "${CYAN}${BOLD}=== iOS STEALTH NOISE GENERATOR (Phoenix) ===${NC}"
+        echo -e "${CYAN}${BOLD}=== STEALTH NOISE GENERATOR (Phoenix v6.1) ===${NC}"
         local status
         if systemctl is-active --quiet vps-noise; then
             status="${GREEN}ВКЛЮЧЕН${NC}"
@@ -395,25 +587,112 @@ manage_noise_generator() {
             status="${RED}ОТКЛЮЧЕН${NC}"
         fi
         echo -e "Статус: $status"
+        if [ -f "$NOISE_CONF" ]; then
+            local p
+            p=$(awk -F'"' '/^PROFILE=/{print $2}' "$NOISE_CONF")
+            echo -e "Профиль: ${CYAN}${p:-?}${NC}    Конфиг: $NOISE_CONF"
+        fi
         echo ""
-        echo -e "  ${GREEN}[1]${NC} Включить генератор (iOS Safari mimic + APNs keepalive)"
-        echo -e "  ${RED}[2]${NC} Выключить генератор"
+        echo -e "  ${GREEN}[1]${NC} Запустить с ${BOLD}рекомендованными${NC} настройками"
+        echo -e "  ${GREEN}[2]${NC} Запустить с ${BOLD}кастомными${NC} интервалами (мастер)"
+        echo -e "  ${CYAN}[3]${NC} Открыть конфиг в редакторе (${EDITOR:-nano})"
+        echo -e "  ${CYAN}[4]${NC} Показать текущий конфиг"
+        echo -e "  ${YELLOW}[5]${NC} Перезапустить сервис (применить изменённый конфиг)"
+        echo -e "  ${RED}[6]${NC} Выключить генератор"
         echo -e "  ${CYAN}[0]${NC} Назад"
         echo ""
         read -r -p "Выбор: " nchoice
         case $nchoice in
             1)
-                cat > "$NOISE_GEN_SCRIPT" <<'NOISE_EOF'
+                write_default_noise_conf
+                deploy_noise_generator
+                echo -e "${GREEN}[+] Шум запущен с рекомендованными настройками.${NC}"
+                sleep 2
+                ;;
+            2)
+                prompt_custom_noise_conf
+                deploy_noise_generator
+                echo -e "${GREEN}[+] Шум запущен с кастомным конфигом.${NC}"
+                sleep 2
+                ;;
+            3)
+                [ -f "$NOISE_CONF" ] || write_default_noise_conf
+                "${EDITOR:-nano}" "$NOISE_CONF"
+                ;;
+            4)
+                clear
+                show_noise_conf
+                echo ""
+                read -r -p "Нажмите Enter..."
+                ;;
+            5)
+                systemctl restart vps-noise && echo -e "${GREEN}[+] Перезапущен.${NC}"
+                sleep 1
+                ;;
+            6)
+                systemctl stop vps-noise 2>/dev/null
+                systemctl disable vps-noise 2>/dev/null
+                sleep 1
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
+# Раскладывает скрипт + systemd-юнит и (пере)запускает сервис.
+deploy_noise_generator() {
+    [ -f "$NOISE_CONF" ] || write_default_noise_conf
+    cat > "$NOISE_GEN_SCRIPT" <<'NOISE_EOF'
 #!/bin/bash
-# iOS Stealth Noise Generator — Phoenix edition.
-# Имитирует фоновую активность iPhone/iPad: Safari, App Store, iCloud,
-# APNs keepalive. Если в системе есть curl-impersonate-safari, он
-# используется автоматически — это даёт корректный JA3/ALPN отпечаток iOS.
+# vps-noise.sh — Phoenix v6.1 multi-profile noise generator.
+# Полностью управляется через /etc/vps-noise.conf. Один процесс
+# параллельно крутит несколько независимых сценариев активности:
+#   - iOS Safari/CFNetwork бёрсты
+#   - APNs keepalive
+#   - Заходы в почту (Yandex/Mail.ru/Max.ru) — короткие сессии
+#   - Чтение новостных сайтов и соцсетей РФ
+#   - Фантомные APT-загрузки (.deb пакетов и тяжёлых ОС-образов)
 
 set -u
+umask 077
 
-# --- Пул реальных iOS User-Agent (Safari + native CFNetwork) ---
-UA_POOL=(
+CONF="/etc/vps-noise.conf"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+# --- Дефолты на случай, если конфига нет / параметр забыли ---
+PROFILE="${PROFILE:-ru}"
+ENABLE_IOS_BURST="${ENABLE_IOS_BURST:-1}"
+ENABLE_APNS="${ENABLE_APNS:-1}"
+ENABLE_EMAIL="${ENABLE_EMAIL:-1}"
+ENABLE_NEWS="${ENABLE_NEWS:-1}"
+ENABLE_APT_PHANTOM="${ENABLE_APT_PHANTOM:-1}"
+
+IOS_BURST_INTERVAL_MIN="${IOS_BURST_INTERVAL_MIN:-1}"
+IOS_BURST_INTERVAL_MAX="${IOS_BURST_INTERVAL_MAX:-6}"
+EMAIL_INTERVAL_MIN="${EMAIL_INTERVAL_MIN:-45}"
+EMAIL_INTERVAL_MAX="${EMAIL_INTERVAL_MAX:-180}"
+NEWS_INTERVAL_MIN="${NEWS_INTERVAL_MIN:-20}"
+NEWS_INTERVAL_MAX="${NEWS_INTERVAL_MAX:-90}"
+APT_PHANTOM_INTERVAL_MIN="${APT_PHANTOM_INTERVAL_MIN:-360}"
+APT_PHANTOM_INTERVAL_MAX="${APT_PHANTOM_INTERVAL_MAX:-1440}"
+APT_PHANTOM_PKG_MIN="${APT_PHANTOM_PKG_MIN:-1}"
+APT_PHANTOM_PKG_MAX="${APT_PHANTOM_PKG_MAX:-3}"
+APT_PHANTOM_OS_CHANCE="${APT_PHANTOM_OS_CHANCE:-20}"
+APT_PHANTOM_BLACKHOLE="${APT_PHANTOM_BLACKHOLE:-1}"
+APT_PHANTOM_PACKAGES="${APT_PHANTOM_PACKAGES:-curl wget vim htop git tmux nginx ca-certificates}"
+APT_PHANTOM_OS_PACKAGES="${APT_PHANTOM_OS_PACKAGES:-linux-image-generic linux-headers-generic ubuntu-server}"
+RATE_KB_MIN="${RATE_KB_MIN:-500}"
+RATE_KB_MAX="${RATE_KB_MAX:-3500}"
+NIGHT_HOUR_FROM="${NIGHT_HOUR_FROM:-1}"
+NIGHT_HOUR_TO="${NIGHT_HOUR_TO:-6}"
+PEAK_MORNING_FROM="${PEAK_MORNING_FROM:-7}"
+PEAK_MORNING_TO="${PEAK_MORNING_TO:-9}"
+PEAK_EVENING_FROM="${PEAK_EVENING_FROM:-18}"
+PEAK_EVENING_TO="${PEAK_EVENING_TO:-23}"
+
+# ===== UA-пулы =====
+UA_IOS=(
 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
@@ -423,79 +702,132 @@ UA_POOL=(
 "com.apple.WebKit.Networking/8617.2.4.0.6 CFNetwork/1492.0.1 Darwin/23.3.0"
 )
 
-# --- Реальные домены, к которым обращается iOS в фоне ---
-BROWSE_URLS=(
-"https://www.apple.com/"
-"https://www.apple.com/iphone/"
-"https://www.apple.com/shop/buy-iphone"
-"https://support.apple.com/"
-"https://www.icloud.com/"
-"https://apps.apple.com/"
-"https://apps.apple.com/us/genre/ios/id36"
-"https://itunes.apple.com/lookup?id=284910350"
-"https://configuration.apple.com/configurations/internetservices/safari/ContentBlockerLists.plist.signed"
-"https://gs-loc.apple.com/"
-"https://gateway.icloud.com/"
-"https://mesu.apple.com/assets/"
-"https://swcdn.apple.com/"
-"https://updates.cdn-apple.com/"
-"https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/"
-"https://www.bing.com/"
-"https://duckduckgo.com/"
-"https://yandex.ru/"
-"https://www.google.com/"
+# Десктоп — для почты/новостей/соцсетей это естественнее, чем iOS Safari
+UA_DESKTOP=(
+"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 YaBrowser/24.4.0.0 Safari/537.36"
+"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
 )
 
-# Лёгкие "пинги" (как captive-portal/connectivity check у iOS)
-CAPTIVE_URLS=(
+UA_MOBILE_RU=(
+"Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+"Mozilla/5.0 (Linux; arm_64; Android 13; RMX3771) AppleWebKit/537.36 (KHTML, like Gecko) YaBrowser/24.4.0 Mobile Safari/537.36"
+)
+
+# ===== URL-пулы =====
+URLS_IOS=(
+"https://www.apple.com/" "https://www.apple.com/iphone/"
+"https://www.apple.com/shop/buy-iphone" "https://support.apple.com/"
+"https://www.icloud.com/" "https://apps.apple.com/"
+"https://itunes.apple.com/lookup?id=284910350"
+"https://configuration.apple.com/configurations/internetservices/safari/ContentBlockerLists.plist.signed"
+"https://gateway.icloud.com/" "https://mesu.apple.com/assets/"
+"https://swcdn.apple.com/" "https://updates.cdn-apple.com/"
+"https://is1-ssl.mzstatic.com/" "https://gs-loc.apple.com/"
+)
+URLS_CAPTIVE=(
 "https://captive.apple.com/hotspot-detect.html"
 "https://www.apple.com/library/test/success.html"
 "https://gsp64-ssl.ls.apple.com/"
 )
 
-# --- Заголовки, повторяющие порядок Safari iOS ---
-ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-ACCEPT_LANG_POOL=("en-US,en;q=0.9" "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" "en-GB,en;q=0.9")
+# Yandex / Mail.ru / Max.ru — то, куда заходит реальный пользователь в РФ
+# shellcheck disable=SC2034
+URLS_EMAIL_YANDEX=(
+"https://mail.yandex.ru/" "https://mail.yandex.ru/lite/"
+"https://passport.yandex.ru/auth?origin=mail&from=mail"
+"https://yandex.ru/" "https://disk.yandex.ru/"
+"https://360.yandex.ru/mail/"
+)
+# shellcheck disable=SC2034
+URLS_EMAIL_MAILRU=(
+"https://mail.ru/" "https://e.mail.ru/inbox/" "https://e.mail.ru/login"
+"https://account.mail.ru/login" "https://my.mail.ru/" "https://cloud.mail.ru/"
+)
+# shellcheck disable=SC2034
+URLS_EMAIL_MAX=(
+"https://max.ru/" "https://web.max.ru/" "https://max.ru/about"
+)
+
+URLS_NEWS_RU=(
+"https://lenta.ru/" "https://ria.ru/" "https://www.rbc.ru/"
+"https://tass.ru/" "https://www.kommersant.ru/" "https://www.vedomosti.ru/"
+"https://www.gazeta.ru/" "https://rg.ru/" "https://iz.ru/"
+"https://www.interfax.ru/" "https://www.kp.ru/"
+"https://dzen.ru/news" "https://www.fontanka.ru/" "https://www.mk.ru/"
+"https://meduza.io/"
+)
+URLS_SOCIAL_RU=(
+"https://vk.com/" "https://ok.ru/" "https://dzen.ru/"
+"https://t.me/s/durov" "https://www.wildberries.ru/" "https://www.ozon.ru/"
+"https://www.avito.ru/" "https://hh.ru/"
+)
+URLS_SEARCH_RU=(
+"https://yandex.ru/" "https://ya.ru/" "https://www.google.com/"
+)
+
+# shellcheck disable=SC2034
+URLS_GLOBAL=(
+"https://www.bing.com/" "https://duckduckgo.com/"
+"https://www.wikipedia.org/" "https://www.reddit.com/"
+"https://news.ycombinator.com/" "https://www.bbc.com/"
+"https://www.cnn.com/" "https://www.nytimes.com/"
+)
+
+ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+ACCEPT_LANG_RU="ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+ACCEPT_LANG_EN="en-US,en;q=0.9"
 ACCEPT_ENC="gzip, deflate, br"
 
-# Выбираем curl-impersonate-safari, если он есть
+# ===== Бинарь curl =====
 pick_curl() {
-    if command -v curl_safari17_4 >/dev/null 2>&1; then
-        echo "curl_safari17_4"
-    elif command -v curl_safari16_5 >/dev/null 2>&1; then
-        echo "curl_safari16_5"
-    elif command -v curl-impersonate-safari >/dev/null 2>&1; then
-        echo "curl-impersonate-safari"
-    else
-        echo "curl"
+    if command -v curl_safari17_4 >/dev/null 2>&1; then echo curl_safari17_4
+    elif command -v curl_safari16_5 >/dev/null 2>&1; then echo curl_safari16_5
+    elif command -v curl-impersonate-safari >/dev/null 2>&1; then echo curl-impersonate-safari
+    else echo curl
     fi
 }
-
 CURL_BIN=$(pick_curl)
-COOKIE_JAR="/tmp/.ios_noise_cookies"
-touch "$COOKIE_JAR"
+
+COOKIE_JAR_DIR="/tmp/.vps_noise"
+mkdir -p "$COOKIE_JAR_DIR"
+chmod 700 "$COOKIE_JAR_DIR"
 
 # Случайное число в диапазоне [a, b]
 rrange() { echo $(( RANDOM % ($2 - $1 + 1) + $1 )); }
 
-# --- Один запрос «как из Safari/iOS» ---
-do_request() {
-    local url="$1"
-    local ua="${UA_POOL[$RANDOM % ${#UA_POOL[@]}]}"
-    local lang="${ACCEPT_LANG_POOL[$RANDOM % ${#ACCEPT_LANG_POOL[@]}]}"
-    local rate=$(( RANDOM % 3000 + 500 ))   # 500–3500 KB/s — мобильный канал
+# Случайный rate-limit
+rand_rate() { echo $(( RANDOM % (RATE_KB_MAX - RATE_KB_MIN + 1) + RATE_KB_MIN )); }
 
-    # Базовый набор флагов, валидный для всех вариантов curl
+# ===== Один HTTP-запрос =====
+# Аргументы: $1 — URL, $2 — UA-pool name (ios|desktop|mobile_ru), $3 — lang (ru|en), $4 — cookie tag
+http_request() {
+    local url="$1" ua_kind="${2:-ios}" lang="${3:-en}" tag="${4:-default}"
+    local ua jar="$COOKIE_JAR_DIR/${tag}.jar"
+    case "$ua_kind" in
+        ios)        ua="${UA_IOS[$RANDOM % ${#UA_IOS[@]}]}" ;;
+        desktop)    ua="${UA_DESKTOP[$RANDOM % ${#UA_DESKTOP[@]}]}" ;;
+        mobile_ru)  ua="${UA_MOBILE_RU[$RANDOM % ${#UA_MOBILE_RU[@]}]}" ;;
+        *)          ua="${UA_DESKTOP[$RANDOM % ${#UA_DESKTOP[@]}]}" ;;
+    esac
+    local accept_lang="$ACCEPT_LANG_EN"
+    [ "$lang" = "ru" ] && accept_lang="$ACCEPT_LANG_RU"
+
+    touch "$jar"
+
+    local rate
+    rate=$(rand_rate)
     local args=(
         -s -o /dev/null
-        --max-time 25
-        --connect-timeout 8
+        --max-time 25 --connect-timeout 8
         --tls-max 1.3 --tlsv1.2
         --compressed
-        --cookie-jar "$COOKIE_JAR" --cookie "$COOKIE_JAR"
+        --cookie-jar "$jar" --cookie "$jar"
         -A "$ua"
         -H "Accept: $ACCEPT"
-        -H "Accept-Language: $lang"
+        -H "Accept-Language: $accept_lang"
         -H "Accept-Encoding: $ACCEPT_ENC"
         -H "Sec-Fetch-Dest: document"
         -H "Sec-Fetch-Mode: navigate"
@@ -504,9 +836,6 @@ do_request() {
         -H "Priority: u=0, i"
         --limit-rate "${rate}K"
     )
-
-    # У стандартного curl пробуем HTTP/3, если не вышло — HTTP/2.
-    # У curl-impersonate-safari ALPN зашит в бинарник.
     if [ "$CURL_BIN" = "curl" ]; then
         if (( RANDOM % 3 == 0 )) && curl --help all 2>/dev/null | grep -q -- '--http3'; then
             args+=(--http3)
@@ -514,111 +843,257 @@ do_request() {
             args+=(--http2)
         fi
     fi
-
     "$CURL_BIN" "${args[@]}" "$url" 2>/dev/null || true
 }
 
-# --- APNs keepalive: TCP-коннект на courier.push.apple.com:5223 ---
-# Реальный iPhone постоянно держит этот сокет; даже короткий connect раз
-# в 20–40 минут добавляет правдоподобия фоновому профилю трафика.
+# ===== APNs keepalive =====
 apns_keepalive() {
-    local host="courier.push.apple.com"
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 6 bash -c "exec 3<>/dev/tcp/${host}/5223 && sleep 3" 2>/dev/null || true
+    timeout 6 bash -c 'exec 3<>/dev/tcp/courier.push.apple.com/5223 && sleep 3' 2>/dev/null || true
+}
+
+# ===== iOS Safari бёрст =====
+ios_burst() {
+    local n url
+    n=$(rrange 3 8)
+    http_request "${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}" ios en ios_session
+    sleep "$(rrange 1 4)"
+    local i
+    for ((i=1; i<n; i++)); do
+        url="${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}"
+        http_request "$url" ios en ios_session
+        sleep "$(rrange 1 6)"
+    done
+    # Иногда — captive check
+    if (( RANDOM % 5 == 0 )); then
+        http_request "${URLS_CAPTIVE[$RANDOM % ${#URLS_CAPTIVE[@]}]}" ios en ios_captive
     fi
 }
 
-# --- Сессионный «бёрст»: 3–8 запросов как при просмотре ленты ---
-browse_burst() {
-    local n
-    n=$(rrange 3 8)
-    local i url
-    # Первый запрос — корневой ресурс
-    do_request "${BROWSE_URLS[$RANDOM % ${#BROWSE_URLS[@]}]}"
-    sleep "$(rrange 1 4)"
-    for ((i=1; i<n; i++)); do
-        url="${BROWSE_URLS[$RANDOM % ${#BROWSE_URLS[@]}]}"
-        do_request "$url"
-        sleep "$(rrange 1 6)"
+# ===== Email session =====
+# Поведение: открыть главную почты → 2-5 переходов внутри → пауза.
+# Чередуется между Яндексом, Mail.ru и Max.ru.
+email_session() {
+    local provider=$(( RANDOM % 3 ))
+    local urls_var url n i
+    case $provider in
+        0) urls_var=URLS_EMAIL_YANDEX ;;
+        1) urls_var=URLS_EMAIL_MAILRU ;;
+        2) urls_var=URLS_EMAIL_MAX ;;
+    esac
+    # bash 4.3+ nameref — чисто и без eval
+    local -n arr="$urls_var"
+    n=$(rrange 2 5)
+    for ((i=0; i<n; i++)); do
+        url="${arr[$RANDOM % ${#arr[@]}]}"
+        # 70% десктоп, 30% мобильный РФ-браузер
+        if (( RANDOM % 10 < 7 )); then
+            http_request "$url" desktop ru email
+        else
+            http_request "$url" mobile_ru ru email
+        fi
+        sleep "$(rrange 4 25)"
     done
 }
 
-# --- Главный цикл с реалистичной кривой активности ---
-LAST_APNS=0
-while true; do
-    HOUR=$(date +%H)
-    NOW=$(date +%s)
-
-    # APNs keepalive ~ каждые 25–35 минут
-    if (( NOW - LAST_APNS > 1500 + RANDOM % 600 )); then
-        apns_keepalive
-        LAST_APNS=$NOW
+# ===== News session =====
+news_session() {
+    local n url i
+    # Стартовая точка — поисковик или прямой заход на новостник
+    if (( RANDOM % 3 == 0 )); then
+        http_request "${URLS_SEARCH_RU[$RANDOM % ${#URLS_SEARCH_RU[@]}]}" desktop ru news
+        sleep "$(rrange 2 7)"
     fi
-
-    if (( 10#$HOUR >= 1 && 10#$HOUR <= 6 )); then
-        # Ночь — редкие captive-проверки и единичные сессии
-        do_request "${CAPTIVE_URLS[$RANDOM % ${#CAPTIVE_URLS[@]}]}"
-        sleep "$(rrange 600 1500)"
+    n=$(rrange 3 9)
+    for ((i=0; i<n; i++)); do
         if (( RANDOM % 4 == 0 )); then
-            browse_burst
+            url="${URLS_SOCIAL_RU[$RANDOM % ${#URLS_SOCIAL_RU[@]}]}"
+        else
+            url="${URLS_NEWS_RU[$RANDOM % ${#URLS_NEWS_RU[@]}]}"
         fi
-        sleep "$(rrange 900 2400)"
-    elif (( 10#$HOUR >= 7 && 10#$HOUR <= 9 )) || (( 10#$HOUR >= 18 && 10#$HOUR <= 23 )); then
-        # Утренний и вечерний пики — частые бёрсты
-        browse_burst
-        sleep "$(rrange 30 180)"
-    else
-        # День — умеренная активность
-        browse_burst
-        sleep "$(rrange 90 360)"
-    fi
-done
-NOISE_EOF
-                chmod +x "$NOISE_GEN_SCRIPT"
+        if (( RANDOM % 10 < 6 )); then
+            http_request "$url" desktop ru news
+        else
+            http_request "$url" mobile_ru ru news
+        fi
+        sleep "$(rrange 6 40)"
+    done
+}
 
-                # Без жёсткой привязки к одному ядру — иначе пакеты
-                # шума всегда летят с одного и того же CPU и легко
-                # отделимы по таймингу. Оставляем планировщику.
-                cat > "$NOISE_GEN_SERVICE" <<EOF
+# ===== APT phantom =====
+# Настоящий unattended-upgrades регулярно делает `apt-get update` и
+# подкачивает .deb. Мы делаем то же самое, но всё, что скачали —
+# мгновенно отправляем в /dev/null. Системе не наносится никакого
+# вреда: ни пакеты не ставятся, ни кэш не пухнет.
+apt_phantom_run() {
+    # apt-get update — это нормальная операция, она и так бы выполнялась.
+    apt-get -qq -o Acquire::Languages=none update >/dev/null 2>&1 || true
+
+    # APT_PHANTOM_PACKAGES — список через пробел, словосплит здесь намеренный
+    # shellcheck disable=SC2206
+    local pkgs=( $APT_PHANTOM_PACKAGES )
+    # shellcheck disable=SC2206
+    local os_pkgs=( $APT_PHANTOM_OS_PACKAGES )
+
+    local n
+    n=$(rrange "$APT_PHANTOM_PKG_MIN" "$APT_PHANTOM_PKG_MAX")
+
+    local i pkg use_os tmpd
+    for ((i=0; i<n; i++)); do
+        use_os=0
+        if (( RANDOM % 100 < APT_PHANTOM_OS_CHANCE )); then
+            use_os=1
+            pkg="${os_pkgs[$RANDOM % ${#os_pkgs[@]}]}"
+        else
+            pkg="${pkgs[$RANDOM % ${#pkgs[@]}]}"
+        fi
+
+        if [ "$APT_PHANTOM_BLACKHOLE" = "1" ]; then
+            # Получаем список URI и тащим curl-ом прямо в /dev/null —
+            # на диск ничего не пишется вообще.
+            local uri_list
+            uri_list=$(apt-get -y -qq --print-uris install --reinstall "$pkg" 2>/dev/null \
+                       | awk -F"'" '/^'\''http/{print $2}')
+            [ -z "$uri_list" ] && uri_list=$(apt-get -y -qq --print-uris download "$pkg" 2>/dev/null \
+                       | awk -F"'" '/^'\''http/{print $2}')
+            local u rate
+            rate=$(rand_rate)
+            for u in $uri_list; do
+                curl -s -L --max-time 120 --connect-timeout 10 \
+                    --limit-rate "${rate}K" \
+                    -A "Debian APT-HTTP/1.3 (2.7.14) Ubuntu/24.04" \
+                    "$u" -o /dev/null 2>/dev/null || true
+            done
+        else
+            # Сохраняем .deb в tmpfs / временный каталог и сразу же rm.
+            tmpd=$(mktemp -d /tmp/.apt_phantom.XXXXXX)
+            ( cd "$tmpd" && apt-get -qq download "$pkg" >/dev/null 2>&1 || true )
+            rm -rf "$tmpd"
+        fi
+        sleep "$(rrange 5 30)"
+
+        # Ослабленный шум: «пользователь смотрит, что ставится» — реже
+        # листает страницу пакета.
+        if (( RANDOM % 3 == 0 )); then
+            http_request "https://packages.ubuntu.com/noble/$pkg" desktop en apt
+        fi
+        # Иногда ОС-обновление сопровождается одним заходом на release-notes
+        if [ "$use_os" = "1" ] && (( RANDOM % 2 == 0 )); then
+            http_request "https://wiki.ubuntu.com/NobleNumbat/ReleaseNotes" desktop en apt
+        fi
+    done
+}
+
+# ===== Профиль времени суток (множитель пауз) =====
+# Возвращает целочисленный множитель (в процентах) к базовому интервалу.
+hour_factor() {
+    local h
+    h=$(date +%H); h=$((10#$h))
+    if (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then
+        echo 250                  # ночь — паузы в 2.5 раза длиннее
+    elif (( h >= PEAK_MORNING_FROM && h <= PEAK_MORNING_TO )); then
+        echo 60                   # утренний пик — короче
+    elif (( h >= PEAK_EVENING_FROM && h <= PEAK_EVENING_TO )); then
+        echo 70                   # вечерний пик
+    else
+        echo 100                  # день
+    fi
+}
+
+# Случайная пауза в МИНУТАХ с учётом времени суток
+sleep_minutes() {
+    local mn=$1 mx=$2 base factor minutes
+    base=$(rrange "$mn" "$mx")
+    factor=$(hour_factor)
+    minutes=$(( base * factor / 100 ))
+    [ "$minutes" -lt 1 ] && minutes=1
+    sleep "$((minutes * 60))"
+}
+
+# ===== Параллельные циклы =====
+loop_ios() {
+    while true; do
+        ios_burst
+        sleep_minutes "$IOS_BURST_INTERVAL_MIN" "$IOS_BURST_INTERVAL_MAX"
+    done
+}
+loop_apns() {
+    while true; do
+        apns_keepalive
+        sleep "$(rrange 1500 2400)"   # ~25–40 мин
+    done
+}
+loop_email() {
+    while true; do
+        sleep_minutes "$EMAIL_INTERVAL_MIN" "$EMAIL_INTERVAL_MAX"
+        email_session
+    done
+}
+loop_news() {
+    while true; do
+        sleep_minutes "$NEWS_INTERVAL_MIN" "$NEWS_INTERVAL_MAX"
+        news_session
+    done
+}
+loop_apt() {
+    while true; do
+        sleep_minutes "$APT_PHANTOM_INTERVAL_MIN" "$APT_PHANTOM_INTERVAL_MAX"
+        apt_phantom_run
+    done
+}
+
+# Старт включённых модулей в фоне
+PIDS=()
+[ "$ENABLE_IOS_BURST"   = "1" ] && { loop_ios   & PIDS+=($!); }
+[ "$ENABLE_APNS"        = "1" ] && { loop_apns  & PIDS+=($!); }
+[ "$ENABLE_EMAIL"       = "1" ] && { loop_email & PIDS+=($!); }
+[ "$ENABLE_NEWS"        = "1" ] && { loop_news  & PIDS+=($!); }
+[ "$ENABLE_APT_PHANTOM" = "1" ] && command -v apt-get >/dev/null 2>&1 && { loop_apt & PIDS+=($!); }
+
+# Если ни один модуль не включён — спим, чтобы systemd не считал крах.
+if [ "${#PIDS[@]}" -eq 0 ]; then
+    while :; do sleep 3600; done
+fi
+
+# Если упадёт хоть один цикл — останавливаем сервис целиком, systemd
+# его перезапустит (Restart=always), все циклы стартуют заново.
+trap 'kill "${PIDS[@]}" 2>/dev/null; exit 0' TERM INT
+wait -n
+kill "${PIDS[@]}" 2>/dev/null || true
+exit 1
+NOISE_EOF
+    chmod +x "$NOISE_GEN_SCRIPT"
+
+    cat > "$NOISE_GEN_SERVICE" <<EOF
 [Unit]
-Description=VPS iOS Phoenix Stealth Noise
+Description=VPS Phoenix Stealth Noise (iOS + RU human profile + APT phantom)
 After=network-online.target dnsmasq.service
 Wants=network-online.target
 
 [Service]
 ExecStart=$NOISE_GEN_SCRIPT
+EnvironmentFile=-$NOISE_CONF
 Restart=always
 RestartSec=15
 Nice=15
 IOSchedulingClass=idle
 CPUWeight=20
-MemoryHigh=64M
-MemoryMax=128M
+MemoryHigh=128M
+MemoryMax=256M
 StandardOutput=null
 StandardError=null
 PrivateTmp=yes
-ProtectSystem=strict
-ReadWritePaths=/tmp
+ProtectSystem=full
 NoNewPrivileges=yes
+ReadWritePaths=/tmp /var/cache/apt /var/lib/apt
 
 [Install]
 WantedBy=multi-user.target
 EOF
-                systemctl daemon-reload
-                systemctl enable vps-noise >/dev/null 2>&1
-                systemctl restart vps-noise
-                echo -e "${GREEN}[+] iOS-шум запущен (CFNetwork + APNs).${NC}"
-                sleep 1
-                ;;
-            2)
-                systemctl stop vps-noise 2>/dev/null
-                systemctl disable vps-noise 2>/dev/null
-                sleep 1
-                ;;
-            0) return ;;
-        esac
-    done
+    systemctl daemon-reload
+    systemctl enable vps-noise >/dev/null 2>&1
+    systemctl restart vps-noise
 }
+
 
 manage_swap() {
     while true; do
@@ -718,13 +1193,14 @@ reset_all() {
     rm -f /swapfile
     sed -i '/\/swapfile/d' /etc/fstab
     zramctl --reset /dev/zram0 2>/dev/null || true
-    rm -f "$SYSCTL_CONF" "$LIMITS_CONF" "$EXP_CONF" \
+    rm -f "$SYSCTL_CONF" "$LIMITS_CONF" "$EXP_CONF" "$NOISE_CONF" \
           /etc/dnsmasq.d/vps-speed.conf \
           /etc/systemd/system.conf.d/99-vps-limits.conf \
           /etc/systemd/user.conf.d/99-vps-limits.conf
     systemctl stop vps-noise vps-rps dnsmasq >/dev/null 2>&1 || true
     systemctl disable vps-noise vps-rps >/dev/null 2>&1 || true
     rm -f "$NOISE_GEN_SCRIPT" "$NOISE_GEN_SERVICE" "$RPS_BOOT_SCRIPT" "$RPS_BOOT_SERVICE"
+    rm -rf /tmp/.vps_noise
     systemctl daemon-reload >/dev/null 2>&1 || true
     sysctl --system >/dev/null 2>&1 || true
     echo -e "${GREEN}[+] Сброс выполнен.${NC}"
@@ -736,8 +1212,8 @@ main_menu() {
         print_header
         echo -e "Выберите действие:"
         echo -e "  ${GREEN}[1]${NC} Подготовка: Компоненты Phoenix"
-        echo -e "  ${CYAN}[2]${NC} УСКОРЕНИЕ: v6.0 (Adaptive Buffers + RPS + ZRAM)"
-        echo -e "  ${CYAN}[3]${NC} Stealth: iOS-генератор шума (Safari + APNs)"
+        echo -e "  ${CYAN}[2]${NC} УСКОРЕНИЕ: v6.1 (Adaptive Buffers + RPS + ZRAM)"
+        echo -e "  ${CYAN}[3]${NC} Stealth: генератор шума (iOS + RU email/news + APT phantom)"
         echo -e "  ${CYAN}[4]${NC} Подкачка: SWAP & ZRAM (Ручная настройка)"
         echo -e "  ${CYAN}[5]${NC} Тест: Запустить Бенчмарк (Пинг)"
         echo -e "  ${YELLOW}[12]${NC} Экспериментально: TFO / ECN / busy_poll"
