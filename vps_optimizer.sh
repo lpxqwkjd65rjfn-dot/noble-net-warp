@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.0 PHOENIX-Z)
+# VPS Global Optimization Script (v8.1 PHOENIX-Z+)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -97,7 +97,7 @@ print_header() {
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "       ULTRA VPS ACCELERATOR v8.0 (PHOENIX-Z)                    "
+    echo "       ULTRA VPS ACCELERATOR v8.1 (PHOENIX-Z+)                   "
     echo "================================================================="
     echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
     echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
@@ -751,6 +751,43 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_autocorking 0
     sysctl_safe net.ipv4.tcp_limit_output_bytes 1048576
 
+    # Доводки под низкий пинг (новое в v8.1):
+    #  - mtu_probing=1 + base_mss=1024: на туннелях/прокси PMTU-чёрная дыра — обычная
+    #    проблема (особенно WireGuard/Reality/XHTTP); base_mss=1024 даёт безопасный старт
+    #    и динамически растёт пакетами PROBE по RFC4821. Снижает «зависший» 1-й RTT.
+    #  - probe_interval=600 + probe_threshold=8 — частота повторного probe'а MTU.
+    #  - slow_start_after_idle=0 — отказ от «перезапуска» SS на idle-паузе (важно для
+    #    long-lived прокси-сессий xray/sing-box).
+    #  - workaround_signed_windows=1 — устраняет квирк старых клиентов с подписанным окном.
+    #  - syn_retries=3, synack_retries=2 — быстрее детектируем мёртвый upstream.
+    #  - keepalive faster (600/30/5): мёртвые сессии чистятся за ~3 минуты вместо 2+ часов.
+    #  - fin_timeout=10, retries2=8, max_tw_buckets выше — быстрее освобождаем сокеты.
+    #  - tcp_low_latency=1 — historic, безопасно: предпочитать latency throughput-у.
+    sysctl_safe net.ipv4.tcp_mtu_probing 1
+    sysctl_safe net.ipv4.tcp_base_mss 1024
+    sysctl_safe net.ipv4.tcp_probe_interval 600
+    sysctl_safe net.ipv4.tcp_probe_threshold 8
+    sysctl_safe net.ipv4.tcp_slow_start_after_idle 0
+    sysctl_safe net.ipv4.tcp_workaround_signed_windows 1
+    sysctl_safe net.ipv4.tcp_syn_retries 3
+    sysctl_safe net.ipv4.tcp_synack_retries 2
+    sysctl_safe net.ipv4.tcp_keepalive_time 600
+    sysctl_safe net.ipv4.tcp_keepalive_intvl 30
+    sysctl_safe net.ipv4.tcp_keepalive_probes 5
+    sysctl_safe net.ipv4.tcp_fin_timeout 10
+    sysctl_safe net.ipv4.tcp_retries2 8
+    sysctl_safe net.ipv4.tcp_low_latency 1
+    sysctl_safe net.ipv4.tcp_min_snd_mss 536
+    # Анти-DoS challenge_ack — высокий лимит, чтобы не было side-channel detectable.
+    sysctl_safe net.ipv4.tcp_challenge_ack_limit 999
+    # ip_no_pmtu_disc=0 — пусть PMTU работает (по умолчанию 0, но фиксируем).
+    sysctl_safe net.ipv4.ip_no_pmtu_disc 0
+    # Повышенный netdev_budget для softirq на современных VPS с >1Gbps.
+    sysctl_safe net.core.netdev_budget 600
+    sysctl_safe net.core.netdev_budget_usecs 8000
+    # Анти-bufferbloat в TCP: tcp_notsent_lowat уже выставлен ранее. Добавим:
+    sysctl_safe net.ipv4.tcp_invalid_ratelimit 500
+
     # MPTCP (Linux 5.6+)
     if [ "$kvi" -ge 50600 ]; then
         sysctl_safe net.mptcp.enabled 1
@@ -795,10 +832,38 @@ apply_sysctls() {
     sysctl_safe vm.swappiness "$PRESET_SWAPPINESS"
     sysctl_safe vm.page-cluster 0
     sysctl_safe vm.vfs_cache_pressure 50
-    sysctl_safe vm.dirty_background_ratio 5
+    sysctl_safe vm.dirty_background_ratio 3
     sysctl_safe vm.dirty_ratio 10
+    sysctl_safe vm.dirty_writeback_centisecs 500
+    sysctl_safe vm.dirty_expire_centisecs 1500
     sysctl_safe vm.min_free_kbytes 65536
     sysctl_safe vm.zone_reclaim_mode 0
+    # Доводки v8.1:
+    #  - max_map_count: высоко-thread'овые прокси (sing-box, gomod-сервисы)
+    #    могут упираться в 65530 mmap'ов на процесс.
+    #  - overcommit_memory=1: не отказываем в malloc()'е по «возможному» лимиту;
+    #    Linux всё равно умеет OOM-кильнуть.
+    #  - watermark_scale_factor=125: kswapd начинает чистить страницы раньше,
+    #    меньше шансов попасть в direct reclaim (latency spike).
+    #  - watermark_boost_factor=15000: меньше боусс'а — меньше «волн» компакции.
+    #  - compaction_proactiveness=0: на VPS нет смысла греть CPU фоновой компакцией.
+    #  - admin_reserve_kbytes: гарантирует ~16MB для root-shell даже при OOM.
+    sysctl_safe vm.max_map_count 1048576
+    sysctl_safe vm.overcommit_memory 1
+    sysctl_safe vm.overcommit_ratio 100
+    sysctl_safe vm.watermark_scale_factor 125
+    sysctl_safe vm.watermark_boost_factor 15000
+    sysctl_safe vm.compaction_proactiveness 0
+    sysctl_safe vm.admin_reserve_kbytes 16384
+    # Безопасные kernel/sched доводки.
+    sysctl_safe kernel.sched_migration_cost_ns 5000000
+    sysctl_safe kernel.sched_autogroup_enabled 0
+    sysctl_safe kernel.numa_balancing 0
+    sysctl_safe kernel.timer_migration 1
+    # fs limits — на случай прокси с тысячами upstream'ов.
+    sysctl_safe fs.file-max 2097152
+    sysctl_safe fs.nr_open 2097152
+    sysctl_safe fs.aio-max-nr 1048576
 
     APPLIED_BBR="$best_bbr"
     APPLIED_QDISC="$best_qdisc"
@@ -904,7 +969,7 @@ finalize_sysctl_conf() {
         cp "$SYSCTL_CONF" "$SYSCTL_BACKUP" 2>/dev/null || true
     fi
     {
-        echo "# === VPS Optimizer v8.0 PHOENIX-Z ==="
+        echo "# === VPS Optimizer v8.1 PHOENIX-Z+ ==="
         echo "# Generated $(date -u +%FT%TZ)  preset=$PRESET_NAME  virt=$VIRT  kernel=$(uname -r)"
         echo "# Только параметры, которые ядро/гипервизор реально приняли."
         cat "$SYSCTL_TMP" 2>/dev/null
@@ -945,7 +1010,7 @@ self_test() {
 
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
-    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.0 PHOENIX-Z...${NC}"
+    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.1 PHOENIX-Z+...${NC}"
 
     VIRT=$(detect_virt)
     _log INFO "  Virt:    $VIRT"
@@ -979,7 +1044,7 @@ apply_optimizations() {
 
     self_test
 
-    _log OK "${GREEN}[+] Phoenix-Z v8.0: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}.${NC}"
+    _log OK "${GREEN}[+] Phoenix-Z+ v8.1: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}.${NC}"
     rm -f "$SYSCTL_TMP"; trap - EXIT
 
     [ "$QUIET" = "1" ] && return
@@ -1412,6 +1477,46 @@ URLS_CAPTIVE=(
 "https://gsp64-ssl.ls.apple.com/"
 )
 
+# РФ госпорталы / КИИ (новое в v8.1) — реальный iPhone владельца в РФ
+# периодически открывает Госуслуги, ФНС, мос.ру и т.п. Никаких соцсетей,
+# никаких мессенджеров. Все ссылки публичные и стабильные.
+# shellcheck disable=SC2034
+URLS_IOS_RU_GOV=(
+"https://www.gosuslugi.ru/"
+"https://lk.gosuslugi.ru/"
+"https://login.gosuslugi.ru/"
+"https://esia.gosuslugi.ru/"
+"https://www.nalog.gov.ru/"
+"https://lkfl2.nalog.ru/lkfl/login"
+"https://www.fns.ru/"
+"https://www.mos.ru/"
+"https://www.mos.ru/services/"
+"https://www.mos.ru/news/"
+"https://pgu.mos.ru/"
+"https://kremlin.ru/"
+"https://government.ru/"
+"https://www.gov.ru/"
+"https://www.mvd.ru/"
+"https://www.fsb.ru/"
+"https://мвд.рф/"
+"https://минцифры.рф/"
+"https://digital.gov.ru/ru/"
+"https://www.cbr.ru/"
+"https://rkn.gov.ru/"
+"https://sudrf.ru/"
+"https://www.gov-murman.ru/"
+"https://gisp.gov.ru/"
+"https://nalog.ru/"
+"https://минздрав.рф/"
+"https://www.rosreestr.gov.ru/"
+"https://лк.фнс.рф/"
+"https://pos.gosuslugi.ru/og/"
+"https://epgu.gosuslugi.ru/"
+"https://www.pochta.ru/"
+"https://www.pfrf.gov.ru/"
+"https://sfr.gov.ru/"
+)
+
 # Yandex / Mail.ru / Max.ru — то, куда заходит реальный пользователь в РФ
 # shellcheck disable=SC2034
 URLS_EMAIL_YANDEX=(
@@ -1606,14 +1711,30 @@ apns_keepalive() {
 }
 
 # ===== iOS Safari бёрст =====
+# Профиль реального iPhone-пользователя в РФ:
+#   ~70%  Apple-домены (apple/icloud/mzstatic/...).
+#   ~20%  Российские новости (lenta/ria/rbc/tass/...).
+#   ~10%  Госпорталы РФ / КИИ (gosuslugi/mos.ru/nalog/...).
+#   Никаких соцсетей, никаких мессенджеров.
+ios_burst_pick() {
+    local r=$(( RANDOM % 100 ))
+    if (( r < 70 )); then
+        echo "${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}"
+    elif (( r < 90 )); then
+        echo "${URLS_NEWS_RU[$RANDOM % ${#URLS_NEWS_RU[@]}]}"
+    else
+        echo "${URLS_IOS_RU_GOV[$RANDOM % ${#URLS_IOS_RU_GOV[@]}]}"
+    fi
+}
 ios_burst() {
     local n url
     n=$(rrange 3 8)
+    # Первый запрос всегда Apple — это «открыли Safari».
     http_request "${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}" ios en ios_session
     sleep "$(rrange 1 4)"
     local i
     for ((i=1; i<n; i++)); do
-        url="${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}"
+        url=$(ios_burst_pick)
         http_request "$url" ios en ios_session
         sleep "$(rrange 1 6)"
     done
@@ -2049,26 +2170,80 @@ DNS_PRESET_YANDEX="77.88.8.8 77.88.8.1"
 DNS_PRESET_QUAD9="9.9.9.9 149.112.112.112"
 DNS_PRESET_ADGUARD="94.140.14.14 94.140.15.15"
 
+# Server-name hostnames — нужны для DoT (RFC: IP#hostname для systemd-resolved)
+# и DoH (URL). Без них strict TLS проверит только IP без SNI и упадёт.
+DNS_SNI_CLOUDFLARE="cloudflare-dns.com"
+DNS_SNI_GOOGLE="dns.google"
+DNS_SNI_YANDEX="common.dot.dns.yandex.net"
+DNS_SNI_QUAD9="dns.quad9.net"
+DNS_SNI_ADGUARD="dns.adguard-dns.com"
+
+# DoH stamps / URLs — для dnscrypt-proxy; URL'ы стандартные, проверены.
+DNS_DOH_CLOUDFLARE="https://cloudflare-dns.com/dns-query"
+DNS_DOH_GOOGLE="https://dns.google/dns-query"
+DNS_DOH_YANDEX="https://common.dot.dns.yandex.net/dns-query"
+DNS_DOH_QUAD9="https://dns.quad9.net/dns-query"
+DNS_DOH_ADGUARD="https://dns.adguard-dns.com/dns-query"
+
+# Возвращает SNI/host для DoT/DoH preset.
+dns_preset_sni() {
+    case "$1" in
+        cloudflare) echo "$DNS_SNI_CLOUDFLARE" ;;
+        google)     echo "$DNS_SNI_GOOGLE" ;;
+        yandex)     echo "$DNS_SNI_YANDEX" ;;
+        quad9)      echo "$DNS_SNI_QUAD9" ;;
+        adguard)    echo "$DNS_SNI_ADGUARD" ;;
+        *) echo "" ;;
+    esac
+}
+dns_preset_doh_url() {
+    case "$1" in
+        cloudflare) echo "$DNS_DOH_CLOUDFLARE" ;;
+        google)     echo "$DNS_DOH_GOOGLE" ;;
+        yandex)     echo "$DNS_DOH_YANDEX" ;;
+        quad9)      echo "$DNS_DOH_QUAD9" ;;
+        adguard)    echo "$DNS_DOH_ADGUARD" ;;
+        *) echo "" ;;
+    esac
+}
+
 # Применяет выбранный DNS-режим. Сохраняет состояние в $DNS_STATE.
-# Аргументы:  $1 = mode (local|cloudflare|google|yandex|quad9|adguard|custom)
-#             $2 = (custom only) IP-адреса через пробел
+# Аргументы:  $1 = transport (plain|dot|doh) — по умолчанию plain.
+#                  Если $1 — это preset (например 'cloudflare') или 'local'/'custom',
+#                  считаем это backward-compat вызовом и transport=plain.
+#             $2 = preset (local|cloudflare|google|yandex|quad9|adguard|custom)
+#             $3 = (custom only) IP-адреса через пробел / DoH URL
 apply_dns() {
-    local mode="${1:-local}" servers=""
-    case "$mode" in
-        local|"")
-            # Удаляем drop-in (если был) и /etc/resolv.conf override.
-            if [ "$DRY_RUN" = "1" ]; then
-                _log INFO "${GRAY}[dry-run] DNS → local${NC}"
-                return 0
-            fi
-            rm -f "$DNS_CONF" "$DNS_STATE"
-            if [ -f "$DNS_RESOLV_BACKUP" ]; then
-                cp -p "$DNS_RESOLV_BACKUP" /etc/resolv.conf 2>/dev/null || true
-            fi
-            systemctl restart systemd-resolved 2>/dev/null || true
-            _log OK "${GREEN}[+] DNS режим: local (берётся конфигурация провайдера)${NC}"
-            return 0
+    # Backward-compat: если первый аргумент — известный preset/local/custom, добавляем 'plain'.
+    local transport="${1:-plain}"
+    case "$transport" in
+        plain|dot|doh) shift ;;
+        local|cloudflare|google|yandex|quad9|adguard|custom|"")
+            transport="plain"
             ;;
+        *)
+            _log WARN "${RED}[!] Неизвестный DNS transport: $transport${NC}"
+            return 1
+            ;;
+    esac
+    local mode="${1:-local}" servers=""
+    if [ "$mode" = "local" ] || [ -z "$mode" ]; then
+        # Полный сброс DNS — чем бы ни был transport.
+        if [ "$DRY_RUN" = "1" ]; then
+            _log INFO "${GRAY}[dry-run] DNS → local${NC}"
+            return 0
+        fi
+        rm -f "$DNS_CONF" "$DNS_STATE"
+        if [ -f "$DNS_RESOLV_BACKUP" ]; then
+            cp -p "$DNS_RESOLV_BACKUP" /etc/resolv.conf 2>/dev/null || true
+        fi
+        # Останавливаем DoH-прокси, если был запущен.
+        systemctl disable --now dnscrypt-proxy 2>/dev/null || true
+        systemctl restart systemd-resolved 2>/dev/null || true
+        _log OK "${GREEN}[+] DNS режим: local (берётся конфигурация провайдера)${NC}"
+        return 0
+    fi
+    case "$mode" in
         cloudflare) servers="$DNS_PRESET_CLOUDFLARE" ;;
         google)     servers="$DNS_PRESET_GOOGLE" ;;
         yandex)     servers="$DNS_PRESET_YANDEX" ;;
@@ -2076,99 +2251,296 @@ apply_dns() {
         adguard)    servers="$DNS_PRESET_ADGUARD" ;;
         custom)     servers="${2:-}" ;;
         *)
-            _log WARN "${RED}[!] Неизвестный DNS-режим: $mode${NC}"
+            _log WARN "${RED}[!] Неизвестный DNS preset: $mode${NC}"
             return 1
             ;;
     esac
 
-    # Валидация для custom — должны быть IPv4/IPv6.
-    local s
-    for s in $servers; do
-        if ! [[ "$s" =~ ^[0-9a-fA-F:.]+$ ]]; then
-            _log WARN "${RED}[!] Невалидный DNS-сервер: $s${NC}"
-            return 1
-        fi
-    done
     if [ -z "$servers" ]; then
         _log WARN "${RED}[!] Список DNS-серверов пуст${NC}"
         return 1
     fi
 
+    # Для plain/dot валидируем IP. Для doh при custom — может быть URL.
+    if [ "$transport" != "doh" ] || [ "$mode" != "custom" ]; then
+        local s
+        for s in $servers; do
+            if ! [[ "$s" =~ ^[0-9a-fA-F:.]+$ ]]; then
+                _log WARN "${RED}[!] Невалидный DNS-сервер: $s${NC}"
+                return 1
+            fi
+        done
+    fi
+
     [ "$DRY_RUN" = "1" ] && {
-        _log INFO "${GRAY}[dry-run] DNS → $mode ($servers)${NC}"
+        _log INFO "${GRAY}[dry-run] DNS → $transport/$mode ($servers)${NC}"
         return 0
     }
 
-    # Если запущен systemd-resolved — пишем drop-in (правильный путь на 24.04).
-    # Иначе — fallback на /etc/resolv.conf (с предварительным бэкапом).
+    case "$transport" in
+        plain) dns_apply_plain "$mode" "$servers" ;;
+        dot)   dns_apply_dot   "$mode" "$servers" ;;
+        doh)   dns_apply_doh   "$mode" "$servers" ;;
+    esac
+    local rc=$?
+    [ $rc -eq 0 ] && echo "$transport|$mode|$servers" > "$DNS_STATE"
+    return $rc
+}
+
+# Plain DNS (UDP/TCP 53) через systemd-resolved drop-in или /etc/resolv.conf
+dns_apply_plain() {
+    local mode="$1" servers="$2"
+    # Останавливаем dnscrypt-proxy, если был от предыдущего DoH.
+    systemctl disable --now dnscrypt-proxy 2>/dev/null || true
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         mkdir -p /etc/systemd/resolved.conf.d
         cat > "$DNS_CONF" <<EOF
-# Auto-generated by vps_optimizer.sh — DNS preset: $mode
+# Auto-generated by vps_optimizer.sh — transport=plain preset=$mode
 [Resolve]
 DNS=$servers
 DNSStubListener=yes
 DNSSEC=allow-downgrade
-DNSOverTLS=opportunistic
+DNSOverTLS=no
 Cache=yes
 EOF
         systemctl restart systemd-resolved 2>/dev/null
-        _log OK "${GREEN}[+] DNS применён через systemd-resolved (preset=$mode):${NC}"
-        _log OK "    $servers"
+        _log OK "${GREEN}[+] DNS plain через systemd-resolved (preset=$mode):${NC}"
     else
         if [ ! -f "$DNS_RESOLV_BACKUP" ] && [ -e /etc/resolv.conf ]; then
             cp -p /etc/resolv.conf "$DNS_RESOLV_BACKUP" 2>/dev/null || true
         fi
-        # Если /etc/resolv.conf — символическая ссылка (на stub), заменяем на файл.
         [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
         {
-            echo "# vps_optimizer.sh — DNS preset: $mode"
+            echo "# vps_optimizer.sh — transport=plain preset=$mode"
+            local s
             for s in $servers; do echo "nameserver $s"; done
             echo "options edns0 trust-ad timeout:1 attempts:2"
         } > /etc/resolv.conf
-        _log OK "${GREEN}[+] DNS применён через /etc/resolv.conf (preset=$mode):${NC}"
-        _log OK "    $servers"
+        _log OK "${GREEN}[+] DNS plain через /etc/resolv.conf (preset=$mode):${NC}"
     fi
-    echo "$mode|$servers" > "$DNS_STATE"
+    _log OK "    $servers"
+    return 0
+}
+
+# DoT (DNS-over-TLS, порт 853) — через systemd-resolved DNSOverTLS=yes (strict).
+# Для valid TLS handshake server name указывается в формате IP#hostname.
+dns_apply_dot() {
+    local mode="$1" servers="$2"
+    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        _log WARN "${RED}[!] DoT требует systemd-resolved (на этой системе не активен)${NC}"
+        _log INFO "${YELLOW}    fallback → plain${NC}"
+        dns_apply_plain "$mode" "$servers"
+        return $?
+    fi
+    systemctl disable --now dnscrypt-proxy 2>/dev/null || true
+    local sni dns_line=""
+    sni=$(dns_preset_sni "$mode")
+    if [ "$mode" = "custom" ] || [ -z "$sni" ]; then
+        # Для custom нет SNI — используем IP без hostname (TLS будет с проверкой по IP/SAN).
+        dns_line="$servers"
+    else
+        local s line=""
+        for s in $servers; do
+            line+="${s}#${sni} "
+        done
+        dns_line="${line% }"
+    fi
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > "$DNS_CONF" <<EOF
+# Auto-generated by vps_optimizer.sh — transport=dot preset=$mode
+[Resolve]
+DNS=$dns_line
+DNSStubListener=yes
+DNSSEC=allow-downgrade
+DNSOverTLS=yes
+Cache=yes
+EOF
+    systemctl restart systemd-resolved 2>/dev/null
+    _log OK "${GREEN}[+] DNS DoT (порт 853, strict TLS) preset=$mode:${NC}"
+    _log OK "    $dns_line"
+    return 0
+}
+
+# DoH (DNS-over-HTTPS, порт 443) через dnscrypt-proxy.
+# dnscrypt-proxy ставим из apt (есть в noble), слушает 127.0.0.1:53,
+# направляет запросы на DoH-эндпоинт. systemd-resolved должен быть отключён,
+# либо мы пишем resolv.conf руками (точно укажет на наш прокси).
+dns_apply_doh() {
+    local mode="$1" servers="$2"
+    if ! command -v dnscrypt-proxy >/dev/null 2>&1; then
+        _log INFO "${YELLOW}[*] Устанавливаем dnscrypt-proxy (требуется для DoH)...${NC}"
+        if ! apt-get update -qq >/dev/null 2>&1 || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnscrypt-proxy >/dev/null 2>&1; then
+            _log WARN "${RED}[!] Не удалось поставить dnscrypt-proxy. Fallback → DoT${NC}"
+            dns_apply_dot "$mode" "$servers"
+            return $?
+        fi
+    fi
+    local doh_url
+    if [ "$mode" = "custom" ]; then
+        # Custom DoH — пользователь передал URL'ы (или IP, тогда не годится).
+        local first
+        first=$(echo "$servers" | awk '{print $1}')
+        if [[ "$first" == https://* ]]; then
+            doh_url="$first"
+        else
+            _log WARN "${RED}[!] Для DoH custom нужен URL (https://.../dns-query). Fallback → DoT${NC}"
+            dns_apply_dot "$mode" "$servers"
+            return $?
+        fi
+    else
+        doh_url=$(dns_preset_doh_url "$mode")
+    fi
+    if [ -z "$doh_url" ]; then
+        _log WARN "${RED}[!] Не нашли DoH URL для preset=$mode${NC}"
+        return 1
+    fi
+    # Конфиг dnscrypt-proxy: server_names берётся из public-resolvers.md
+    # (стандартный список dnscrypt/DoH-серверов), генерация stamp не нужна.
+    mkdir -p /etc/dnscrypt-proxy
+    local dnscp_server
+    case "$mode" in
+        cloudflare) dnscp_server="cloudflare" ;;
+        google)     dnscp_server="google" ;;
+        quad9)      dnscp_server="quad9-doh-ip4-port443-filter-pri" ;;
+        adguard)    dnscp_server="adguard-dns-doh" ;;
+        yandex)     dnscp_server="yandex" ;;
+        *)          dnscp_server="cloudflare" ;;
+    esac
+    cat > /etc/dnscrypt-proxy/dnscrypt-proxy.toml <<EOF
+# Auto-generated by vps_optimizer.sh — transport=doh preset=$mode
+listen_addresses = ['127.0.0.1:53', '[::1]:53']
+server_names = ['$dnscp_server']
+ipv4_servers = true
+ipv6_servers = true
+doh_servers = true
+require_dnssec = false
+require_nolog = false
+require_nofilter = false
+cache = true
+cache_size = 4096
+cache_min_ttl = 600
+cache_max_ttl = 86400
+cache_neg_min_ttl = 60
+cache_neg_max_ttl = 600
+log_level = 2
+[sources.public-resolvers]
+  urls = ['https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md', 'https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md']
+  cache_file = '/var/cache/dnscrypt-proxy/public-resolvers.md'
+  minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+  refresh_delay = 72
+  prefix = ''
+EOF
+    mkdir -p /var/cache/dnscrypt-proxy
+    chown -R _dnscrypt-proxy:_dnscrypt-proxy /var/cache/dnscrypt-proxy 2>/dev/null || true
+
+    # Освобождаем :53 — выключаем resolved stub listener, перенаправляем resolved upstream на 127.0.0.1.
+    # Альтернатива: полностью отключить resolved и писать /etc/resolv.conf напрямую.
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > "$DNS_CONF" <<EOF
+# Auto-generated by vps_optimizer.sh — transport=doh
+[Resolve]
+DNS=127.0.0.1
+DNSStubListener=no
+DNSSEC=no
+DNSOverTLS=no
+Cache=no
+EOF
+        systemctl restart systemd-resolved 2>/dev/null
+    fi
+    if [ ! -f "$DNS_RESOLV_BACKUP" ] && [ -e /etc/resolv.conf ]; then
+        cp -p /etc/resolv.conf "$DNS_RESOLV_BACKUP" 2>/dev/null || true
+    fi
+    [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+    {
+        echo "# vps_optimizer.sh — transport=doh (через dnscrypt-proxy на 127.0.0.1)"
+        echo "nameserver 127.0.0.1"
+        echo "options edns0 trust-ad timeout:1 attempts:2"
+    } > /etc/resolv.conf
+
+    systemctl enable --now dnscrypt-proxy 2>/dev/null || systemctl restart dnscrypt-proxy 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+        _log OK "${GREEN}[+] DNS DoH (порт 443) preset=$mode → $dnscp_server${NC}"
+        _log OK "    URL: $doh_url (через dnscrypt-proxy на 127.0.0.1)"
+    else
+        _log WARN "${RED}[!] dnscrypt-proxy не стартанул. Проверь: journalctl -u dnscrypt-proxy${NC}"
+        return 1
+    fi
+    return 0
 }
 
 manage_dns_menu() {
     while true; do
         clear
-        local cur_mode="local" cur_servers=""
+        local cur_transport="plain" cur_mode="local" cur_servers=""
         if [ -f "$DNS_STATE" ]; then
-            cur_mode=$(cut -d'|' -f1 "$DNS_STATE")
-            cur_servers=$(cut -d'|' -f2- "$DNS_STATE")
+            # Поддержка обеих схем: старая "mode|servers" и новая "transport|mode|servers".
+            local raw
+            raw=$(cat "$DNS_STATE")
+            local n
+            n=$(awk -F'|' '{print NF}' <<<"$raw")
+            if [ "$n" = "3" ]; then
+                cur_transport=$(cut -d'|' -f1 <<<"$raw")
+                cur_mode=$(cut -d'|' -f2 <<<"$raw")
+                cur_servers=$(cut -d'|' -f3- <<<"$raw")
+            else
+                cur_transport="plain"
+                cur_mode=$(cut -d'|' -f1 <<<"$raw")
+                cur_servers=$(cut -d'|' -f2- <<<"$raw")
+            fi
         fi
         echo -e "${CYAN}${BOLD}=== DNS Configuration ===${NC}"
-        echo -e "Текущий: ${BOLD}$cur_mode${NC}${cur_servers:+ ($cur_servers)}"
+        echo -e "Текущий: ${BOLD}${cur_transport}${NC} / ${BOLD}${cur_mode}${NC}${cur_servers:+ (${cur_servers})}"
         echo ""
-        echo -e "  ${GREEN}[1]${NC} ${BOLD}local${NC} — конфигурация провайдера (по умолчанию)"
-        echo -e "  ${CYAN}[2]${NC} Cloudflare (1.1.1.1 / 1.0.0.1)"
-        echo -e "  ${CYAN}[3]${NC} Google (8.8.8.8 / 8.8.4.4)"
-        echo -e "  ${CYAN}[4]${NC} Yandex DNS (77.88.8.8 / 77.88.8.1)"
-        echo -e "  ${CYAN}[5]${NC} Quad9 (9.9.9.9)"
-        echo -e "  ${CYAN}[6]${NC} AdGuard (94.140.14.14 / 94.140.15.15)"
-        echo -e "  ${YELLOW}[7]${NC} Custom — ввести IP-адреса вручную"
-        echo -e "  ${GREEN}[0]${NC} Назад"
+        echo -e "${YELLOW}1) Выбор транспорта (как DNS-запросы летят по сети):${NC}"
+        echo -e "  ${GREEN}[1]${NC} ${BOLD}plain${NC}  — обычный DNS, порт 53/UDP+TCP (по умолчанию)"
+        echo -e "  ${CYAN}[2]${NC}  ${BOLD}DoT${NC}    — DNS-over-TLS, порт 853 (через systemd-resolved strict)"
+        echo -e "  ${CYAN}[3]${NC}  ${BOLD}DoH${NC}    — DNS-over-HTTPS, порт 443 (через dnscrypt-proxy, апт-ставится сам)"
+        echo -e "  ${GREEN}[L]${NC}  Полный сброс к локальному (провайдерскому) DNS"
+        echo -e "  ${GREEN}[0]${NC}  Назад"
         echo ""
-        read -r -p "Ваш выбор: " c
-        case "$c" in
-            1) apply_dns local; sleep 1 ;;
-            2) apply_dns cloudflare; read -r -p "Enter..." ;;
-            3) apply_dns google; read -r -p "Enter..." ;;
-            4) apply_dns yandex; read -r -p "Enter..." ;;
-            5) apply_dns quad9; read -r -p "Enter..." ;;
-            6) apply_dns adguard; read -r -p "Enter..." ;;
-            7)
-                echo "Введите IP DNS-серверов через пробел (IPv4 или IPv6)."
-                echo "Пример: 1.1.1.1 8.8.8.8 2606:4700:4700::1111"
-                read -r -p "Серверы: " ips
-                apply_dns custom "$ips"; read -r -p "Enter..."
-                ;;
+        read -r -p "Транспорт: " t
+        local transport=""
+        case "$t" in
+            1|p|plain|"") transport="plain" ;;
+            2|t|dot|DoT)  transport="dot" ;;
+            3|h|doh|DoH)  transport="doh" ;;
+            L|l|local)    apply_dns plain local; read -r -p "Enter..."; continue ;;
             0) return ;;
-            *) ;;
+            *) continue ;;
         esac
+        echo ""
+        echo -e "${YELLOW}2) Resolver:${NC}"
+        echo -e "  ${CYAN}[1]${NC} Cloudflare"
+        echo -e "  ${CYAN}[2]${NC} Google"
+        echo -e "  ${CYAN}[3]${NC} Yandex"
+        echo -e "  ${CYAN}[4]${NC} Quad9"
+        echo -e "  ${CYAN}[5]${NC} AdGuard"
+        echo -e "  ${YELLOW}[6]${NC} Custom (ввести IP/URL вручную)"
+        echo -e "  ${GREEN}[0]${NC} Отмена"
+        read -r -p "Resolver: " r
+        local preset="" extra=""
+        case "$r" in
+            1) preset="cloudflare" ;;
+            2) preset="google" ;;
+            3) preset="yandex" ;;
+            4) preset="quad9" ;;
+            5) preset="adguard" ;;
+            6)
+                preset="custom"
+                if [ "$transport" = "doh" ]; then
+                    echo "DoH custom — введите URL (https://.../dns-query):"
+                else
+                    echo "Введите IP DNS-серверов через пробел (IPv4 или IPv6)."
+                    echo "Пример: 1.1.1.1 8.8.8.8 2606:4700:4700::1111"
+                fi
+                read -r -p "> " extra
+                ;;
+            0|*) continue ;;
+        esac
+        apply_dns "$transport" "$preset" "$extra"
+        read -r -p "Enter для продолжения..."
     done
 }
 
@@ -2184,7 +2556,7 @@ print_status_dashboard() {
     bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
-    echo -e "${CYAN}${BOLD}=== СТАТУС VPS PHOENIX-Z ===${NC}"
+    echo -e "${CYAN}${BOLD}=== СТАТУС VPS PHOENIX-Z+ ===${NC}"
     echo -e "  Hypervisor:    ${BOLD}$virt${NC}"
     echo -e "  Kernel:        $(uname -r)"
     echo -e "  Cores:         $cores"
@@ -2254,10 +2626,19 @@ print_status_dashboard() {
         echo -e "  Preset:        ${BOLD}$(cat "$PRESET_FILE")${NC}"
     fi
     if [ -f "$DNS_STATE" ]; then
-        local dns_mode dns_servers
-        dns_mode=$(cut -d'|' -f1 "$DNS_STATE")
-        dns_servers=$(cut -d'|' -f2- "$DNS_STATE")
-        echo -e "  DNS:           ${BOLD}$dns_mode${NC} (${dns_servers})"
+        local raw n dns_t dns_mode dns_servers
+        raw=$(cat "$DNS_STATE")
+        n=$(awk -F'|' '{print NF}' <<<"$raw")
+        if [ "$n" = "3" ]; then
+            dns_t=$(cut -d'|' -f1 <<<"$raw")
+            dns_mode=$(cut -d'|' -f2 <<<"$raw")
+            dns_servers=$(cut -d'|' -f3- <<<"$raw")
+        else
+            dns_t="plain"
+            dns_mode=$(cut -d'|' -f1 <<<"$raw")
+            dns_servers=$(cut -d'|' -f2- <<<"$raw")
+        fi
+        echo -e "  DNS:           ${BOLD}${dns_t}${NC} / ${BOLD}${dns_mode}${NC} (${dns_servers})"
     else
         echo -e "  DNS:           ${GRAY}local (provider default)${NC}"
     fi
@@ -2329,7 +2710,7 @@ import_config() {
 #  CLI parser
 # ===================================================================
 print_cli_help() {
-    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.0 PHOENIX-Z"
+    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.1 PHOENIX-Z+"
     cat <<EOF
 
 USAGE:
@@ -2343,9 +2724,14 @@ COMMANDS:
     self-test                Перепроверить применённые настройки
     preset <name>            Сохранить пресет на будущие apply
     noise on|off|edit|status Управление шумогенератором
-    dns <mode> [ips]         Управление DNS:
-                               local (default) | cloudflare | google | yandex
-                               | quad9 | adguard | custom <ip1 ip2 ...>
+    dns ...                  Управление DNS:
+                               dns                                   # статус
+                               dns local                             # вернуть провайдер.
+                               dns plain|dot|doh <preset>            # transport+resolver
+                               dns plain|dot|doh custom <ip|url ...> # свои IP/URL
+                             preset = cloudflare|google|yandex|quad9|adguard
+                             plain = 53/UDP, dot = 853/TLS,
+                             doh = 443/HTTPS (через dnscrypt-proxy, ставится автоматически)
     swap <gb>                Создать swap-файл указанного размера в ГБ
     benchmark                Замерить пинг до набора популярных endpoints
     reset                    Полный откат всех изменений
@@ -2445,8 +2831,16 @@ cli_dispatch() {
             import_config "${args[0]}"
             ;;
         dns)
-            local sub="${args[0]:-}"
-            case "$sub" in
+            # Поддерживаются формы:
+            #   dns                        — статус
+            #   dns status                 — статус
+            #   dns local                  — сброс к провайдерскому DNS
+            #   dns <preset>               — backward-compat: plain + preset
+            #   dns plain|dot|doh <preset>
+            #   dns plain|dot|doh custom <ips/url...>
+            local a0="${args[0]:-}"
+            local a1="${args[1]:-}"
+            case "$a0" in
                 ""|status)
                     if [ -f "$DNS_STATE" ]; then
                         echo "DNS: $(cat "$DNS_STATE")"
@@ -2454,16 +2848,37 @@ cli_dispatch() {
                         echo "DNS: local (не управляется)"
                     fi
                     ;;
-                local|cloudflare|google|yandex|quad9|adguard)
-                    apply_dns "$sub"
+                local)
+                    apply_dns plain local
+                    ;;
+                plain|dot|doh)
+                    if [ -z "$a1" ]; then
+                        echo -e "${RED}dns $a0: укажи resolver (cloudflare|google|yandex|quad9|adguard|custom)${NC}"
+                        exit 1
+                    fi
+                    if [ "$a1" = "custom" ]; then
+                        local rest
+                        rest="${args[*]:2}"
+                        apply_dns "$a0" custom "$rest"
+                    else
+                        apply_dns "$a0" "$a1"
+                    fi
+                    ;;
+                cloudflare|google|yandex|quad9|adguard)
+                    apply_dns plain "$a0"
                     ;;
                 custom)
                     local shift_args
                     shift_args="${args[*]:1}"
-                    apply_dns custom "$shift_args"
+                    apply_dns plain custom "$shift_args"
                     ;;
                 *)
-                    echo -e "${RED}dns: использование — local|cloudflare|google|yandex|quad9|adguard|custom <ips...>${NC}"
+                    echo -e "${RED}dns: использование:${NC}"
+                    echo "  dns                              # статус"
+                    echo "  dns local                        # вернуть провайдерский DNS"
+                    echo "  dns plain|dot|doh <preset>       # plain/DoT/DoH"
+                    echo "  dns plain|dot|doh custom <args>  # custom IP-адреса (или URL для DoH)"
+                    echo "  preset = cloudflare|google|yandex|quad9|adguard"
                     exit 1
                     ;;
             esac
@@ -2507,7 +2922,7 @@ main_menu() {
         echo ""
         echo -e "Выберите действие:"
         echo -e "  ${GREEN}[1]${NC} Подготовка: компоненты Phoenix-X"
-        echo -e "  ${CYAN}[2]${NC} ${BOLD}Применить v8.0${NC} (multi-queue / XPS / IRQ / conntrack / MPTCP / DNS / ECN)"
+        echo -e "  ${CYAN}[2]${NC} ${BOLD}Применить v8.1${NC} (multi-queue / XPS / MTU-probe / DoT/DoH / VM-tune / iOS-RU)"
         echo -e "  ${CYAN}[3]${NC} Stealth: генератор шума (iOS + RU email/news + APT phantom)"
         echo -e "  ${CYAN}[4]${NC} Подкачка: SWAP & ZRAM"
         echo -e "  ${CYAN}[5]${NC} Бенчмарк (пинг до популярных endpoints)"
