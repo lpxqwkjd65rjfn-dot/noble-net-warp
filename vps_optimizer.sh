@@ -2,25 +2,57 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v6.1 PHOENIX - HUMAN PROFILE EDITION)
+# VPS Global Optimization Script (v7.0 PHOENIX-X)
 # ------------------------------------------------------------------------------
-#  - Adaptive TCP/UDP buffers (BDP-aware, scales with RAM)
-#  - Robust BBR/BBR2/BBR3 detection (no blind modprobe)
-#  - Correct RPS/RFS bitmask for >32 cores
-#  - LRO disabled (critical for forwarding/proxy use-cases)
-#  - File descriptor limits actually applied (limits.conf + nr_open)
-#  - ZRAM tuned with vm.swappiness=180 / page-cluster=0
-#  - Persistent RPS via systemd unit (survives reboots)
-#  - Stealth iOS noise: realistic UA pool, HTTP/3 + HTTP/2, TLS 1.3,
-#    iOS service endpoints (apple, icloud, mzstatic, push), human-like
-#    burst/idle timing, optional curl-impersonate-safari for full JA3.
-#  - RU human profile: Yandex/Mail.ru/Max.ru email + news sites with
-#    configurable session intervals (recommended OR fully custom).
-#  - Phantom APT activity: periodic apt-get update + .deb downloads of
-#    libraries and OS images that are immediately discarded — looks like
-#    a normal Ubuntu host running unattended-upgrades.
-#  - All noise parameters externalised to /etc/vps-noise.conf and editable.
+# Phase 1 — Correctness on locked-down rented VPS:
+#   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
+#   - Probe-then-write for every sysctl & sysfs knob (no broken /etc/sysctl.d
+#     entries, no failing oneshot units after reboot)
+#   - Kernel-version gate (MPTCP, BBR2/3, gro_flush_timeout, etc.)
+#   - Self-test report after apply (OK / SKIPPED / DENIED for each setting)
+#
+# Phase 2 — Multi-core load distribution:
+#   - RPS + RFS (correct bitmask for >32 cores)
+#   - XPS (Transmit Packet Steering) — was missing in v6.1
+#   - IRQ affinity spreading via /proc/irq/*/smp_affinity_list (when writable)
+#   - flow_limit_table_len + flow_limit_cpu_bitmap
+#   - sched_autogroup_enabled=0, migration_cost, NAPI defer
+#   - CPU governor → performance (best effort, silent fallback)
+#
+# Phase 3 — Real proxy bottlenecks:
+#   - conntrack tuning (max=1M, hashsize=256k, timeout-tuned for proxies)
+#   - MPTCP enabled when supported
+#   - BBR pacing tuned (pacing_ss_ratio, pacing_ca_ratio, min_rtt_wlen)
+#   - tcp_min_snd_mss, tcp_max_orphans, tcp_collapse_max_bytes
+#   - accept_redirects/send_redirects/source_route hardening
+#
+# Phase 4 — Memory / I/O:
+#   - Transparent Huge Pages → madvise (no latency spikes)
+#   - I/O scheduler: none for NVMe, mq-deadline for SSD
+#   - nr_requests / read_ahead_kb tuning
+#   - inotify watches/instances raised
+#   - core_pattern → /dev/null (no disk fill on crash)
+#
+# Phase 6 — UX:
+#   - Profile presets: balanced / proxy / web (different sysctl mixes)
+#   - Status dashboard (BBR, qdisc, conntrack usage, ZRAM, fds, noise)
+#   - Non-interactive CLI: apply / status / noise on|off|edit / preset / reset
+#                         / dry-run / self-test / export / import / update
+#   - dry-run mode: shows everything that WOULD change without touching system
+#   - Self-update from GitHub
+#
+# Inherited from v6.0/v6.1:
+#   - Adaptive TCP/UDP buffers scaled with RAM
+#   - LRO off, ring buffers maxed, adaptive coalescence
+#   - File descriptor limits (limits.conf + systemd defaults)
+#   - ZRAM (zstd → lz4 fallback)
+#   - Persistent RPS/XPS via systemd
+#   - iOS Stealth noise + RU human profile (Yandex/Mail.ru/Max.ru/news)
+#     + APT phantom (libs + OS images → /dev/null)
+#   - All noise parameters in /etc/vps-noise.conf
 # ==============================================================================
+
+set -o pipefail
 
 # Цвета
 RED='\033[0;31m'
@@ -28,6 +60,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
+GRAY='\033[0;90m'
 NC='\033[0m'
 BOLD='\033[1m'
 
@@ -40,14 +73,31 @@ RPS_BOOT_SERVICE="/etc/systemd/system/vps-rps.service"
 EXP_CONF="/etc/sysctl.d/99-vps-experimental.conf"
 SYSCTL_BACKUP="/etc/sysctl.d/.99-vps-optimizer.bak"
 NOISE_CONF="/etc/vps-noise.conf"
+PRESET_FILE="/etc/vps-optimizer.preset"
+SELF_URL="https://raw.githubusercontent.com/lpxqwkjd65rjfn-dot/noble-net-warp/main/vps_optimizer.sh"
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+RUN_LOG="/var/log/vps-optimizer.log"
+
+# Глобальные флаги (управляются через CLI)
+DRY_RUN=0
+QUIET=0
+PRESET=""
+
+# Сводки sysctl/sysfs/ethtool — заполняются в процессе apply, печатаются в self_test
+SYSCTL_OK=()
+SYSCTL_SKIP=()
+SYSFS_OK=()
+SYSFS_SKIP=()
 
 print_header() {
+    [ "$QUIET" = "1" ] && return
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "     ULTRA VPS ACCELERATOR v6.1 (PHOENIX / HUMAN PROFILE)      "
+    echo "       ULTRA VPS ACCELERATOR v7.0 (PHOENIX-X)                    "
     echo "================================================================="
-    echo -e "  Adaptive Buffers | RPS/RFS | ZRAM | iOS+RU Stealth | APT Phantom"
+    echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
+    echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
     echo -e "=================================================================${NC}"
     echo ""
 }
@@ -59,10 +109,90 @@ check_root() {
     fi
 }
 
-# Доступен ли указанный congestion control в ядре?
+# Лог в файл (перезаписывается при каждом запуске apply, рядом — на консоль)
+_log() {
+    local level="$1"; shift
+    local msg="$*"
+    [ "$QUIET" = "1" ] || echo -e "$msg"
+    echo "[$(date -u +%FT%TZ)] [$level] $(echo -e "$msg" | sed 's/\x1b\[[0-9;]*m//g')" >> "$RUN_LOG" 2>/dev/null || true
+}
+
+# ===================================================================
+#  Хелперы детектирования среды
+# ===================================================================
+
+# Возвращает: kvm / xen / openvz / lxc / docker / wsl / none
+detect_virt() {
+    local v=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        v=$(systemd-detect-virt 2>/dev/null || echo none)
+    fi
+    [ -z "$v" ] && v="none"
+    echo "$v"
+}
+
+# Парсим ядро в число "MAJORMINORPATCH" для версионных гейтов
+kernel_version_int() {
+    local kv
+    kv=$(uname -r | awk -F'[.-]' '{printf "%d%02d%02d", $1, $2, ($3==""?0:$3)}')
+    echo "$kv"
+}
+
+# Поддерживается ли sysctl (есть ли соответствующий файл в /proc/sys/...)?
+kernel_supports_sysctl() {
+    local key="$1"
+    [ -e "/proc/sys/${key//.//}" ]
+}
+
+# Доступен ли congestion control в ядре?
 has_cong_ctl() {
     local algo="$1"
     grep -qw "$algo" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null
+}
+
+# Безопасная запись sysctl: probe-then-persist.
+# Сначала пробуем `sysctl -w` в память, и только при успехе добавляем в
+# `$SYSCTL_CONF`. Если ядро не знает ключ — тихо скипаем (важно на OpenVZ).
+SYSCTL_TMP=""
+sysctl_safe() {
+    local key="$1" value="$2"
+    if ! kernel_supports_sysctl "$key"; then
+        SYSCTL_SKIP+=("$key=unsupported")
+        return 1
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        SYSCTL_OK+=("$key=$value (dry-run)")
+        [ -n "$SYSCTL_TMP" ] && echo "$key = $value" >> "$SYSCTL_TMP"
+        return 0
+    fi
+    if sysctl -w "$key=$value" >/dev/null 2>&1; then
+        SYSCTL_OK+=("$key=$value")
+        [ -n "$SYSCTL_TMP" ] && echo "$key = $value" >> "$SYSCTL_TMP"
+        return 0
+    else
+        SYSCTL_SKIP+=("$key=denied")
+        return 1
+    fi
+}
+
+# Безопасная запись в /sys или /proc: проверяем существование и writability.
+sysfs_safe() {
+    local path="$1" value="$2"
+    if [ ! -e "$path" ]; then
+        SYSFS_SKIP+=("$path:missing")
+        return 1
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        SYSFS_OK+=("$path=$value (dry-run)")
+        return 0
+    fi
+    if echo "$value" > "$path" 2>/dev/null; then
+        SYSFS_OK+=("$path=$value")
+        return 0
+    else
+        SYSFS_SKIP+=("$path:denied")
+        return 1
+    fi
 }
 
 # Корректно строим bitmask CPU для rps_cpus, формат группами по 32 бита,
@@ -84,6 +214,12 @@ build_cpu_mask() {
         rest=",ffffffff${rest}"
     done
     echo "${first}${rest}"
+}
+
+# Список «реальных» сетевых интерфейсов — без виртуальных оверлеев.
+list_real_ifaces() {
+    ip -o link show 2>/dev/null | \
+        awk -F': ' '$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube|cni)/ {print $2}'
 }
 
 run_benchmark() {
@@ -141,56 +277,441 @@ EOF
     sleep 1
 }
 
-apply_optimizations() {
-    echo -e "${YELLOW}[*] Глобальный тюнинг системы v6.1 PHOENIX...${NC}"
+# ===================================================================
+#  Профили (presets)
+# ===================================================================
+# Каждый пресет — функция, которая выставляет глобальные PRESET_*
+# переменные. Дальше apply_*_modules() читают их. Если значение не
+# задано — берётся «balanced» по умолчанию.
 
-    # Сохраняем оригинал, если уже был наш конфиг
-    if [ -f "$SYSCTL_CONF" ] && [ ! -f "$SYSCTL_BACKUP" ]; then
-        cp "$SYSCTL_CONF" "$SYSCTL_BACKUP"
+preset_balanced() {
+    PRESET_NAME="balanced"
+    PRESET_NOFILE=1048576
+    PRESET_BUF_MULT=1
+    PRESET_TCP_FASTOPEN=3
+    PRESET_TCP_FIN_TIMEOUT=10
+    PRESET_TCP_KEEPALIVE_TIME=600
+    PRESET_TCP_TW_BUCKETS=1440000
+    PRESET_TCP_MAX_ORPHANS=262144
+    PRESET_CONNTRACK_MAX=1048576
+    PRESET_CONNTRACK_BUCKETS=262144
+    PRESET_CONNTRACK_TCP_TIMEOUT=600
+    PRESET_NETDEV_BACKLOG=500000
+    PRESET_SOMAXCONN=65535
+    PRESET_RPS_FLOWS=4096
+    PRESET_PORT_RANGE="10000 65535"
+    PRESET_ZRAM_FRACTION=50
+    PRESET_SWAPPINESS=180
+    PRESET_BBR_PACING_SS=200
+    PRESET_BBR_PACING_CA=120
+}
+
+# Прокси (xray/sing-box/haproxy/nginx-stream/wireguard) — много короткоживущих
+# коннектов, агрессивные буферы, гигантский conntrack, максимум fds.
+preset_proxy() {
+    preset_balanced
+    PRESET_NAME="proxy"
+    PRESET_NOFILE=2097152
+    PRESET_BUF_MULT=2
+    PRESET_TCP_FIN_TIMEOUT=8
+    PRESET_TCP_KEEPALIVE_TIME=300
+    PRESET_TCP_TW_BUCKETS=2000000
+    PRESET_TCP_MAX_ORPHANS=524288
+    PRESET_CONNTRACK_MAX=2097152
+    PRESET_CONNTRACK_BUCKETS=524288
+    PRESET_CONNTRACK_TCP_TIMEOUT=300
+    PRESET_NETDEV_BACKLOG=1000000
+    PRESET_RPS_FLOWS=8192
+}
+
+# Web-сервер (nginx/apache, статический контент): меньше conntrack,
+# умереннее буферы, security-акценты.
+preset_web() {
+    preset_balanced
+    PRESET_NAME="web"
+    PRESET_BUF_MULT=1
+    PRESET_TCP_FIN_TIMEOUT=15
+    PRESET_TCP_KEEPALIVE_TIME=900
+    PRESET_TCP_TW_BUCKETS=720000
+    PRESET_CONNTRACK_MAX=524288
+    PRESET_CONNTRACK_BUCKETS=131072
+    PRESET_CONNTRACK_TCP_TIMEOUT=900
+}
+
+load_preset() {
+    local p="${1:-}"
+    if [ -z "$p" ] && [ -f "$PRESET_FILE" ]; then
+        p=$(tr -d '[:space:]' < "$PRESET_FILE" 2>/dev/null)
     fi
+    [ -z "$p" ] && p="balanced"
+    case "$p" in
+        proxy)    preset_proxy ;;
+        web)      preset_web ;;
+        balanced) preset_balanced ;;
+        *)        echo -e "${YELLOW}[!] Неизвестный пресет '$p', использую balanced${NC}"; preset_balanced ;;
+    esac
+    [ "$DRY_RUN" = "1" ] || echo "$PRESET_NAME" > "$PRESET_FILE" 2>/dev/null || true
+    _log INFO "Preset: ${BOLD}${CYAN}${PRESET_NAME}${NC}"
+}
 
-    # 1. RPS/RFS — раздаём softirq по всем ядрам
-    local interfaces cpu_cores rps_mask iface
-    interfaces=$(ip -o link show | awk -F': ' '$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube)/ {print $2}')
+# ===================================================================
+#  Модули apply_optimizations
+# ===================================================================
+
+apply_zram() {
+    if ! modprobe zram 2>/dev/null; then
+        _log WARN "${YELLOW}[!] ZRAM недоступен (контейнер?) — пропуск.${NC}"
+        return 0
+    fi
+    [ "$DRY_RUN" = "1" ] && { _log INFO "${GRAY}[dry-run] ZRAM пропущен${NC}"; return 0; }
+    swapoff /dev/zram0 2>/dev/null || true
+    zramctl --reset /dev/zram0 2>/dev/null || true
+    local mem_total zram_size
+    mem_total=$(free -m | awk '/Mem:/{print $2}')
+    zram_size=$(( mem_total * PRESET_ZRAM_FRACTION / 100 ))
+    [ "$zram_size" -lt 256 ] && zram_size=256
+    zramctl --find --size "${zram_size}M" --algorithm zstd >/dev/null 2>&1 || \
+        zramctl --find --size "${zram_size}M" --algorithm lz4 >/dev/null 2>&1
+    mkswap /dev/zram0 >/dev/null 2>&1
+    swapon /dev/zram0 -p 100 2>/dev/null || true
+    _log OK "${GREEN}[+] ZRAM активен (${zram_size}MB).${NC}"
+}
+
+# Тюнинг сетевых интерфейсов: RPS, XPS, RFS, ring buffers, coalescence, LRO off.
+apply_iface_tuning() {
+    local interfaces cpu_cores rps_mask
+    interfaces=$(list_real_ifaces)
     cpu_cores=$(nproc)
     rps_mask=$(build_cpu_mask "$cpu_cores")
 
+    if [ -z "$interfaces" ]; then
+        _log WARN "${YELLOW}[!] Реальных интерфейсов не найдено — пропуск iface tuning.${NC}"
+        return 0
+    fi
+
+    sysctl_safe net.core.rps_sock_flow_entries 32768
+
+    local iface
     for iface in $interfaces; do
-        echo -e "${YELLOW}[*] RPS/RFS тюнинг: $iface (Маска: $rps_mask)${NC}"
+        _log INFO "${YELLOW}[*] Iface tuning: $iface (mask=$rps_mask)${NC}"
         local f
+        # RPS — RX softirq распределение
         for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
-            if [ -e "$f" ]; then echo "$rps_mask" > "$f" 2>/dev/null || true; fi
+            [ -e "$f" ] && sysfs_safe "$f" "$rps_mask"
         done
-        echo "32768" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+        # RFS — flow steering
         for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
-            if [ -e "$f" ]; then echo "4096" > "$f" 2>/dev/null || true; fi
+            [ -e "$f" ] && sysfs_safe "$f" "${PRESET_RPS_FLOWS}"
+        done
+        # XPS — TX распределение (новое в v7.0). Каждой TX-очереди свой
+        # bitmask. Если очередей >= ядер — раздаём по одному CPU на очередь;
+        # иначе — общая полная маска.
+        local txq_idx=0 cpu_idx=0
+        for f in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
+            if [ -e "$f" ]; then
+                if [ "$cpu_cores" -gt 0 ]; then
+                    cpu_idx=$(( txq_idx % cpu_cores ))
+                    local one_cpu_mask
+                    one_cpu_mask=$(printf '%x' $(( 1 << cpu_idx )))
+                    sysfs_safe "$f" "$one_cpu_mask"
+                else
+                    sysfs_safe "$f" "$rps_mask"
+                fi
+                txq_idx=$(( txq_idx + 1 ))
+            fi
         done
 
-        # Аппаратное ускорение. ВАЖНО: LRO выключаем — он ломает форвардинг
-        # (а именно ради проксирования/туннелей этот скрипт и используют).
-        ethtool -K "$iface" rx on tx on sg on tso on gso on gro on lro off >/dev/null 2>&1 || true
+        # ВАЖНО: LRO выключаем — он ломает форвардинг.
+        if [ "$DRY_RUN" != "1" ]; then
+            ethtool -K "$iface" rx on tx on sg on tso on gso on gro on lro off >/dev/null 2>&1 || true
 
-        # Поднимаем ring buffers до максимума, если железо разрешает
-        local ring_max_rx ring_max_tx
-        ring_max_rx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f && /^RX:/{print $2; exit}')
-        ring_max_tx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f && /^TX:/{print $2; exit}')
-        if [ -n "$ring_max_rx" ] && [ -n "$ring_max_tx" ]; then
-            ethtool -G "$iface" rx "$ring_max_rx" tx "$ring_max_tx" >/dev/null 2>&1 || true
+            # Ring buffers до железного максимума
+            local ring_max_rx ring_max_tx
+            ring_max_rx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f && /^RX:/{print $2; exit}')
+            ring_max_tx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f && /^TX:/{print $2; exit}')
+            if [ -n "$ring_max_rx" ] && [ -n "$ring_max_tx" ]; then
+                ethtool -G "$iface" rx "$ring_max_rx" tx "$ring_max_tx" >/dev/null 2>&1 || true
+            fi
+            ethtool -C "$iface" adaptive-rx on adaptive-tx on >/dev/null 2>&1 || \
+                ethtool -C "$iface" rx-usecs 8 tx-usecs 8 >/dev/null 2>&1 || true
         fi
-
-        # Адаптивная коалесценция прерываний — лучше для смешанной нагрузки
-        ethtool -C "$iface" adaptive-rx on adaptive-tx on >/dev/null 2>&1 || \
-            ethtool -C "$iface" rx-usecs 8 tx-usecs 8 >/dev/null 2>&1 || true
     done
+}
 
-    # Делаем RPS-настройки персистентными (через systemd) — без этого
-    # настройки очередей сбрасываются при ребуте.
+# Размазываем сетевые IRQ по ядрам. На многих VPS /proc/irq/*/smp_affinity_list
+# не writable (provider запретил) — тогда мягко скипаем.
+apply_irq_affinity() {
+    local cpu_cores
+    cpu_cores=$(nproc)
+    if [ "$cpu_cores" -lt 2 ]; then
+        _log INFO "${GRAY}[*] 1 CPU — IRQ affinity пропуск.${NC}"
+        return 0
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        _log INFO "${GRAY}[dry-run] IRQ affinity не трогаю${NC}"
+        return 0
+    fi
+    # Гасим irqbalance, иначе он перетрёт наши настройки. В контейнерах он
+    # обычно не запущен — просто скипаем ошибку.
+    systemctl stop irqbalance 2>/dev/null || true
+    systemctl disable irqbalance 2>/dev/null || true
+
+    local iface irq_list irq cpu_idx=0
+    for iface in $(list_real_ifaces); do
+        # IRQs принадлежащие интерфейсу — ищем в /proc/interrupts по
+        # суффиксу с именем интерфейса (например, virtio0-input.0).
+        irq_list=$(awk -v ifn="$iface" '$NF ~ ifn {gsub(":","",$1); print $1}' /proc/interrupts 2>/dev/null)
+        for irq in $irq_list; do
+            local affinity_file="/proc/irq/${irq}/smp_affinity_list"
+            if [ -w "$affinity_file" ]; then
+                if echo "$cpu_idx" > "$affinity_file" 2>/dev/null; then
+                    SYSFS_OK+=("irq#${irq}->cpu${cpu_idx}")
+                else
+                    SYSFS_SKIP+=("irq#${irq}:write-failed")
+                fi
+                cpu_idx=$(( (cpu_idx + 1) % cpu_cores ))
+            else
+                SYSFS_SKIP+=("irq#${irq}:no-write")
+            fi
+        done
+    done
+}
+
+# CPU governor → performance. На share-VM часто залочено провайдером —
+# скипаем без сбоя.
+apply_cpu_governor() {
+    [ "$DRY_RUN" = "1" ] && { _log INFO "${GRAY}[dry-run] CPU governor не трогаю${NC}"; return 0; }
+    local f set=0
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        if [ -w "$f" ]; then
+            echo performance > "$f" 2>/dev/null && set=1
+        fi
+    done
+    if [ "$set" = "1" ]; then
+        _log OK "${GREEN}[+] CPU governor → performance${NC}"
+    else
+        _log INFO "${GRAY}[*] CPU governor: на этой VPS не управляется (провайдер) — skip${NC}"
+    fi
+}
+
+# Transparent Huge Pages → madvise (без latency spikes на прокси-нагрузках).
+apply_thp() {
+    [ "$DRY_RUN" = "1" ] && { _log INFO "${GRAY}[dry-run] THP не трогаю${NC}"; return 0; }
+    if [ -w /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        if echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null; then
+            _log OK "${GREEN}[+] THP=madvise${NC}"
+        fi
+    fi
+    if [ -w /sys/kernel/mm/transparent_hugepage/defrag ]; then
+        echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+    fi
+}
+
+# I/O scheduler: для NVMe — none, для SSD — mq-deadline. Плюс readahead.
+apply_block_io() {
+    [ "$DRY_RUN" = "1" ] && { _log INFO "${GRAY}[dry-run] block I/O не трогаю${NC}"; return 0; }
+    local dev
+    for dev in /sys/block/*; do
+        local name="${dev##*/}"
+        # Виртуальные / loop / zram пропускаем
+        case "$name" in
+            loop*|ram*|zram*|sr*|fd*|dm-*|md*) continue ;;
+        esac
+        local rotational
+        rotational=$(cat "$dev/queue/rotational" 2>/dev/null || echo 1)
+        local target="mq-deadline"
+        # NVMe имена начинаются на nvme*; для них — none (multi-queue device)
+        case "$name" in
+            nvme*) target="none" ;;
+        esac
+        # HDD (rotational=1) → bfq если есть, иначе mq-deadline
+        if [ "$rotational" = "1" ]; then target="mq-deadline"; fi
+        if [ -w "$dev/queue/scheduler" ]; then
+            local available
+            available=$(cat "$dev/queue/scheduler" 2>/dev/null)
+            if echo "$available" | grep -qw "$target"; then
+                if echo "$target" > "$dev/queue/scheduler" 2>/dev/null; then
+                    SYSFS_OK+=("$name:scheduler=$target")
+                fi
+            fi
+        fi
+        [ -w "$dev/queue/nr_requests" ] && \
+            sysfs_safe "$dev/queue/nr_requests" 512
+        [ -w "$dev/queue/read_ahead_kb" ] && \
+            sysfs_safe "$dev/queue/read_ahead_kb" 128
+    done
+    # core_pattern → /dev/null: на закрытых cloud VM крах процесса не должен
+    # съедать диск дампами.
+    if [ -w /proc/sys/kernel/core_pattern ]; then
+        sysctl_safe kernel.core_pattern "|/bin/false" || true
+    fi
+}
+
+# Все sysctls — через probe-then-write. То, что ядро/гипервизор не приняли,
+# не попадёт в persistent-конфиг. Это и есть главная фишка v7.0.
+apply_sysctls() {
+    local kvi
+    kvi=$(kernel_version_int)
+
+    # Базовые fs/kernel
+    sysctl_safe fs.file-max 2000000
+    sysctl_safe fs.nr_open 2000000
+    sysctl_safe kernel.pid_max 4194304
+    sysctl_safe fs.inotify.max_user_watches 524288
+    sysctl_safe fs.inotify.max_user_instances 512
+    sysctl_safe kernel.sched_autogroup_enabled 0
+    sysctl_safe kernel.sched_migration_cost_ns 5000000
+
+    # Подбираем congestion control из реально доступных
+    local best_bbr="cubic"
+    if has_cong_ctl bbr3; then best_bbr="bbr3"
+    elif has_cong_ctl bbr2; then best_bbr="bbr2"
+    elif has_cong_ctl bbr;  then best_bbr="bbr"
+    fi
+
+    local best_qdisc="fq_codel"
+    if modprobe sch_cake 2>/dev/null; then best_qdisc="cake"
+    elif modprobe sch_fq 2>/dev/null;   then best_qdisc="fq"
+    fi
+    [ "$best_bbr" != "cubic" ] && modprobe sch_fq 2>/dev/null && best_qdisc="fq"
+
+    # Адаптивные буферы — масштабируются по RAM × множитель пресета.
+    local mem_mb buf_max=134217728
+    mem_mb=$(free -m | awk '/Mem:/{print $2}')
+    [ "$mem_mb" -ge 8192 ]  && buf_max=268435456
+    [ "$mem_mb" -ge 16384 ] && buf_max=536870912
+    buf_max=$(( buf_max * PRESET_BUF_MULT ))
+
+    # Networking core
+    sysctl_safe net.core.default_qdisc "$best_qdisc"
+    sysctl_safe net.ipv4.tcp_congestion_control "$best_bbr"
+    sysctl_safe net.core.netdev_budget 600
+    sysctl_safe net.core.netdev_budget_usecs 8000
+    sysctl_safe net.core.netdev_max_backlog "$PRESET_NETDEV_BACKLOG"
+    sysctl_safe net.core.somaxconn "$PRESET_SOMAXCONN"
+    sysctl_safe net.core.busy_poll 50
+    sysctl_safe net.core.busy_read 50
+    sysctl_safe net.core.optmem_max 4194304
+    sysctl_safe net.core.dev_weight 128
+    sysctl_safe net.core.flow_limit_table_len 8192
+
+    # NAPI defer (Linux 5.12+)
+    if [ "$kvi" -ge 51200 ]; then
+        sysctl_safe net.core.gro_flush_timeout 200000
+        sysctl_safe net.core.napi_defer_hard_irqs 2
+    fi
+
+    # Buffers
+    sysctl_safe net.core.rmem_max "$buf_max"
+    sysctl_safe net.core.wmem_max "$buf_max"
+    sysctl_safe net.core.rmem_default 2097152
+    sysctl_safe net.core.wmem_default 2097152
+    sysctl_safe net.ipv4.tcp_rmem "4096 2097152 $buf_max"
+    sysctl_safe net.ipv4.tcp_wmem "4096 2097152 $buf_max"
+    sysctl_safe net.ipv4.tcp_mem "786432 1048576 1572864"
+    sysctl_safe net.ipv4.tcp_adv_win_scale -2
+    sysctl_safe net.ipv4.tcp_moderate_rcvbuf 1
+    sysctl_safe net.ipv4.tcp_notsent_lowat 131072
+
+    # UDP — критично для QUIC/Reality/XHTTP
+    sysctl_safe net.ipv4.udp_rmem_min 131072
+    sysctl_safe net.ipv4.udp_wmem_min 131072
+    sysctl_safe net.ipv4.udp_mem "786432 1048576 1572864"
+
+    # TCP behavior
+    sysctl_safe net.ipv4.tcp_mtu_probing 1
+    sysctl_safe net.ipv4.tcp_window_scaling 1
+    sysctl_safe net.ipv4.tcp_sack 1
+    sysctl_safe net.ipv4.tcp_dsack 1
+    sysctl_safe net.ipv4.tcp_fack 0
+    sysctl_safe net.ipv4.tcp_timestamps 1
+    sysctl_safe net.ipv4.tcp_no_metrics_save 1
+    sysctl_safe net.ipv4.tcp_slow_start_after_idle 0
+    sysctl_safe net.ipv4.tcp_tw_reuse 1
+    sysctl_safe net.ipv4.tcp_max_tw_buckets "$PRESET_TCP_TW_BUCKETS"
+    sysctl_safe net.ipv4.tcp_fin_timeout "$PRESET_TCP_FIN_TIMEOUT"
+    sysctl_safe net.ipv4.tcp_keepalive_time "$PRESET_TCP_KEEPALIVE_TIME"
+    sysctl_safe net.ipv4.tcp_keepalive_intvl 30
+    sysctl_safe net.ipv4.tcp_keepalive_probes 5
+    sysctl_safe net.ipv4.tcp_fastopen "$PRESET_TCP_FASTOPEN"
+    sysctl_safe net.ipv4.tcp_max_syn_backlog 65535
+    sysctl_safe net.ipv4.tcp_synack_retries 2
+    sysctl_safe net.ipv4.tcp_syn_retries 3
+    sysctl_safe net.ipv4.tcp_max_orphans "$PRESET_TCP_MAX_ORPHANS"
+    sysctl_safe net.ipv4.tcp_orphan_retries 2
+    sysctl_safe net.ipv4.tcp_min_snd_mss 536
+    sysctl_safe net.ipv4.tcp_min_rtt_wlen 300
+    sysctl_safe net.ipv4.tcp_pacing_ss_ratio "$PRESET_BBR_PACING_SS"
+    sysctl_safe net.ipv4.tcp_pacing_ca_ratio "$PRESET_BBR_PACING_CA"
+    sysctl_safe net.ipv4.tcp_collapse_max_bytes 6291456
+    sysctl_safe net.ipv4.ip_local_port_range "$PRESET_PORT_RANGE"
+
+    # MPTCP (Linux 5.6+)
+    if [ "$kvi" -ge 50600 ]; then
+        sysctl_safe net.mptcp.enabled 1
+    fi
+
+    # Маскировка стека: TTL=64 как у нативного Linux-десктопа.
+    sysctl_safe net.ipv4.ip_default_ttl 64
+
+    # Security / hygiene
+    sysctl_safe net.ipv4.tcp_syncookies 1
+    sysctl_safe net.ipv4.tcp_rfc1337 1
+    sysctl_safe net.ipv4.conf.all.rp_filter 1
+    sysctl_safe net.ipv4.conf.default.rp_filter 1
+    sysctl_safe net.ipv4.conf.all.accept_redirects 0
+    sysctl_safe net.ipv4.conf.default.accept_redirects 0
+    sysctl_safe net.ipv4.conf.all.send_redirects 0
+    sysctl_safe net.ipv4.conf.default.send_redirects 0
+    sysctl_safe net.ipv4.conf.all.accept_source_route 0
+    sysctl_safe net.ipv4.conf.default.accept_source_route 0
+    sysctl_safe net.ipv4.icmp_echo_ignore_broadcasts 1
+    sysctl_safe net.ipv6.conf.all.accept_redirects 0
+    sysctl_safe net.ipv6.conf.default.accept_redirects 0
+
+    # IPv6 mirror
+    sysctl_safe net.ipv6.conf.all.disable_ipv6 0
+    sysctl_safe net.ipv6.conf.default.disable_ipv6 0
+
+    # conntrack — критический пункт для прокси-нагрузок. Модуль может быть
+    # не загружен — пробуем поднять, sysctls появятся только после этого.
+    modprobe nf_conntrack 2>/dev/null || true
+    if kernel_supports_sysctl net.netfilter.nf_conntrack_max; then
+        sysctl_safe net.netfilter.nf_conntrack_max "$PRESET_CONNTRACK_MAX"
+        sysctl_safe net.netfilter.nf_conntrack_buckets "$PRESET_CONNTRACK_BUCKETS"
+        sysctl_safe net.netfilter.nf_conntrack_tcp_timeout_established "$PRESET_CONNTRACK_TCP_TIMEOUT"
+        sysctl_safe net.netfilter.nf_conntrack_tcp_timeout_time_wait 30
+        sysctl_safe net.netfilter.nf_conntrack_tcp_timeout_close_wait 30
+        sysctl_safe net.netfilter.nf_conntrack_tcp_timeout_fin_wait 30
+        sysctl_safe net.netfilter.nf_conntrack_generic_timeout 120
+    fi
+
+    # VM / ZRAM tuning
+    sysctl_safe vm.swappiness "$PRESET_SWAPPINESS"
+    sysctl_safe vm.page-cluster 0
+    sysctl_safe vm.vfs_cache_pressure 50
+    sysctl_safe vm.dirty_background_ratio 5
+    sysctl_safe vm.dirty_ratio 10
+    sysctl_safe vm.min_free_kbytes 65536
+    sysctl_safe vm.zone_reclaim_mode 0
+
+    APPLIED_BBR="$best_bbr"
+    APPLIED_QDISC="$best_qdisc"
+    APPLIED_BUF_MAX="$buf_max"
+}
+
+# Persistent unit: после ребута заново применяет RPS, RFS, XPS, LRO=off.
+# Сами sysctls персистентны через /etc/sysctl.d/, а sysfs-настройки нет —
+# поэтому именно их и восстанавливает этот юнит.
+apply_persistent_units() {
+    [ "$DRY_RUN" = "1" ] && return 0
     cat > "$RPS_BOOT_SCRIPT" <<'RPS_EOF'
 #!/bin/bash
-set -e
+# Auto-generated by vps_optimizer.sh — restores RPS/XPS/RFS/LRO after reboot.
+set +e
 build_cpu_mask() {
     local n=$1
-    if [ "$n" -le 0 ]; then echo "0"; return; fi
+    [ "$n" -le 0 ] && { echo 0; return; }
     local groups=$(( (n + 31) / 32 ))
     local last_bits=$(( n - (groups - 1) * 32 ))
     local first
@@ -203,14 +724,26 @@ build_cpu_mask() {
     for ((i=1; i<groups; i++)); do rest=",ffffffff${rest}"; done
     echo "${first}${rest}"
 }
-MASK=$(build_cpu_mask "$(nproc)")
+CORES=$(nproc)
+MASK=$(build_cpu_mask "$CORES")
 echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-for IFACE in $(ip -o link show | awk -F': ' '$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube)/ {print $2}'); do
+
+for IFACE in $(ip -o link show | awk -F': ' '$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube|cni)/ {print $2}'); do
     for f in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
         [ -e "$f" ] && echo "$MASK" > "$f" 2>/dev/null || true
     done
     for f in /sys/class/net/"$IFACE"/queues/rx-*/rps_flow_cnt; do
         [ -e "$f" ] && echo 4096 > "$f" 2>/dev/null || true
+    done
+    # XPS: каждой TX-очереди свой CPU
+    txi=0
+    for f in /sys/class/net/"$IFACE"/queues/tx-*/xps_cpus; do
+        if [ -e "$f" ]; then
+            cpu_idx=$(( txi % CORES ))
+            mask=$(printf '%x' $(( 1 << cpu_idx )))
+            echo "$mask" > "$f" 2>/dev/null || true
+            txi=$(( txi + 1 ))
+        fi
     done
     ethtool -K "$IFACE" lro off >/dev/null 2>&1 || true
 done
@@ -218,7 +751,7 @@ RPS_EOF
     chmod +x "$RPS_BOOT_SCRIPT"
     cat > "$RPS_BOOT_SERVICE" <<EOF
 [Unit]
-Description=VPS RPS/RFS persistent tuning
+Description=VPS RPS/RFS/XPS persistent tuning
 After=network-online.target
 Wants=network-online.target
 
@@ -232,164 +765,120 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now vps-rps.service >/dev/null 2>&1 || true
+}
 
-    # 2. ZRAM
-    if modprobe zram 2>/dev/null; then
-        echo -e "${YELLOW}[*] Активация ZRAM акселератора...${NC}"
-        swapoff /dev/zram0 2>/dev/null || true
-        zramctl --reset /dev/zram0 2>/dev/null || true
-
-        local mem_total zram_size
-        mem_total=$(free -m | awk '/Mem:/{print $2}')
-        # Сжатый swap размером ~50% RAM (zstd ~3x сжатие → ~1.5x эффективной RAM).
-        zram_size=$(( mem_total / 2 ))
-        if [ "$zram_size" -lt 256 ]; then zram_size=256; fi
-
-        zramctl --find --size "${zram_size}M" --algorithm zstd >/dev/null 2>&1 || \
-            zramctl --find --size "${zram_size}M" --algorithm lz4 >/dev/null 2>&1
-        mkswap /dev/zram0 >/dev/null 2>&1
-        swapon /dev/zram0 -p 100 2>/dev/null || true
-        echo -e "${GREEN}[+] ZRAM активен (${zram_size}MB).${NC}"
-    else
-        echo -e "${RED}[!] ZRAM не поддерживается ядром.${NC}"
-    fi
-
-    # 3. Подбираем лучший congestion control из реально доступных
-    local best_bbr="cubic"
-    if has_cong_ctl bbr3; then best_bbr="bbr3"
-    elif has_cong_ctl bbr2; then best_bbr="bbr2"
-    elif has_cong_ctl bbr;  then best_bbr="bbr"
-    fi
-
-    # Лучший qdisc: cake (умный, AQM), fq (BBR-friendly), fq_codel (fallback)
-    local best_qdisc="fq_codel"
-    if modprobe sch_cake 2>/dev/null; then best_qdisc="cake"
-    elif modprobe sch_fq 2>/dev/null;   then best_qdisc="fq"
-    fi
-    # BBR любит именно fq — если он есть, оставляем fq
-    if [ "$best_bbr" != "cubic" ] && modprobe sch_fq 2>/dev/null; then
-        best_qdisc="fq"
-    fi
-
-    # 4. Адаптивные буферы. BDP для 1Gbps×100ms ≈ 12MB,
-    # для 10Gbps×100ms ≈ 125MB. Берём 128MB как разумный максимум,
-    # на жирной RAM поднимаем до 256MB. UDP отдельно — критично для QUIC/Reality.
-    local mem_mb buf_max=134217728
-    mem_mb=$(free -m | awk '/Mem:/{print $2}')
-    if [ "$mem_mb" -ge 8192 ]; then buf_max=268435456; fi
-    if [ "$mem_mb" -ge 16384 ]; then buf_max=536870912; fi
-
-    cat > "$SYSCTL_CONF" <<EOF
-# === Phoenix Performance ===
-fs.file-max = 2000000
-fs.nr_open = 2000000
-kernel.pid_max = 4194304
-
-# --- Networking core ---
-net.core.default_qdisc = $best_qdisc
-net.ipv4.tcp_congestion_control = $best_bbr
-net.core.netdev_budget = 600
-net.core.netdev_budget_usecs = 8000
-net.core.netdev_max_backlog = 500000
-net.core.somaxconn = 65535
-net.core.busy_poll = 50
-net.core.busy_read = 50
-net.core.optmem_max = 4194304
-net.core.rps_sock_flow_entries = 32768
-
-# --- TCP buffers (BDP-tuned, scales with RAM) ---
-net.core.rmem_max = $buf_max
-net.core.wmem_max = $buf_max
-net.core.rmem_default = 2097152
-net.core.wmem_default = 2097152
-net.ipv4.tcp_rmem = 4096 2097152 $buf_max
-net.ipv4.tcp_wmem = 4096 2097152 $buf_max
-net.ipv4.tcp_mem = 786432 1048576 1572864
-net.ipv4.tcp_adv_win_scale = -2
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_notsent_lowat = 131072
-
-# --- UDP buffers (важно для QUIC/Reality/XHTTP) ---
-net.ipv4.udp_rmem_min = 131072
-net.ipv4.udp_wmem_min = 131072
-net.ipv4.udp_mem = 786432 1048576 1572864
-
-# --- TCP behavior ---
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 0
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 1440000
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.ip_local_port_range = 10000 65535
-
-# --- Stealth / маскировка стека под обычный десктоп ---
-# TTL=64 — стандартное значение Linux (а не «64 минус N» как у тоннелей).
-# Это убирает явный признак, что трафик вышел из-под VPN/прокси.
-net.ipv4.ip_default_ttl = 64
-
-# --- Security ---
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-
-# --- IPv6 mirror ---
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-
-# --- VM/ZRAM tuning ---
-vm.swappiness = 180
-vm.page-cluster = 0
-vm.vfs_cache_pressure = 50
-vm.dirty_background_ratio = 5
-vm.dirty_ratio = 10
-vm.min_free_kbytes = 65536
-EOF
-
-    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
-
-    # 5. Лимиты файловых дескрипторов — раньше переменная LIMITS_CONF
-    # объявлялась, но никогда не использовалась. Это критично для
-    # высоконагруженных прокси (xray, sing-box, haproxy).
+apply_limits() {
+    [ "$DRY_RUN" = "1" ] && return 0
     cat > "$LIMITS_CONF" <<EOF
-*       soft    nofile  1048576
-*       hard    nofile  1048576
-root    soft    nofile  1048576
-root    hard    nofile  1048576
+*       soft    nofile  $PRESET_NOFILE
+*       hard    nofile  $PRESET_NOFILE
+root    soft    nofile  $PRESET_NOFILE
+root    hard    nofile  $PRESET_NOFILE
 *       soft    nproc   unlimited
 *       hard    nproc   unlimited
 EOF
-    # systemd unit-files игнорируют limits.conf — ставим лимиты и для них.
     mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
     cat > /etc/systemd/system.conf.d/99-vps-limits.conf <<EOF
 [Manager]
-DefaultLimitNOFILE=1048576
+DefaultLimitNOFILE=$PRESET_NOFILE
 DefaultLimitNPROC=infinity
 EOF
     cat > /etc/systemd/user.conf.d/99-vps-limits.conf <<EOF
 [Manager]
-DefaultLimitNOFILE=1048576
+DefaultLimitNOFILE=$PRESET_NOFILE
 DefaultLimitNPROC=infinity
 EOF
     systemctl daemon-reexec >/dev/null 2>&1 || true
+}
 
-    echo -e "${GREEN}[+] Phoenix v6.1: BBR=${best_bbr}, qdisc=${best_qdisc}, buf_max=${buf_max}.${NC}"
+# Шапка в persistent-файле sysctl. Туда уже накопилось всё, что
+# реально применилось.
+finalize_sysctl_conf() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    if [ -f "$SYSCTL_CONF" ] && [ ! -f "$SYSCTL_BACKUP" ]; then
+        cp "$SYSCTL_CONF" "$SYSCTL_BACKUP" 2>/dev/null || true
+    fi
+    {
+        echo "# === VPS Optimizer v7.0 PHOENIX-X ==="
+        echo "# Generated $(date -u +%FT%TZ)  preset=$PRESET_NAME  virt=$VIRT  kernel=$(uname -r)"
+        echo "# Только параметры, которые ядро/гипервизор реально приняли."
+        cat "$SYSCTL_TMP" 2>/dev/null
+    } > "$SYSCTL_CONF"
+    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+}
+
+# Сводка применённых/пропущенных настроек.
+self_test() {
+    local ok_count=${#SYSCTL_OK[@]}
+    local skip_count=${#SYSCTL_SKIP[@]}
+    local sysfs_ok=${#SYSFS_OK[@]}
+    local sysfs_skip=${#SYSFS_SKIP[@]}
+
+    [ "$QUIET" = "1" ] && return
+
     echo ""
-    read -r -p "Нажмите Enter..."
+    echo -e "${CYAN}${BOLD}=== Self-test ===${NC}"
+    echo -e "  Preset:        ${BOLD}${PRESET_NAME}${NC}"
+    echo -e "  Hypervisor:    ${BOLD}${VIRT}${NC}"
+    echo -e "  Kernel:        $(uname -r)"
+    echo -e "  Cores:         $(nproc)"
+    echo -e "  RAM:           $(free -h | awk '/Mem:/{print $2}')"
+    echo -e "  BBR:           ${GREEN}${APPLIED_BBR:-?}${NC}    qdisc: ${GREEN}${APPLIED_QDISC:-?}${NC}"
+    echo -e "  buf_max:       ${APPLIED_BUF_MAX:-?} bytes"
+    echo -e "  sysctl:        ${GREEN}${ok_count} OK${NC} / ${YELLOW}${skip_count} skipped${NC}"
+    echo -e "  sysfs:         ${GREEN}${sysfs_ok} OK${NC} / ${YELLOW}${sysfs_skip} skipped${NC}"
+
+    if [ "$skip_count" -gt 0 ]; then
+        echo -e "  ${GRAY}Skipped sysctl (kernel/hypervisor restriction):${NC}"
+        local s
+        for s in "${SYSCTL_SKIP[@]}"; do
+            echo -e "    ${GRAY}- $s${NC}"
+        done | head -20
+    fi
+    echo ""
+}
+
+apply_optimizations() {
+    [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
+    _log INFO "${YELLOW}[*] Глобальный тюнинг v7.0 PHOENIX-X...${NC}"
+
+    VIRT=$(detect_virt)
+    _log INFO "  Virt:    $VIRT"
+
+    # Под OpenVZ половина sysctl запрещена — это нормально, всё пройдёт через
+    # probe-then-write и просто залогируется как skipped.
+    case "$VIRT" in
+        openvz|lxc)
+            _log INFO "${GRAY}[*] Контейнерный гипервизор ($VIRT) — часть тюнингов будет пропущена ядром, это ок.${NC}"
+            ;;
+    esac
+
+    SYSCTL_OK=()
+    SYSCTL_SKIP=()
+    SYSFS_OK=()
+    SYSFS_SKIP=()
+    SYSCTL_TMP=$(mktemp /tmp/.vps_sysctl.XXXXXX)
+    trap 'rm -f "$SYSCTL_TMP"' EXIT
+
+    load_preset "$PRESET"
+    apply_zram
+    apply_iface_tuning
+    apply_irq_affinity
+    apply_cpu_governor
+    apply_thp
+    apply_block_io
+    apply_sysctls
+    apply_persistent_units
+    apply_limits
+    finalize_sysctl_conf
+
+    self_test
+
+    _log OK "${GREEN}[+] Phoenix-X v7.0: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}.${NC}"
+    rm -f "$SYSCTL_TMP"; trap - EXIT
+
+    [ "$QUIET" = "1" ] && return
+    [ -t 0 ] && read -r -p "Нажмите Enter..."
 }
 
 #
@@ -1193,7 +1682,7 @@ reset_all() {
     rm -f /swapfile
     sed -i '/\/swapfile/d' /etc/fstab
     zramctl --reset /dev/zram0 2>/dev/null || true
-    rm -f "$SYSCTL_CONF" "$LIMITS_CONF" "$EXP_CONF" "$NOISE_CONF" \
+    rm -f "$SYSCTL_CONF" "$LIMITS_CONF" "$EXP_CONF" "$NOISE_CONF" "$PRESET_FILE" \
           /etc/dnsmasq.d/vps-speed.conf \
           /etc/systemd/system.conf.d/99-vps-limits.conf \
           /etc/systemd/user.conf.d/99-vps-limits.conf
@@ -1207,15 +1696,312 @@ reset_all() {
     sleep 2
 }
 
+# ===================================================================
+#  Status dashboard
+# ===================================================================
+print_status_dashboard() {
+    print_header
+    local virt cores ram bbr qdisc
+    virt=$(detect_virt)
+    cores=$(nproc)
+    ram=$(free -h | awk '/Mem:/{print $2}')
+    bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    echo -e "${CYAN}${BOLD}=== СТАТУС VPS PHOENIX-X ===${NC}"
+    echo -e "  Hypervisor:    ${BOLD}$virt${NC}"
+    echo -e "  Kernel:        $(uname -r)"
+    echo -e "  Cores:         $cores"
+    echo -e "  RAM:           $ram"
+    echo -e "  Uptime:        $(uptime -p 2>/dev/null || uptime)"
+    echo ""
+    echo -e "${CYAN}--- Networking ---${NC}"
+    echo -e "  Congestion:    ${GREEN}$bbr${NC}    Default qdisc: ${GREEN}$qdisc${NC}"
+    echo -e "  rmem_max:      $(sysctl -n net.core.rmem_max 2>/dev/null || echo ?) bytes"
+    echo -e "  wmem_max:      $(sysctl -n net.core.wmem_max 2>/dev/null || echo ?) bytes"
+    echo -e "  somaxconn:     $(sysctl -n net.core.somaxconn 2>/dev/null || echo ?)"
+    echo -e "  fastopen:      $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo ?)"
+    if [ -e /proc/sys/net/netfilter/nf_conntrack_count ]; then
+        local cc cm
+        cc=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+        cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+        echo -e "  conntrack:     $cc / $cm   ($(( cc * 100 / (cm > 0 ? cm : 1) ))% used)"
+    fi
+
+    echo ""
+    echo -e "${CYAN}--- Memory / IO ---${NC}"
+    echo -e "  swappiness:    $(sysctl -n vm.swappiness 2>/dev/null)"
+    if command -v zramctl >/dev/null 2>&1; then
+        local zline
+        zline=$(zramctl --noheadings 2>/dev/null | head -n1)
+        if [ -n "$zline" ]; then
+            echo -e "  ZRAM:          ${GREEN}active${NC} ($zline)"
+        else
+            echo -e "  ZRAM:          ${GRAY}inactive${NC}"
+        fi
+    fi
+    if [ -r /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        local thp
+        thp=$(grep -oE '\[[a-z]+\]' /sys/kernel/mm/transparent_hugepage/enabled | tr -d '[]')
+        echo -e "  THP:           $thp"
+    fi
+    echo -e "  open files:    $(awk '/^Max open files/{print $4}' /proc/self/limits 2>/dev/null || echo ?)"
+
+    echo ""
+    echo -e "${CYAN}--- Multi-core load ---${NC}"
+    local iface
+    for iface in $(list_real_ifaces); do
+        local rx_q tx_q
+        rx_q=$(find /sys/class/net/"$iface"/queues/ -maxdepth 1 -name 'rx-*' 2>/dev/null | wc -l)
+        tx_q=$(find /sys/class/net/"$iface"/queues/ -maxdepth 1 -name 'tx-*' 2>/dev/null | wc -l)
+        local lro
+        lro=$(ethtool -k "$iface" 2>/dev/null | awk '/large-receive-offload/{print $2; exit}')
+        local rps_set xps_set
+        rps_set=$(cat /sys/class/net/"$iface"/queues/rx-0/rps_cpus 2>/dev/null)
+        xps_set=$(cat /sys/class/net/"$iface"/queues/tx-0/xps_cpus 2>/dev/null)
+        echo -e "  $iface: rx=$rx_q tx=$tx_q lro=${lro:-?} rps=${rps_set:-?} xps=${xps_set:-?}"
+    done
+
+    echo ""
+    echo -e "${CYAN}--- Services ---${NC}"
+    local svc
+    for svc in vps-rps vps-noise; do
+        if systemctl is-active --quiet "$svc"; then
+            echo -e "  $svc: ${GREEN}active${NC}"
+        else
+            echo -e "  $svc: ${GRAY}inactive${NC}"
+        fi
+    done
+
+    if [ -f "$PRESET_FILE" ]; then
+        echo ""
+        echo -e "  Preset:        ${BOLD}$(cat "$PRESET_FILE")${NC}"
+    fi
+    echo ""
+}
+
+# ===================================================================
+#  Self-update / export / import
+# ===================================================================
+self_update() {
+    local tmp
+    tmp=$(mktemp /tmp/.vps_optimizer_new.XXXXXX)
+    if curl -fsSL "$SELF_URL" -o "$tmp" && [ -s "$tmp" ]; then
+        if bash -n "$tmp" 2>/dev/null; then
+            chmod +x "$tmp"
+            mv "$tmp" "$SELF_PATH"
+            echo -e "${GREEN}[+] Скрипт обновлён до последней версии: $SELF_PATH${NC}"
+        else
+            rm -f "$tmp"
+            echo -e "${RED}[!] Скачанная версия невалидна — обновление отменено.${NC}"
+            return 1
+        fi
+    else
+        rm -f "$tmp"
+        echo -e "${RED}[!] Не удалось скачать $SELF_URL${NC}"
+        return 1
+    fi
+}
+
+export_config() {
+    local target="${1:-/tmp/vps-phoenix-bundle.tar.gz}"
+    local files=()
+    [ -f "$SYSCTL_CONF" ]   && files+=("$SYSCTL_CONF")
+    [ -f "$LIMITS_CONF" ]   && files+=("$LIMITS_CONF")
+    [ -f "$NOISE_CONF" ]    && files+=("$NOISE_CONF")
+    [ -f "$PRESET_FILE" ]   && files+=("$PRESET_FILE")
+    [ -f "$RPS_BOOT_SCRIPT" ] && files+=("$RPS_BOOT_SCRIPT")
+    [ -f "$RPS_BOOT_SERVICE" ] && files+=("$RPS_BOOT_SERVICE")
+    [ -f "$NOISE_GEN_SCRIPT" ] && files+=("$NOISE_GEN_SCRIPT")
+    [ -f "$NOISE_GEN_SERVICE" ] && files+=("$NOISE_GEN_SERVICE")
+    [ -f /etc/systemd/system.conf.d/99-vps-limits.conf ] && \
+        files+=("/etc/systemd/system.conf.d/99-vps-limits.conf")
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}[!] Нечего экспортировать (apply ещё не запускался).${NC}"
+        return 1
+    fi
+    tar czf "$target" "${files[@]}" 2>/dev/null
+    echo -e "${GREEN}[+] Конфигурация выгружена в $target${NC}"
+    echo -e "${GRAY}    Включено файлов: ${#files[@]}${NC}"
+}
+
+import_config() {
+    local src="${1:?import path required}"
+    if [ ! -f "$src" ]; then
+        echo -e "${RED}[!] Нет файла: $src${NC}"; return 1
+    fi
+    tar xzf "$src" -C / 2>/dev/null && {
+        echo -e "${GREEN}[+] Конфигурация импортирована.${NC}"
+        sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl restart vps-rps vps-noise 2>/dev/null || true
+        echo -e "${GREEN}[+] Сервисы перезапущены.${NC}"
+    } || echo -e "${RED}[!] Распаковка не удалась.${NC}"
+}
+
+# ===================================================================
+#  CLI parser
+# ===================================================================
+print_cli_help() {
+    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v7.0 PHOENIX-X"
+    cat <<EOF
+
+USAGE:
+    vps_optimizer.sh                          # интерактивное меню
+    vps_optimizer.sh <command> [options]      # CLI режим (без меню)
+
+COMMANDS:
+    install                  Установить компоненты Phoenix
+    apply [--preset NAME]    Применить sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)
+    status                   Показать дашборд состояния
+    self-test                Перепроверить применённые настройки
+    preset <name>            Сохранить пресет на будущие apply
+    noise on|off|edit|status Управление шумогенератором
+    swap <gb>                Создать swap-файл указанного размера в ГБ
+    benchmark                Замерить пинг до набора популярных endpoints
+    reset                    Полный откат всех изменений
+    export [path.tar.gz]     Выгрузить все конфиги в архив
+    import <path.tar.gz>     Накатить выгруженные конфиги
+    update                   Обновить скрипт до последней версии (GitHub main)
+    help                     Эта справка
+
+GLOBAL FLAGS:
+    --dry-run                Только показать, что бы изменилось
+    --quiet                  Минимум вывода (для скриптов/cron)
+    --preset NAME            Использовать конкретный пресет (см. apply)
+
+EXAMPLES:
+    sudo ./vps_optimizer.sh apply --preset proxy
+    sudo ./vps_optimizer.sh noise on
+    sudo ./vps_optimizer.sh status
+    sudo ./vps_optimizer.sh apply --dry-run
+EOF
+}
+
+cli_dispatch() {
+    local cmd="$1"; shift || true
+    # Парсим глобальные флаги независимо от позиции
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) DRY_RUN=1 ;;
+            --quiet|-q) QUIET=1 ;;
+            --preset)  PRESET="$2"; shift ;;
+            --preset=*) PRESET="${1#*=}" ;;
+            *)         args+=("$1") ;;
+        esac
+        shift
+    done
+
+    case "$cmd" in
+        install)        install_dependencies ;;
+        apply|optimize) apply_optimizations ;;
+        status)         print_status_dashboard ;;
+        self-test)
+            apply_optimizations >/dev/null
+            self_test
+            ;;
+        preset)
+            local name="${args[0]:-}"
+            if [ -z "$name" ]; then
+                echo -e "${RED}preset: укажи имя (balanced|proxy|web)${NC}"; exit 1
+            fi
+            echo "$name" > "$PRESET_FILE"
+            echo -e "${GREEN}[+] Preset → $name (будет применён при следующем apply)${NC}"
+            ;;
+        noise)
+            local sub="${args[0]:-status}"
+            case "$sub" in
+                on|start)
+                    [ -f "$NOISE_CONF" ] || write_default_noise_conf
+                    deploy_noise_generator
+                    echo -e "${GREEN}[+] vps-noise.service запущен.${NC}"
+                    ;;
+                off|stop)
+                    systemctl stop vps-noise 2>/dev/null
+                    systemctl disable vps-noise 2>/dev/null
+                    echo -e "${YELLOW}[*] vps-noise.service остановлен.${NC}"
+                    ;;
+                edit)
+                    [ -f "$NOISE_CONF" ] || write_default_noise_conf
+                    "${EDITOR:-nano}" "$NOISE_CONF"
+                    ;;
+                status|*)
+                    if systemctl is-active --quiet vps-noise; then
+                        echo -e "vps-noise: ${GREEN}active${NC}"
+                    else
+                        echo -e "vps-noise: ${GRAY}inactive${NC}"
+                    fi
+                    [ -f "$NOISE_CONF" ] && grep -E '^[A-Z_]+=' "$NOISE_CONF" | head -20
+                    ;;
+            esac
+            ;;
+        swap)
+            local gb="${args[0]:-2}"
+            # Простая неинтерактивная версия — создаёт swap-файл размера $gb GB.
+            swapoff -a 2>/dev/null || true
+            rm -f /swapfile
+            fallocate -l "${gb}G" /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null
+            swapon /swapfile
+            grep -q "^/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+            echo -e "${GREEN}[+] swap ${gb}G активен.${NC}"
+            ;;
+        benchmark) run_benchmark ;;
+        reset)     reset_all ;;
+        export)    export_config "${args[0]:-}" ;;
+        import)
+            if [ -z "${args[0]:-}" ]; then echo "import: укажи путь к архиву"; exit 1; fi
+            import_config "${args[0]}"
+            ;;
+        update)    self_update ;;
+        help|-h|--help) print_cli_help ;;
+        *)         echo -e "${RED}Неизвестная команда: $cmd${NC}"; print_cli_help; exit 1 ;;
+    esac
+}
+
+# ===================================================================
+#  Интерактивное меню
+# ===================================================================
+manage_presets_menu() {
+    clear
+    echo -e "${CYAN}${BOLD}=== Профили оптимизации ===${NC}"
+    local cur="balanced"
+    [ -f "$PRESET_FILE" ] && cur=$(cat "$PRESET_FILE")
+    echo -e "Текущий: ${BOLD}$cur${NC}"
+    echo ""
+    echo -e "  ${GREEN}[1]${NC} balanced — универсальный (по умолчанию)"
+    echo -e "  ${GREEN}[2]${NC} proxy    — xray/sing-box/wg, агрессивные буферы и conntrack"
+    echo -e "  ${GREEN}[3]${NC} web      — nginx/apache, security-акценты"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) echo balanced > "$PRESET_FILE"; echo -e "${GREEN}[+] preset=balanced${NC}"; sleep 1 ;;
+        2) echo proxy    > "$PRESET_FILE"; echo -e "${GREEN}[+] preset=proxy${NC}"; sleep 1 ;;
+        3) echo web      > "$PRESET_FILE"; echo -e "${GREEN}[+] preset=web${NC}"; sleep 1 ;;
+        0) ;;
+    esac
+}
+
 main_menu() {
     while true; do
         print_header
+        local cur_preset="balanced"
+        [ -f "$PRESET_FILE" ] && cur_preset=$(cat "$PRESET_FILE")
+        echo -e "Profile: ${CYAN}${BOLD}$cur_preset${NC}    Hypervisor: $(detect_virt)"
+        echo ""
         echo -e "Выберите действие:"
-        echo -e "  ${GREEN}[1]${NC} Подготовка: Компоненты Phoenix"
-        echo -e "  ${CYAN}[2]${NC} УСКОРЕНИЕ: v6.1 (Adaptive Buffers + RPS + ZRAM)"
+        echo -e "  ${GREEN}[1]${NC} Подготовка: компоненты Phoenix-X"
+        echo -e "  ${CYAN}[2]${NC} ${BOLD}Применить v7.0${NC} (probe-then-write, XPS/IRQ/conntrack/MPTCP/THP)"
         echo -e "  ${CYAN}[3]${NC} Stealth: генератор шума (iOS + RU email/news + APT phantom)"
-        echo -e "  ${CYAN}[4]${NC} Подкачка: SWAP & ZRAM (Ручная настройка)"
-        echo -e "  ${CYAN}[5]${NC} Тест: Запустить Бенчмарк (Пинг)"
+        echo -e "  ${CYAN}[4]${NC} Подкачка: SWAP & ZRAM"
+        echo -e "  ${CYAN}[5]${NC} Бенчмарк (пинг до популярных endpoints)"
+        echo -e "  ${CYAN}[6]${NC} Status дашборд"
+        echo -e "  ${CYAN}[7]${NC} Профиль оптимизации (balanced / proxy / web)"
+        echo -e "  ${YELLOW}[9]${NC} Self-update из GitHub"
+        echo -e "  ${YELLOW}[10]${NC} Export / Import конфигов"
         echo -e "  ${YELLOW}[12]${NC} Экспериментально: TFO / ECN / busy_poll"
         echo -e "  ${RED}[8]${NC} Полный откат всех изменений"
         echo -e "  ${GREEN}[0]${NC} Выход"
@@ -1227,6 +2013,19 @@ main_menu() {
             3)  manage_noise_generator ;;
             4)  manage_swap ;;
             5)  run_benchmark ;;
+            6)  print_status_dashboard; read -r -p "Нажмите Enter..." ;;
+            7)  manage_presets_menu ;;
+            9)  self_update; read -r -p "Нажмите Enter..." ;;
+            10) clear
+                echo -e "${CYAN}--- Export / Import ---${NC}"
+                echo "  [1] Export → /tmp/vps-phoenix-bundle.tar.gz"
+                echo "  [2] Import от пути"
+                read -r -p "Выбор: " exi
+                case "$exi" in
+                    1) export_config; read -r -p "Enter..." ;;
+                    2) read -r -p "Путь к архиву: " p; import_config "$p"; read -r -p "Enter..." ;;
+                esac
+                ;;
             12) experimental_menu ;;
             8)  reset_all ;;
             0)  exit 0 ;;
@@ -1235,5 +2034,22 @@ main_menu() {
     done
 }
 
+# ===================================================================
+#  Точка входа: CLI или интерактивное меню
+# ===================================================================
+
+if [ $# -gt 0 ]; then
+    # help/status — без проверки root, остальные команды требуют sudo
+    case "$1" in
+        help|-h|--help) print_cli_help; exit 0 ;;
+        status)
+            print_status_dashboard
+            exit 0
+            ;;
+    esac
+    check_root
+    cli_dispatch "$@"
+    exit $?
+fi
 check_root
 main_menu
