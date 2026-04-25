@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v7.0 PHOENIX-X)
+# VPS Global Optimization Script (v8.0 PHOENIX-Z)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -74,6 +74,9 @@ EXP_CONF="/etc/sysctl.d/99-vps-experimental.conf"
 SYSCTL_BACKUP="/etc/sysctl.d/.99-vps-optimizer.bak"
 NOISE_CONF="/etc/vps-noise.conf"
 PRESET_FILE="/etc/vps-optimizer.preset"
+DNS_CONF="/etc/systemd/resolved.conf.d/99-vps-optimizer.conf"
+DNS_STATE="/etc/vps-optimizer.dns"
+DNS_RESOLV_BACKUP="/etc/.vps_optimizer_resolv_backup"
 SELF_URL="https://raw.githubusercontent.com/lpxqwkjd65rjfn-dot/noble-net-warp/main/vps_optimizer.sh"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 RUN_LOG="/var/log/vps-optimizer.log"
@@ -94,7 +97,7 @@ print_header() {
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "       ULTRA VPS ACCELERATOR v7.0 (PHOENIX-X)                    "
+    echo "       ULTRA VPS ACCELERATOR v8.0 (PHOENIX-Z)                    "
     echo "================================================================="
     echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
     echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
@@ -377,7 +380,36 @@ apply_zram() {
     _log OK "${GREEN}[+] ZRAM активен (${zram_size}MB).${NC}"
 }
 
-# Тюнинг сетевых интерфейсов: RPS, XPS, RFS, ring buffers, coalescence, LRO off.
+# Получаем список ядер, доступных для размещения сетевых очередей,
+# исключая isolcpus (если оператор зарезервировал ядра под realtime).
+usable_cpus() {
+    local total isol
+    total=$(nproc)
+    isol=$(awk -F'isolcpus=' 'NF>1 {split($2,a," "); print a[1]}' /proc/cmdline 2>/dev/null)
+    if [ -z "$isol" ] || ! command -v seq >/dev/null 2>&1; then
+        seq 0 $((total-1))
+        return
+    fi
+    # isolcpus может быть "1-3,5" — раскрываем диапазоны.
+    local out=() c r a b
+    declare -A excluded
+    IFS=',' read -ra parts <<<"$isol"
+    for r in "${parts[@]}"; do
+        if [[ "$r" == *-* ]]; then
+            a="${r%-*}"; b="${r#*-}"
+            for ((c=a; c<=b; c++)); do excluded[$c]=1; done
+        else
+            excluded[$r]=1
+        fi
+    done
+    for ((c=0; c<total; c++)); do
+        [ -z "${excluded[$c]:-}" ] && out+=("$c")
+    done
+    printf '%s\n' "${out[@]}"
+}
+
+# Тюнинг сетевых интерфейсов: multi-queue, RPS, XPS, RFS, ring buffers,
+# coalescence, LRO off, link-speed-aware подстройка буферов.
 apply_iface_tuning() {
     local interfaces cpu_cores rps_mask
     interfaces=$(list_real_ifaces)
@@ -391,9 +423,30 @@ apply_iface_tuning() {
 
     sysctl_safe net.core.rps_sock_flow_entries 32768
 
+    # Список реально usable cores (вне isolcpus)
+    local usable_arr
+    mapfile -t usable_arr < <(usable_cpus)
+    local usable_n="${#usable_arr[@]}"
+    [ "$usable_n" -eq 0 ] && usable_n=1
+
     local iface
     for iface in $interfaces; do
         _log INFO "${YELLOW}[*] Iface tuning: $iface (mask=$rps_mask)${NC}"
+
+        # Multi-queue: на virtio-net часто стоит 1 очередь — раскручиваем
+        # до min(N_cpus, max_combined). Это даёт реальный multi-core эффект,
+        # без него RPS/XPS не «доезжают» до железа.
+        if [ "$DRY_RUN" != "1" ]; then
+            local mq_max mq_target
+            mq_max=$(ethtool -l "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f && /^Combined:/{print $2; exit}')
+            if [ -n "$mq_max" ] && [ "$mq_max" -gt 1 ]; then
+                mq_target="$cpu_cores"
+                [ "$mq_target" -gt "$mq_max" ] && mq_target="$mq_max"
+                if ethtool -L "$iface" combined "$mq_target" >/dev/null 2>&1; then
+                    _log OK "    multi-queue: combined=$mq_target / max $mq_max"
+                fi
+            fi
+        fi
         local f
         # RPS — RX softirq распределение
         for f in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
@@ -403,20 +456,15 @@ apply_iface_tuning() {
         for f in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
             [ -e "$f" ] && sysfs_safe "$f" "${PRESET_RPS_FLOWS}"
         done
-        # XPS — TX распределение (новое в v7.0). Каждой TX-очереди свой
-        # bitmask. Если очередей >= ядер — раздаём по одному CPU на очередь;
-        # иначе — общая полная маска.
-        local txq_idx=0 cpu_idx=0
+        # XPS — TX распределение. Каждой TX-очереди свой bitmask
+        # с одним ядром из usable списка (минуя isolcpus).
+        local txq_idx=0 cpu_pick
         for f in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
             if [ -e "$f" ]; then
-                if [ "$cpu_cores" -gt 0 ]; then
-                    cpu_idx=$(( txq_idx % cpu_cores ))
-                    local one_cpu_mask
-                    one_cpu_mask=$(printf '%x' $(( 1 << cpu_idx )))
-                    sysfs_safe "$f" "$one_cpu_mask"
-                else
-                    sysfs_safe "$f" "$rps_mask"
-                fi
+                cpu_pick="${usable_arr[$(( txq_idx % usable_n ))]:-0}"
+                local one_cpu_mask
+                one_cpu_mask=$(printf '%x' $(( 1 << cpu_pick )))
+                sysfs_safe "$f" "$one_cpu_mask"
                 txq_idx=$(( txq_idx + 1 ))
             fi
         done
@@ -456,20 +504,41 @@ apply_irq_affinity() {
     systemctl stop irqbalance 2>/dev/null || true
     systemctl disable irqbalance 2>/dev/null || true
 
-    local iface irq_list irq cpu_idx=0
+    local usable_arr
+    mapfile -t usable_arr < <(usable_cpus)
+    local usable_n="${#usable_arr[@]}"
+    [ "$usable_n" -eq 0 ] && usable_n="$cpu_cores"
+
+    local iface irq_list irq cpu_idx=0 cpu_pick
     for iface in $(list_real_ifaces); do
         # IRQs принадлежащие интерфейсу — ищем в /proc/interrupts по
         # суффиксу с именем интерфейса (например, virtio0-input.0).
         irq_list=$(awk -v ifn="$iface" '$NF ~ ifn {gsub(":","",$1); print $1}' /proc/interrupts 2>/dev/null)
         for irq in $irq_list; do
             local affinity_file="/proc/irq/${irq}/smp_affinity_list"
+            cpu_pick="${usable_arr[$(( cpu_idx % usable_n ))]:-0}"
             if [ -w "$affinity_file" ]; then
-                if echo "$cpu_idx" > "$affinity_file" 2>/dev/null; then
-                    SYSFS_OK+=("irq#${irq}->cpu${cpu_idx}")
+                # Пишем дважды: некоторые ядра возвращают EBUSY на первой записи
+                # (особенно сразу после ethtool -L). Перепроверяем readback.
+                local readback
+                if echo "$cpu_pick" > "$affinity_file" 2>/dev/null; then
+                    readback=$(cat "$affinity_file" 2>/dev/null)
+                    if [ "$readback" = "$cpu_pick" ]; then
+                        SYSFS_OK+=("irq#${irq}->cpu${cpu_pick}")
+                    else
+                        # Retry один раз
+                        echo "$cpu_pick" > "$affinity_file" 2>/dev/null || true
+                        readback=$(cat "$affinity_file" 2>/dev/null)
+                        if [ "$readback" = "$cpu_pick" ]; then
+                            SYSFS_OK+=("irq#${irq}->cpu${cpu_pick}(retry)")
+                        else
+                            SYSFS_SKIP+=("irq#${irq}:readback=$readback")
+                        fi
+                    fi
                 else
                     SYSFS_SKIP+=("irq#${irq}:write-failed")
                 fi
-                cpu_idx=$(( (cpu_idx + 1) % cpu_cores ))
+                cpu_idx=$(( cpu_idx + 1 ))
             else
                 SYSFS_SKIP+=("irq#${irq}:no-write")
             fi
@@ -576,10 +645,28 @@ apply_sysctls() {
     [ "$best_bbr" != "cubic" ] && modprobe sch_fq 2>/dev/null && best_qdisc="fq"
 
     # Адаптивные буферы — масштабируются по RAM × множитель пресета.
+    # Дополнительно учитываем реальную скорость сетевого линка через
+    # ethtool: BDP = link_speed × ~150ms RTT. На 10G+ линке имеет смысл
+    # поднять потолок до 512MB даже на VPS с малой RAM.
     local mem_mb buf_max=134217728
     mem_mb=$(free -m | awk '/Mem:/{print $2}')
     [ "$mem_mb" -ge 8192 ]  && buf_max=268435456
     [ "$mem_mb" -ge 16384 ] && buf_max=536870912
+
+    local link_mbps=0 link_iface
+    for link_iface in $(list_real_ifaces); do
+        local s
+        s=$(ethtool "$link_iface" 2>/dev/null | awk '/Speed:/{print $2}' | grep -oE '[0-9]+' | head -1)
+        if [ -n "$s" ] && [ "$s" -gt "$link_mbps" ]; then
+            link_mbps="$s"
+        fi
+    done
+    if [ "$link_mbps" -ge 10000 ] && [ "$buf_max" -lt 268435456 ]; then
+        buf_max=268435456  # 10G линк → минимум 256MB потолок
+    fi
+    if [ "$link_mbps" -ge 25000 ] && [ "$buf_max" -lt 536870912 ]; then
+        buf_max=536870912  # 25G+ → 512MB потолок
+    fi
     buf_max=$(( buf_max * PRESET_BUF_MULT ))
 
     # Networking core
@@ -645,6 +732,24 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_pacing_ca_ratio "$PRESET_BBR_PACING_CA"
     sysctl_safe net.ipv4.tcp_collapse_max_bytes 6291456
     sysctl_safe net.ipv4.ip_local_port_range "$PRESET_PORT_RANGE"
+
+    # Глубокая настройка TCP-стека (новое в v8.0):
+    #  app_win=31 — максимум окна, отдаваемого приложению (важно для прокси),
+    #  recovery=1 (RACK) — современный recovery-механизм по таймстампам,
+    #  ecn=2 — пассивный ECN (отвечаем на ECN-флаги, но сами не запрашиваем),
+    #  thin_linear_timeouts=1 — линейные ретраи на «тонких» соединениях,
+    #  reordering — устойчивость к out-of-order пакетам в облачных сетях.
+    sysctl_safe net.ipv4.tcp_app_win 31
+    sysctl_safe net.ipv4.tcp_recovery 1
+    sysctl_safe net.ipv4.tcp_ecn 2
+    sysctl_safe net.ipv4.tcp_ecn_fallback 1
+    sysctl_safe net.ipv4.tcp_thin_linear_timeouts 1
+    sysctl_safe net.ipv4.tcp_reordering 6
+    sysctl_safe net.ipv4.tcp_max_reordering 300
+    sysctl_safe net.ipv4.tcp_early_retrans 3
+    sysctl_safe net.ipv4.tcp_frto 2
+    sysctl_safe net.ipv4.tcp_autocorking 0
+    sysctl_safe net.ipv4.tcp_limit_output_bytes 1048576
 
     # MPTCP (Linux 5.6+)
     if [ "$kvi" -ge 50600 ]; then
@@ -799,7 +904,7 @@ finalize_sysctl_conf() {
         cp "$SYSCTL_CONF" "$SYSCTL_BACKUP" 2>/dev/null || true
     fi
     {
-        echo "# === VPS Optimizer v7.0 PHOENIX-X ==="
+        echo "# === VPS Optimizer v8.0 PHOENIX-Z ==="
         echo "# Generated $(date -u +%FT%TZ)  preset=$PRESET_NAME  virt=$VIRT  kernel=$(uname -r)"
         echo "# Только параметры, которые ядро/гипервизор реально приняли."
         cat "$SYSCTL_TMP" 2>/dev/null
@@ -840,7 +945,7 @@ self_test() {
 
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
-    _log INFO "${YELLOW}[*] Глобальный тюнинг v7.0 PHOENIX-X...${NC}"
+    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.0 PHOENIX-Z...${NC}"
 
     VIRT=$(detect_virt)
     _log INFO "  Virt:    $VIRT"
@@ -874,7 +979,7 @@ apply_optimizations() {
 
     self_test
 
-    _log OK "${GREEN}[+] Phoenix-X v7.0: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}.${NC}"
+    _log OK "${GREEN}[+] Phoenix-Z v8.0: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}.${NC}"
     rm -f "$SYSCTL_TMP"; trap - EXIT
 
     [ "$QUIET" = "1" ] && return
@@ -958,6 +1063,24 @@ ubuntu-server ubuntu-minimal cloud-init systemd"
 # во временный каталог с моментальным rm.
 APT_PHANTOM_BLACKHOLE=1
 
+# === Phantom library/archive downloads (новое в v8.0) ===
+# Тянем релизы с GitHub / npm / PyPI / Maven / kernel.org / GNU ftp
+# и т.п. → сразу в /dev/null. UA — curl/wget/pip/npm, без iOS.
+ENABLE_LIB_PHANTOM=1
+LIB_PHANTOM_INTERVAL_MIN=90      # минут (рекомендованно: 90)
+LIB_PHANTOM_INTERVAL_MAX=360     # минут (рекомендованно: 360 = 6ч)
+LIB_PHANTOM_BYTES_MAX=2097152    # cap на одно скачивание (2 MB)
+LIB_PHANTOM_BURST_MIN=1
+LIB_PHANTOM_BURST_MAX=3
+
+# === Vacation mode (новое в v8.0) ===
+# Раз в день кидаем кубик: с шансом VACATION_CHANCE_PCT уходим в тишину
+# на VACATION_HOURS_MIN..MAX (как реально человек уехал на выходные).
+ENABLE_VACATION=1
+VACATION_CHANCE_PCT=7
+VACATION_HOURS_MIN=6
+VACATION_HOURS_MAX=72
+
 # Глобальный rate-limit для curl (KB/s, диапазон min..max).
 RATE_KB_MIN=500
 RATE_KB_MAX=3500
@@ -999,6 +1122,10 @@ prompt_custom_noise_conf() {
     read -r -p "Заходы в почту (1/0) [${ENABLE_EMAIL}]: " v;             ENABLE_EMAIL="${v:-$ENABLE_EMAIL}"
     read -r -p "Новости/соц.сети РФ (1/0) [${ENABLE_NEWS}]: " v;         ENABLE_NEWS="${v:-$ENABLE_NEWS}"
     read -r -p "APT-фантом (1/0) [${ENABLE_APT_PHANTOM}]: " v;           ENABLE_APT_PHANTOM="${v:-$ENABLE_APT_PHANTOM}"
+    read -r -p "Library-фантом (GitHub/npm/PyPI/...) (1/0) [${ENABLE_LIB_PHANTOM:-1}]: " v
+    ENABLE_LIB_PHANTOM="${v:-${ENABLE_LIB_PHANTOM:-1}}"
+    read -r -p "Vacation mode (тишина 6–72ч раз в N дней) (1/0) [${ENABLE_VACATION:-1}]: " v
+    ENABLE_VACATION="${v:-${ENABLE_VACATION:-1}}"
 
     echo ""
     echo -e "${CYAN}-- Email-сессии --${NC}"
@@ -1024,6 +1151,26 @@ prompt_custom_noise_conf() {
     read -r -p "Сразу в /dev/null без сохранения (1/0) [${APT_PHANTOM_BLACKHOLE}]: " v
     APT_PHANTOM_BLACKHOLE="${v:-$APT_PHANTOM_BLACKHOLE}"
 
+    echo ""
+    echo -e "${CYAN}-- Library-фантом (GitHub releases / npm / PyPI / kernel.org) --${NC}"
+    echo -e "${YELLOW}Рекомендуется: 90..360 минут.${NC}"
+    read -r -p "LIB_PHANTOM_INTERVAL_MIN [мин, ${LIB_PHANTOM_INTERVAL_MIN:-90}]: " v
+    LIB_PHANTOM_INTERVAL_MIN="${v:-${LIB_PHANTOM_INTERVAL_MIN:-90}}"
+    read -r -p "LIB_PHANTOM_INTERVAL_MAX [мин, ${LIB_PHANTOM_INTERVAL_MAX:-360}]: " v
+    LIB_PHANTOM_INTERVAL_MAX="${v:-${LIB_PHANTOM_INTERVAL_MAX:-360}}"
+    read -r -p "Cap на 1 скачивание [байт, ${LIB_PHANTOM_BYTES_MAX:-2097152}]: " v
+    LIB_PHANTOM_BYTES_MAX="${v:-${LIB_PHANTOM_BYTES_MAX:-2097152}}"
+
+    echo ""
+    echo -e "${CYAN}-- Vacation mode --${NC}"
+    echo -e "${YELLOW}Рекомендуется: 7% шанс/день, 6..72 часа.${NC}"
+    read -r -p "VACATION_CHANCE_PCT [0..100, ${VACATION_CHANCE_PCT:-7}]: " v
+    VACATION_CHANCE_PCT="${v:-${VACATION_CHANCE_PCT:-7}}"
+    read -r -p "VACATION_HOURS_MIN [${VACATION_HOURS_MIN:-6}]: " v
+    VACATION_HOURS_MIN="${v:-${VACATION_HOURS_MIN:-6}}"
+    read -r -p "VACATION_HOURS_MAX [${VACATION_HOURS_MAX:-72}]: " v
+    VACATION_HOURS_MAX="${v:-${VACATION_HOURS_MAX:-72}}"
+
     # Перезаписываем конфиг
     cat > "$NOISE_CONF" <<EOF
 # vps-noise.conf (custom, $(date -u +%FT%TZ))
@@ -1034,6 +1181,18 @@ ENABLE_APNS=$ENABLE_APNS
 ENABLE_EMAIL=$ENABLE_EMAIL
 ENABLE_NEWS=$ENABLE_NEWS
 ENABLE_APT_PHANTOM=$ENABLE_APT_PHANTOM
+ENABLE_LIB_PHANTOM=${ENABLE_LIB_PHANTOM:-1}
+ENABLE_VACATION=${ENABLE_VACATION:-1}
+
+LIB_PHANTOM_INTERVAL_MIN=${LIB_PHANTOM_INTERVAL_MIN:-90}
+LIB_PHANTOM_INTERVAL_MAX=${LIB_PHANTOM_INTERVAL_MAX:-360}
+LIB_PHANTOM_BYTES_MAX=${LIB_PHANTOM_BYTES_MAX:-2097152}
+LIB_PHANTOM_BURST_MIN=${LIB_PHANTOM_BURST_MIN:-1}
+LIB_PHANTOM_BURST_MAX=${LIB_PHANTOM_BURST_MAX:-3}
+
+VACATION_CHANCE_PCT=${VACATION_CHANCE_PCT:-7}
+VACATION_HOURS_MIN=${VACATION_HOURS_MIN:-6}
+VACATION_HOURS_MAX=${VACATION_HOURS_MAX:-72}
 
 IOS_BURST_INTERVAL_MIN=${IOS_BURST_INTERVAL_MIN}
 IOS_BURST_INTERVAL_MAX=${IOS_BURST_INTERVAL_MAX}
@@ -1171,6 +1330,24 @@ APT_PHANTOM_OS_CHANCE="${APT_PHANTOM_OS_CHANCE:-20}"
 APT_PHANTOM_BLACKHOLE="${APT_PHANTOM_BLACKHOLE:-1}"
 APT_PHANTOM_PACKAGES="${APT_PHANTOM_PACKAGES:-curl wget vim htop git tmux nginx ca-certificates}"
 APT_PHANTOM_OS_PACKAGES="${APT_PHANTOM_OS_PACKAGES:-linux-image-generic linux-headers-generic ubuntu-server}"
+
+# ===== Phantom library downloads (новое в v8.0) =====
+# Имитируем admin-host: периодически тянем релизы и tarball'ы
+# из публичных package-репозиториев → /dev/null. Никаких мессенджеров.
+ENABLE_LIB_PHANTOM="${ENABLE_LIB_PHANTOM:-1}"
+LIB_PHANTOM_INTERVAL_MIN="${LIB_PHANTOM_INTERVAL_MIN:-90}"      # рекомендованно: 90 мин
+LIB_PHANTOM_INTERVAL_MAX="${LIB_PHANTOM_INTERVAL_MAX:-360}"     # рекомендованно: 6 ч
+LIB_PHANTOM_BYTES_MAX="${LIB_PHANTOM_BYTES_MAX:-2097152}"       # 2MB cap на одно скачивание
+LIB_PHANTOM_BURST_MIN="${LIB_PHANTOM_BURST_MIN:-1}"
+LIB_PHANTOM_BURST_MAX="${LIB_PHANTOM_BURST_MAX:-3}"
+
+# ===== Vacation mode (новое в v8.0) =====
+# Раз в день кидаем кубик: если выпало — уходим в тишину на N часов
+# (как реально человек уехал в отпуск/лёг спать на выходные).
+ENABLE_VACATION="${ENABLE_VACATION:-1}"
+VACATION_CHANCE_PCT="${VACATION_CHANCE_PCT:-7}"   # 7% шанс начать «отпуск» в каждый новый день
+VACATION_HOURS_MIN="${VACATION_HOURS_MIN:-6}"
+VACATION_HOURS_MAX="${VACATION_HOURS_MAX:-72}"
 RATE_KB_MIN="${RATE_KB_MIN:-500}"
 RATE_KB_MAX="${RATE_KB_MAX:-3500}"
 NIGHT_HOUR_FROM="${NIGHT_HOUR_FROM:-1}"
@@ -1182,12 +1359,19 @@ PEAK_EVENING_TO="${PEAK_EVENING_TO:-23}"
 
 # ===== UA-пулы =====
 UA_IOS=(
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPad; CPU OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
-"Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+"AppleCoreMedia/1.0.0.22B83 (iPhone; U; CPU OS 18_1 like Mac OS X; en_us)"
 "AppleCoreMedia/1.0.0.21F90 (iPhone; U; CPU OS 17_5 like Mac OS X; en_us)"
+"itunesstored/1.0 iOS/18.1.1 model/iPhone16,2 hwp/t8130 build/22B91 (6; dt:264)"
 "itunesstored/1.0 iOS/17.5.1 model/iPhone15,3 hwp/t8120 build/21F90 (6; dt:248)"
+"com.apple.WebKit.Networking/8619.2.4.0.6 CFNetwork/1568.100.1 Darwin/24.1.0"
 "com.apple.WebKit.Networking/8617.2.4.0.6 CFNetwork/1492.0.1 Darwin/23.3.0"
 )
 
@@ -1215,6 +1399,12 @@ URLS_IOS=(
 "https://gateway.icloud.com/" "https://mesu.apple.com/assets/"
 "https://swcdn.apple.com/" "https://updates.cdn-apple.com/"
 "https://is1-ssl.mzstatic.com/" "https://gs-loc.apple.com/"
+"https://weatherkit.apple.com/" "https://news-events.apple.com/"
+"https://gsa.apple.com/" "https://identity.apple.com/"
+"https://api.weather.com/v3/" "https://gspe1-ssl.ls.apple.com/"
+"https://gsas.apple.com/grandslam/" "https://xp.apple.com/report/2/"
+"https://stocks-data-service.apple.com/" "https://itunes.apple.com/WebObjects/MZStore.woa/wa/viewMultiRoom"
+"https://news-edge.apple.com/" "https://bagsvc.apple.com/" "https://buy.itunes.apple.com/"
 )
 URLS_CAPTIVE=(
 "https://captive.apple.com/hotspot-detect.html"
@@ -1250,11 +1440,86 @@ URLS_NEWS_RU=(
 )
 URLS_SOCIAL_RU=(
 "https://vk.com/" "https://ok.ru/" "https://dzen.ru/"
-"https://t.me/s/durov" "https://www.wildberries.ru/" "https://www.ozon.ru/"
+"https://www.wildberries.ru/" "https://www.ozon.ru/"
 "https://www.avito.ru/" "https://hh.ru/"
 )
 URLS_SEARCH_RU=(
 "https://yandex.ru/" "https://ya.ru/" "https://www.google.com/"
+)
+
+# ===== Phantom library/archive downloads (новое в v8.0) =====
+# Правдоподобный admin-host: GitHub releases, npm/PyPI/Maven/CRAN метаданные
+# и tarball'ы исходников kernel.org → /dev/null. URL'ы стабильные годами.
+# shellcheck disable=SC2034
+URLS_LIB_DOWNLOADS=(
+"https://github.com/htop-dev/htop/archive/refs/tags/3.3.0.tar.gz"
+"https://github.com/jqlang/jq/archive/refs/tags/jq-1.7.1.tar.gz"
+"https://github.com/curl/curl/archive/refs/tags/curl-8_10_1.tar.gz"
+"https://github.com/openssl/openssl/archive/refs/tags/openssl-3.4.0.tar.gz"
+"https://github.com/postgres/postgres/archive/refs/tags/REL_17_2.tar.gz"
+"https://github.com/redis/redis/archive/refs/tags/8.0.0.tar.gz"
+"https://github.com/nginx/nginx/archive/refs/tags/release-1.27.3.tar.gz"
+"https://github.com/grafana/grafana/archive/refs/tags/v11.4.0.tar.gz"
+"https://github.com/prometheus/prometheus/archive/refs/tags/v3.0.1.tar.gz"
+"https://github.com/python/cpython/archive/refs/tags/v3.13.1.tar.gz"
+"https://github.com/torvalds/linux/archive/refs/tags/v6.12.tar.gz"
+"https://github.com/golang/go/archive/refs/tags/go1.23.4.tar.gz"
+"https://github.com/rust-lang/rust/archive/refs/tags/1.83.0.tar.gz"
+"https://github.com/nodejs/node/archive/refs/tags/v22.12.0.tar.gz"
+"https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-19.1.5.tar.gz"
+"https://github.com/ffmpeg/FFmpeg/archive/refs/tags/n7.1.tar.gz"
+"https://github.com/git/git/archive/refs/tags/v2.47.1.tar.gz"
+"https://github.com/vim/vim/archive/refs/tags/v9.1.0900.tar.gz"
+"https://github.com/neovim/neovim/archive/refs/tags/v0.10.3.tar.gz"
+"https://github.com/tmux/tmux/archive/refs/tags/3.5a.tar.gz"
+"https://registry.npmjs.org/express"
+"https://registry.npmjs.org/react"
+"https://registry.npmjs.org/typescript"
+"https://registry.npmjs.org/webpack"
+"https://registry.npmjs.org/lodash"
+"https://pypi.org/simple/requests/"
+"https://pypi.org/simple/numpy/"
+"https://pypi.org/simple/django/"
+"https://pypi.org/simple/flask/"
+"https://pypi.org/simple/pandas/"
+"https://files.pythonhosted.org/packages/source/r/requests/requests-2.32.3.tar.gz"
+"https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.17.0/commons-lang3-3.17.0.jar"
+"https://repo1.maven.org/maven2/com/google/guava/guava/33.4.0-jre/guava-33.4.0-jre.jar"
+"https://repo1.maven.org/maven2/org/springframework/spring-core/6.2.1/spring-core-6.2.1.jar"
+"https://cran.r-project.org/src/contrib/PACKAGES"
+"https://cran.r-project.org/src/contrib/dplyr_1.1.4.tar.gz"
+"https://rubygems.org/gems/rails-7.2.2.gem"
+"https://rubygems.org/gems/rake-13.2.1.gem"
+"https://crates.io/api/v1/crates/serde/download"
+"https://crates.io/api/v1/crates/tokio/download"
+"https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz"
+"https://www.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12"
+"https://download.docker.com/linux/ubuntu/dists/noble/InRelease"
+"https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz"
+"https://archive.apache.org/dist/httpd/httpd-2.4.62.tar.bz2"
+"https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.34/bin/apache-tomcat-10.1.34.tar.gz"
+"https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz"
+"https://golang.org/dl/go1.23.4.linux-amd64.tar.gz"
+"https://dl.google.com/go/go1.23.4.linux-amd64.tar.gz"
+"https://www.openssl.org/source/openssl-3.4.0.tar.gz"
+"https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz"
+"https://ftp.gnu.org/gnu/binutils/binutils-2.43.tar.xz"
+"https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz"
+"https://ftp.postgresql.org/pub/source/v17.2/postgresql-17.2.tar.bz2"
+)
+# Реалистичные UA для admin/dev-host (не Safari iOS):
+# shellcheck disable=SC2034
+UA_LIBDL=(
+"curl/8.10.1"
+"curl/8.5.0"
+"Wget/1.21.4"
+"Wget/1.24.5"
+"Debian APT-HTTP/1.3 (2.7.14) Ubuntu/24.04"
+"Go-http-client/2.0"
+"python-requests/2.32.3"
+"pip/24.3.1 {\"ci\":null,\"cpu\":\"x86_64\",\"distro\":{\"name\":\"Ubuntu\",\"version\":\"24.04\"},\"implementation\":{\"name\":\"CPython\",\"version\":\"3.13.1\"}}"
+"npm/10.9.2 node/v22.12.0 linux x64"
+"Maven/3.9.9 (Java 21.0.5; Linux 6.8.0; amd64)"
 )
 
 # shellcheck disable=SC2034
@@ -1472,6 +1737,63 @@ apt_phantom_run() {
     done
 }
 
+# ===== Phantom library/archive downloads =====
+# Тянет случайный URL (releases / npm / pypi / kernel.org / ...) до
+# LIB_PHANTOM_BYTES_MAX и сразу в /dev/null. Скорость капается RATE_KB_MAX.
+lib_phantom_run() {
+    local burst i url ua rate
+    burst=$(rrange "$LIB_PHANTOM_BURST_MIN" "$LIB_PHANTOM_BURST_MAX")
+    for ((i=0; i<burst; i++)); do
+        url="${URLS_LIB_DOWNLOADS[$RANDOM % ${#URLS_LIB_DOWNLOADS[@]}]}"
+        ua="${UA_LIBDL[$RANDOM % ${#UA_LIBDL[@]}]}"
+        rate=$(rand_rate)
+        local CURL=(curl -s -o /dev/null -L \
+            --max-filesize "$LIB_PHANTOM_BYTES_MAX" \
+            --max-time 60 \
+            --limit-rate "${rate}k" \
+            --connect-timeout 10 \
+            -H "Accept: */*" \
+            -H "Accept-Encoding: gzip, deflate" \
+            -A "$ua" \
+            "$url")
+        "${CURL[@]}" 2>/dev/null || true
+        sleep "$(rrange 3 25)"
+    done
+}
+
+# ===== Vacation mode =====
+# Раз в день кидаем кубик; если выпало — пишем в state-файл время выхода
+# из «отпуска». Все циклы в начале итерации проверяют этот файл и спят.
+VACATION_FILE="/tmp/.vps_noise/vacation_until"
+vacation_check_and_sleep() {
+    [ "$ENABLE_VACATION" = "1" ] || return 0
+    mkdir -p "$(dirname "$VACATION_FILE")"
+    local now until
+    now=$(date +%s)
+    if [ -f "$VACATION_FILE" ]; then
+        until=$(cat "$VACATION_FILE" 2>/dev/null || echo 0)
+        if [ "$until" -gt "$now" ]; then
+            sleep $(( until - now ))
+            return 0
+        else
+            rm -f "$VACATION_FILE"
+        fi
+    fi
+}
+vacation_maybe_start() {
+    [ "$ENABLE_VACATION" = "1" ] || return 0
+    local marker
+    marker="/tmp/.vps_noise/vacation_today_$(date +%Y%m%d)"
+    [ -f "$marker" ] && return 0
+    mkdir -p "$(dirname "$marker")"
+    touch "$marker"
+    if (( RANDOM % 100 < VACATION_CHANCE_PCT )); then
+        local hours
+        hours=$(rrange "$VACATION_HOURS_MIN" "$VACATION_HOURS_MAX")
+        echo "$(( $(date +%s) + hours * 3600 ))" > "$VACATION_FILE"
+    fi
+}
+
 # ===== Профиль времени суток (множитель пауз) =====
 # Возвращает целочисленный множитель (в процентах) к базовому интервалу.
 hour_factor() {
@@ -1501,12 +1823,15 @@ sleep_minutes() {
 # ===== Параллельные циклы =====
 loop_ios() {
     while true; do
+        vacation_maybe_start
+        vacation_check_and_sleep
         ios_burst
         sleep_minutes "$IOS_BURST_INTERVAL_MIN" "$IOS_BURST_INTERVAL_MAX"
     done
 }
 loop_apns() {
     while true; do
+        vacation_check_and_sleep
         apns_keepalive
         sleep "$(rrange 1500 2400)"   # ~25–40 мин
     done
@@ -1514,19 +1839,31 @@ loop_apns() {
 loop_email() {
     while true; do
         sleep_minutes "$EMAIL_INTERVAL_MIN" "$EMAIL_INTERVAL_MAX"
+        vacation_check_and_sleep
         email_session
     done
 }
 loop_news() {
     while true; do
         sleep_minutes "$NEWS_INTERVAL_MIN" "$NEWS_INTERVAL_MAX"
+        vacation_check_and_sleep
         news_session
     done
 }
 loop_apt() {
     while true; do
         sleep_minutes "$APT_PHANTOM_INTERVAL_MIN" "$APT_PHANTOM_INTERVAL_MAX"
+        vacation_maybe_start
+        vacation_check_and_sleep
         apt_phantom_run
+    done
+}
+loop_libdl() {
+    while true; do
+        sleep_minutes "$LIB_PHANTOM_INTERVAL_MIN" "$LIB_PHANTOM_INTERVAL_MAX"
+        vacation_maybe_start
+        vacation_check_and_sleep
+        lib_phantom_run
     done
 }
 
@@ -1537,6 +1874,7 @@ PIDS=()
 [ "$ENABLE_EMAIL"       = "1" ] && { loop_email & PIDS+=($!); }
 [ "$ENABLE_NEWS"        = "1" ] && { loop_news  & PIDS+=($!); }
 [ "$ENABLE_APT_PHANTOM" = "1" ] && command -v apt-get >/dev/null 2>&1 && { loop_apt & PIDS+=($!); }
+[ "$ENABLE_LIB_PHANTOM" = "1" ] && { loop_libdl & PIDS+=($!); }
 
 # Если ни один модуль не включён — спим, чтобы systemd не считал крах.
 if [ "${#PIDS[@]}" -eq 0 ]; then
@@ -1682,7 +2020,11 @@ reset_all() {
     rm -f /swapfile
     sed -i '/\/swapfile/d' /etc/fstab
     zramctl --reset /dev/zram0 2>/dev/null || true
+    # Восстанавливаем оригинальный DNS, если мы его ломали
+    apply_dns local 2>/dev/null || true
+
     rm -f "$SYSCTL_CONF" "$LIMITS_CONF" "$EXP_CONF" "$NOISE_CONF" "$PRESET_FILE" \
+          "$DNS_CONF" "$DNS_STATE" "$DNS_RESOLV_BACKUP" \
           /etc/dnsmasq.d/vps-speed.conf \
           /etc/systemd/system.conf.d/99-vps-limits.conf \
           /etc/systemd/user.conf.d/99-vps-limits.conf
@@ -1697,6 +2039,140 @@ reset_all() {
 }
 
 # ===================================================================
+#  DNS configuration
+# ===================================================================
+# Пресеты публичных резолверов. По умолчанию никаких изменений не делаем
+# (mode=local) — берётся то, что настроил провайдер.
+DNS_PRESET_CLOUDFLARE="1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001"
+DNS_PRESET_GOOGLE="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844"
+DNS_PRESET_YANDEX="77.88.8.8 77.88.8.1"
+DNS_PRESET_QUAD9="9.9.9.9 149.112.112.112"
+DNS_PRESET_ADGUARD="94.140.14.14 94.140.15.15"
+
+# Применяет выбранный DNS-режим. Сохраняет состояние в $DNS_STATE.
+# Аргументы:  $1 = mode (local|cloudflare|google|yandex|quad9|adguard|custom)
+#             $2 = (custom only) IP-адреса через пробел
+apply_dns() {
+    local mode="${1:-local}" servers=""
+    case "$mode" in
+        local|"")
+            # Удаляем drop-in (если был) и /etc/resolv.conf override.
+            if [ "$DRY_RUN" = "1" ]; then
+                _log INFO "${GRAY}[dry-run] DNS → local${NC}"
+                return 0
+            fi
+            rm -f "$DNS_CONF" "$DNS_STATE"
+            if [ -f "$DNS_RESOLV_BACKUP" ]; then
+                cp -p "$DNS_RESOLV_BACKUP" /etc/resolv.conf 2>/dev/null || true
+            fi
+            systemctl restart systemd-resolved 2>/dev/null || true
+            _log OK "${GREEN}[+] DNS режим: local (берётся конфигурация провайдера)${NC}"
+            return 0
+            ;;
+        cloudflare) servers="$DNS_PRESET_CLOUDFLARE" ;;
+        google)     servers="$DNS_PRESET_GOOGLE" ;;
+        yandex)     servers="$DNS_PRESET_YANDEX" ;;
+        quad9)      servers="$DNS_PRESET_QUAD9" ;;
+        adguard)    servers="$DNS_PRESET_ADGUARD" ;;
+        custom)     servers="${2:-}" ;;
+        *)
+            _log WARN "${RED}[!] Неизвестный DNS-режим: $mode${NC}"
+            return 1
+            ;;
+    esac
+
+    # Валидация для custom — должны быть IPv4/IPv6.
+    local s
+    for s in $servers; do
+        if ! [[ "$s" =~ ^[0-9a-fA-F:.]+$ ]]; then
+            _log WARN "${RED}[!] Невалидный DNS-сервер: $s${NC}"
+            return 1
+        fi
+    done
+    if [ -z "$servers" ]; then
+        _log WARN "${RED}[!] Список DNS-серверов пуст${NC}"
+        return 1
+    fi
+
+    [ "$DRY_RUN" = "1" ] && {
+        _log INFO "${GRAY}[dry-run] DNS → $mode ($servers)${NC}"
+        return 0
+    }
+
+    # Если запущен systemd-resolved — пишем drop-in (правильный путь на 24.04).
+    # Иначе — fallback на /etc/resolv.conf (с предварительным бэкапом).
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > "$DNS_CONF" <<EOF
+# Auto-generated by vps_optimizer.sh — DNS preset: $mode
+[Resolve]
+DNS=$servers
+DNSStubListener=yes
+DNSSEC=allow-downgrade
+DNSOverTLS=opportunistic
+Cache=yes
+EOF
+        systemctl restart systemd-resolved 2>/dev/null
+        _log OK "${GREEN}[+] DNS применён через systemd-resolved (preset=$mode):${NC}"
+        _log OK "    $servers"
+    else
+        if [ ! -f "$DNS_RESOLV_BACKUP" ] && [ -e /etc/resolv.conf ]; then
+            cp -p /etc/resolv.conf "$DNS_RESOLV_BACKUP" 2>/dev/null || true
+        fi
+        # Если /etc/resolv.conf — символическая ссылка (на stub), заменяем на файл.
+        [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+        {
+            echo "# vps_optimizer.sh — DNS preset: $mode"
+            for s in $servers; do echo "nameserver $s"; done
+            echo "options edns0 trust-ad timeout:1 attempts:2"
+        } > /etc/resolv.conf
+        _log OK "${GREEN}[+] DNS применён через /etc/resolv.conf (preset=$mode):${NC}"
+        _log OK "    $servers"
+    fi
+    echo "$mode|$servers" > "$DNS_STATE"
+}
+
+manage_dns_menu() {
+    while true; do
+        clear
+        local cur_mode="local" cur_servers=""
+        if [ -f "$DNS_STATE" ]; then
+            cur_mode=$(cut -d'|' -f1 "$DNS_STATE")
+            cur_servers=$(cut -d'|' -f2- "$DNS_STATE")
+        fi
+        echo -e "${CYAN}${BOLD}=== DNS Configuration ===${NC}"
+        echo -e "Текущий: ${BOLD}$cur_mode${NC}${cur_servers:+ ($cur_servers)}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} ${BOLD}local${NC} — конфигурация провайдера (по умолчанию)"
+        echo -e "  ${CYAN}[2]${NC} Cloudflare (1.1.1.1 / 1.0.0.1)"
+        echo -e "  ${CYAN}[3]${NC} Google (8.8.8.8 / 8.8.4.4)"
+        echo -e "  ${CYAN}[4]${NC} Yandex DNS (77.88.8.8 / 77.88.8.1)"
+        echo -e "  ${CYAN}[5]${NC} Quad9 (9.9.9.9)"
+        echo -e "  ${CYAN}[6]${NC} AdGuard (94.140.14.14 / 94.140.15.15)"
+        echo -e "  ${YELLOW}[7]${NC} Custom — ввести IP-адреса вручную"
+        echo -e "  ${GREEN}[0]${NC} Назад"
+        echo ""
+        read -r -p "Ваш выбор: " c
+        case "$c" in
+            1) apply_dns local; sleep 1 ;;
+            2) apply_dns cloudflare; read -r -p "Enter..." ;;
+            3) apply_dns google; read -r -p "Enter..." ;;
+            4) apply_dns yandex; read -r -p "Enter..." ;;
+            5) apply_dns quad9; read -r -p "Enter..." ;;
+            6) apply_dns adguard; read -r -p "Enter..." ;;
+            7)
+                echo "Введите IP DNS-серверов через пробел (IPv4 или IPv6)."
+                echo "Пример: 1.1.1.1 8.8.8.8 2606:4700:4700::1111"
+                read -r -p "Серверы: " ips
+                apply_dns custom "$ips"; read -r -p "Enter..."
+                ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
+# ===================================================================
 #  Status dashboard
 # ===================================================================
 print_status_dashboard() {
@@ -1708,7 +2184,7 @@ print_status_dashboard() {
     bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
-    echo -e "${CYAN}${BOLD}=== СТАТУС VPS PHOENIX-X ===${NC}"
+    echo -e "${CYAN}${BOLD}=== СТАТУС VPS PHOENIX-Z ===${NC}"
     echo -e "  Hypervisor:    ${BOLD}$virt${NC}"
     echo -e "  Kernel:        $(uname -r)"
     echo -e "  Cores:         $cores"
@@ -1777,6 +2253,14 @@ print_status_dashboard() {
         echo ""
         echo -e "  Preset:        ${BOLD}$(cat "$PRESET_FILE")${NC}"
     fi
+    if [ -f "$DNS_STATE" ]; then
+        local dns_mode dns_servers
+        dns_mode=$(cut -d'|' -f1 "$DNS_STATE")
+        dns_servers=$(cut -d'|' -f2- "$DNS_STATE")
+        echo -e "  DNS:           ${BOLD}$dns_mode${NC} (${dns_servers})"
+    else
+        echo -e "  DNS:           ${GRAY}local (provider default)${NC}"
+    fi
     echo ""
 }
 
@@ -1810,6 +2294,8 @@ export_config() {
     [ -f "$LIMITS_CONF" ]   && files+=("$LIMITS_CONF")
     [ -f "$NOISE_CONF" ]    && files+=("$NOISE_CONF")
     [ -f "$PRESET_FILE" ]   && files+=("$PRESET_FILE")
+    [ -f "$DNS_CONF" ]      && files+=("$DNS_CONF")
+    [ -f "$DNS_STATE" ]     && files+=("$DNS_STATE")
     [ -f "$RPS_BOOT_SCRIPT" ] && files+=("$RPS_BOOT_SCRIPT")
     [ -f "$RPS_BOOT_SERVICE" ] && files+=("$RPS_BOOT_SERVICE")
     [ -f "$NOISE_GEN_SCRIPT" ] && files+=("$NOISE_GEN_SCRIPT")
@@ -1843,7 +2329,7 @@ import_config() {
 #  CLI parser
 # ===================================================================
 print_cli_help() {
-    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v7.0 PHOENIX-X"
+    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.0 PHOENIX-Z"
     cat <<EOF
 
 USAGE:
@@ -1857,6 +2343,9 @@ COMMANDS:
     self-test                Перепроверить применённые настройки
     preset <name>            Сохранить пресет на будущие apply
     noise on|off|edit|status Управление шумогенератором
+    dns <mode> [ips]         Управление DNS:
+                               local (default) | cloudflare | google | yandex
+                               | quad9 | adguard | custom <ip1 ip2 ...>
     swap <gb>                Создать swap-файл указанного размера в ГБ
     benchmark                Замерить пинг до набора популярных endpoints
     reset                    Полный откат всех изменений
@@ -1955,6 +2444,30 @@ cli_dispatch() {
             if [ -z "${args[0]:-}" ]; then echo "import: укажи путь к архиву"; exit 1; fi
             import_config "${args[0]}"
             ;;
+        dns)
+            local sub="${args[0]:-}"
+            case "$sub" in
+                ""|status)
+                    if [ -f "$DNS_STATE" ]; then
+                        echo "DNS: $(cat "$DNS_STATE")"
+                    else
+                        echo "DNS: local (не управляется)"
+                    fi
+                    ;;
+                local|cloudflare|google|yandex|quad9|adguard)
+                    apply_dns "$sub"
+                    ;;
+                custom)
+                    local shift_args
+                    shift_args="${args[*]:1}"
+                    apply_dns custom "$shift_args"
+                    ;;
+                *)
+                    echo -e "${RED}dns: использование — local|cloudflare|google|yandex|quad9|adguard|custom <ips...>${NC}"
+                    exit 1
+                    ;;
+            esac
+            ;;
         update)    self_update ;;
         help|-h|--help) print_cli_help ;;
         *)         echo -e "${RED}Неизвестная команда: $cmd${NC}"; print_cli_help; exit 1 ;;
@@ -1994,12 +2507,13 @@ main_menu() {
         echo ""
         echo -e "Выберите действие:"
         echo -e "  ${GREEN}[1]${NC} Подготовка: компоненты Phoenix-X"
-        echo -e "  ${CYAN}[2]${NC} ${BOLD}Применить v7.0${NC} (probe-then-write, XPS/IRQ/conntrack/MPTCP/THP)"
+        echo -e "  ${CYAN}[2]${NC} ${BOLD}Применить v8.0${NC} (multi-queue / XPS / IRQ / conntrack / MPTCP / DNS / ECN)"
         echo -e "  ${CYAN}[3]${NC} Stealth: генератор шума (iOS + RU email/news + APT phantom)"
         echo -e "  ${CYAN}[4]${NC} Подкачка: SWAP & ZRAM"
         echo -e "  ${CYAN}[5]${NC} Бенчмарк (пинг до популярных endpoints)"
         echo -e "  ${CYAN}[6]${NC} Status дашборд"
         echo -e "  ${CYAN}[7]${NC} Профиль оптимизации (balanced / proxy / web)"
+        echo -e "  ${CYAN}[11]${NC} DNS (local / Cloudflare / Yandex / Quad9 / Custom...)"
         echo -e "  ${YELLOW}[9]${NC} Self-update из GitHub"
         echo -e "  ${YELLOW}[10]${NC} Export / Import конфигов"
         echo -e "  ${YELLOW}[12]${NC} Экспериментально: TFO / ECN / busy_poll"
@@ -2026,6 +2540,7 @@ main_menu() {
                     2) read -r -p "Путь к архиву: " p; import_config "$p"; read -r -p "Enter..." ;;
                 esac
                 ;;
+            11) manage_dns_menu ;;
             12) experimental_menu ;;
             8)  reset_all ;;
             0)  exit 0 ;;
