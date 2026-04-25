@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.1 PHOENIX-Z+)
+# VPS Global Optimization Script (v8.1.1 PHOENIX-Z+)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -97,7 +97,7 @@ print_header() {
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "       ULTRA VPS ACCELERATOR v8.1 (PHOENIX-Z+)                   "
+    echo "       ULTRA VPS ACCELERATOR v8.1.1 (PHOENIX-Z+)                   "
     echo "================================================================="
     echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
     echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
@@ -219,6 +219,28 @@ build_cpu_mask() {
     echo "${first}${rest}"
 }
 
+# CPU index → cpumask hex для одного CPU в kernel-формате.
+# Формат cpumask — comma-separated 32-bit hex chunks, low-CPU group последним.
+# Пример: CPU  0 → "1", CPU 31 → "80000000",
+#         CPU 32 → "1,00000000", CPU 63 → "80000000,00000000".
+# Для cpu>=32 простое `printf '%x' $((1<<cpu))` ломается на 32-bit ядрах
+# и неправильно парсится по cpumask-формату (нужны разделители на каждые 32 бита).
+cpu_to_xps_mask() {
+    local cpu="${1:-0}"
+    [ "$cpu" -lt 0 ] && cpu=0
+    local group=$(( cpu / 32 ))
+    local bit=$(( cpu % 32 ))
+    local val
+    val=$(printf '%x' $(( 1 << bit )))
+    if [ "$group" -eq 0 ]; then
+        echo "$val"
+    else
+        local zeros="" i
+        for ((i=0; i<group; i++)); do zeros+=",00000000"; done
+        echo "${val}${zeros}"
+    fi
+}
+
 # Список «реальных» сетевых интерфейсов — без виртуальных оверлеев.
 list_real_ifaces() {
     ip -o link show 2>/dev/null | \
@@ -264,7 +286,6 @@ listen-address=127.0.0.1
 bind-interfaces
 cache-size=10000
 no-resolv
-no-negcache
 neg-ttl=60
 min-cache-ttl=60
 server=1.1.1.1
@@ -463,7 +484,7 @@ apply_iface_tuning() {
             if [ -e "$f" ]; then
                 cpu_pick="${usable_arr[$(( txq_idx % usable_n ))]:-0}"
                 local one_cpu_mask
-                one_cpu_mask=$(printf '%x' $(( 1 << cpu_pick )))
+                one_cpu_mask=$(cpu_to_xps_mask "$cpu_pick")
                 sysfs_safe "$f" "$one_cpu_mask"
                 txq_idx=$(( txq_idx + 1 ))
             fi
@@ -751,41 +772,29 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_autocorking 0
     sysctl_safe net.ipv4.tcp_limit_output_bytes 1048576
 
-    # Доводки под низкий пинг (новое в v8.1):
-    #  - mtu_probing=1 + base_mss=1024: на туннелях/прокси PMTU-чёрная дыра — обычная
-    #    проблема (особенно WireGuard/Reality/XHTTP); base_mss=1024 даёт безопасный старт
-    #    и динамически растёт пакетами PROBE по RFC4821. Снижает «зависший» 1-й RTT.
-    #  - probe_interval=600 + probe_threshold=8 — частота повторного probe'а MTU.
-    #  - slow_start_after_idle=0 — отказ от «перезапуска» SS на idle-паузе (важно для
-    #    long-lived прокси-сессий xray/sing-box).
-    #  - workaround_signed_windows=1 — устраняет квирк старых клиентов с подписанным окном.
-    #  - syn_retries=3, synack_retries=2 — быстрее детектируем мёртвый upstream.
-    #  - keepalive faster (600/30/5): мёртвые сессии чистятся за ~3 минуты вместо 2+ часов.
-    #  - fin_timeout=10, retries2=8, max_tw_buckets выше — быстрее освобождаем сокеты.
+    # Доводки под низкий пинг (новое в v8.1) — ТОЛЬКО то, чего ещё нет выше.
+    # tcp_fin_timeout / tcp_keepalive_time / tcp_keepalive_intvl / tcp_keepalive_probes /
+    # tcp_syn_retries / tcp_synack_retries / tcp_min_snd_mss / tcp_slow_start_after_idle
+    # уже выставлены preset'ом или базовым блоком — их повторное переписывание перебило бы
+    # значения из proxy/web preset'а (баг, исправлен в v8.1.1).
+    #  - mtu_probing=1 + base_mss=1024 + probe_interval=600 + probe_threshold=8:
+    #    лечит PMTU-чёрные дыры на туннелях/прокси (WireGuard/Reality/XHTTP).
+    #  - workaround_signed_windows=1 — устраняет квирк старых клиентов.
+    #  - tcp_retries2=8 — быстрее освобождаем мёртвые сокеты.
     #  - tcp_low_latency=1 — historic, безопасно: предпочитать latency throughput-у.
+    #  - challenge_ack_limit=999 — без side-channel detection.
+    #  - netdev_budget повышен для softirq на >1Gbps.
     sysctl_safe net.ipv4.tcp_mtu_probing 1
     sysctl_safe net.ipv4.tcp_base_mss 1024
     sysctl_safe net.ipv4.tcp_probe_interval 600
     sysctl_safe net.ipv4.tcp_probe_threshold 8
-    sysctl_safe net.ipv4.tcp_slow_start_after_idle 0
     sysctl_safe net.ipv4.tcp_workaround_signed_windows 1
-    sysctl_safe net.ipv4.tcp_syn_retries 3
-    sysctl_safe net.ipv4.tcp_synack_retries 2
-    sysctl_safe net.ipv4.tcp_keepalive_time 600
-    sysctl_safe net.ipv4.tcp_keepalive_intvl 30
-    sysctl_safe net.ipv4.tcp_keepalive_probes 5
-    sysctl_safe net.ipv4.tcp_fin_timeout 10
     sysctl_safe net.ipv4.tcp_retries2 8
     sysctl_safe net.ipv4.tcp_low_latency 1
-    sysctl_safe net.ipv4.tcp_min_snd_mss 536
-    # Анти-DoS challenge_ack — высокий лимит, чтобы не было side-channel detectable.
     sysctl_safe net.ipv4.tcp_challenge_ack_limit 999
-    # ip_no_pmtu_disc=0 — пусть PMTU работает (по умолчанию 0, но фиксируем).
     sysctl_safe net.ipv4.ip_no_pmtu_disc 0
-    # Повышенный netdev_budget для softirq на современных VPS с >1Gbps.
     sysctl_safe net.core.netdev_budget 600
     sysctl_safe net.core.netdev_budget_usecs 8000
-    # Анти-bufferbloat в TCP: tcp_notsent_lowat уже выставлен ранее. Добавим:
     sysctl_safe net.ipv4.tcp_invalid_ratelimit 500
 
     # MPTCP (Linux 5.6+)
@@ -875,47 +884,104 @@ apply_sysctls() {
 # поэтому именно их и восстанавливает этот юнит.
 apply_persistent_units() {
     [ "$DRY_RUN" = "1" ] && return 0
-    cat > "$RPS_BOOT_SCRIPT" <<'RPS_EOF'
+    # Подставляем preset-зависимые значения и multi-queue target прямо в скрипт.
+    local rps_flows="${PRESET_RPS_FLOWS:-4096}"
+    cat > "$RPS_BOOT_SCRIPT" <<RPS_EOF
 #!/bin/bash
-# Auto-generated by vps_optimizer.sh — restores RPS/XPS/RFS/LRO after reboot.
+# Auto-generated by vps_optimizer.sh — restores RPS/XPS/RFS/LRO/multi-queue after reboot.
 set +e
+
 build_cpu_mask() {
-    local n=$1
-    [ "$n" -le 0 ] && { echo 0; return; }
-    local groups=$(( (n + 31) / 32 ))
-    local last_bits=$(( n - (groups - 1) * 32 ))
+    local n=\$1
+    [ "\$n" -le 0 ] && { echo 0; return; }
+    local groups=\$(( (n + 31) / 32 ))
+    local last_bits=\$(( n - (groups - 1) * 32 ))
     local first
-    if [ "$last_bits" -ge 32 ]; then
+    if [ "\$last_bits" -ge 32 ]; then
         first="ffffffff"
     else
-        first=$(printf '%x' $(( (1 << last_bits) - 1 )))
+        first=\$(printf '%x' \$(( (1 << last_bits) - 1 )))
     fi
     local rest="" i
-    for ((i=1; i<groups; i++)); do rest=",ffffffff${rest}"; done
-    echo "${first}${rest}"
+    for ((i=1; i<groups; i++)); do rest=",ffffffff\${rest}"; done
+    echo "\${first}\${rest}"
 }
-CORES=$(nproc)
-MASK=$(build_cpu_mask "$CORES")
+
+# CPU index → cpumask hex (kernel формат, comma-separated 32-bit chunks).
+cpu_to_xps_mask() {
+    local cpu="\${1:-0}"
+    [ "\$cpu" -lt 0 ] && cpu=0
+    local group=\$(( cpu / 32 ))
+    local bit=\$(( cpu % 32 ))
+    local val
+    val=\$(printf '%x' \$(( 1 << bit )))
+    if [ "\$group" -eq 0 ]; then
+        echo "\$val"
+    else
+        local zeros="" i
+        for ((i=0; i<group; i++)); do zeros+=",00000000"; done
+        echo "\${val}\${zeros}"
+    fi
+}
+
+# Парсим isolcpus= из cmdline и возвращаем список «usable» ядер.
+usable_cpus() {
+    local total iso= cmdline
+    total=\$(nproc)
+    cmdline=\$(cat /proc/cmdline 2>/dev/null)
+    if [[ "\$cmdline" =~ isolcpus=([^[:space:]]+) ]]; then
+        iso="\${BASH_REMATCH[1]}"
+    fi
+    declare -A bad
+    if [ -n "\$iso" ]; then
+        local part
+        for part in \${iso//,/ }; do
+            if [[ "\$part" =~ ^([0-9]+)-([0-9]+)\$ ]]; then
+                local lo=\${BASH_REMATCH[1]} hi=\${BASH_REMATCH[2]} c
+                for ((c=lo; c<=hi; c++)); do bad[\$c]=1; done
+            elif [[ "\$part" =~ ^[0-9]+\$ ]]; then
+                bad[\$part]=1
+            fi
+        done
+    fi
+    local c
+    for ((c=0; c<total; c++)); do
+        [ -z "\${bad[\$c]}" ] && echo "\$c"
+    done
+}
+
+CORES=\$(nproc)
+MASK=\$(build_cpu_mask "\$CORES")
+mapfile -t USABLE < <(usable_cpus)
+USABLE_N=\${#USABLE[@]}
+[ "\$USABLE_N" -eq 0 ] && USABLE_N=1
 echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 
-for IFACE in $(ip -o link show | awk -F': ' '$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube|cni)/ {print $2}'); do
-    for f in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
-        [ -e "$f" ] && echo "$MASK" > "$f" 2>/dev/null || true
+for IFACE in \$(ip -o link show | awk -F': ' '\$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube|cni)/ {print \$2}'); do
+    # Multi-queue: восстанавливаем количество очередей до min(N_cpus, max_combined).
+    MQ_MAX=\$(ethtool -l "\$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f && /^Combined:/{print \$2; exit}')
+    if [ -n "\$MQ_MAX" ] && [ "\$MQ_MAX" -gt 1 ]; then
+        MQ_TARGET="\$CORES"
+        [ "\$MQ_TARGET" -gt "\$MQ_MAX" ] && MQ_TARGET="\$MQ_MAX"
+        ethtool -L "\$IFACE" combined "\$MQ_TARGET" >/dev/null 2>&1 || true
+    fi
+    for f in /sys/class/net/"\$IFACE"/queues/rx-*/rps_cpus; do
+        [ -e "\$f" ] && echo "\$MASK" > "\$f" 2>/dev/null || true
     done
-    for f in /sys/class/net/"$IFACE"/queues/rx-*/rps_flow_cnt; do
-        [ -e "$f" ] && echo 4096 > "$f" 2>/dev/null || true
+    for f in /sys/class/net/"\$IFACE"/queues/rx-*/rps_flow_cnt; do
+        [ -e "\$f" ] && echo $rps_flows > "\$f" 2>/dev/null || true
     done
-    # XPS: каждой TX-очереди свой CPU
+    # XPS: каждой TX-очереди свой CPU из usable-списка (минуя isolcpus).
     txi=0
-    for f in /sys/class/net/"$IFACE"/queues/tx-*/xps_cpus; do
-        if [ -e "$f" ]; then
-            cpu_idx=$(( txi % CORES ))
-            mask=$(printf '%x' $(( 1 << cpu_idx )))
-            echo "$mask" > "$f" 2>/dev/null || true
-            txi=$(( txi + 1 ))
+    for f in /sys/class/net/"\$IFACE"/queues/tx-*/xps_cpus; do
+        if [ -e "\$f" ]; then
+            cpu_pick="\${USABLE[\$(( txi % USABLE_N ))]:-0}"
+            mask=\$(cpu_to_xps_mask "\$cpu_pick")
+            echo "\$mask" > "\$f" 2>/dev/null || true
+            txi=\$(( txi + 1 ))
         fi
     done
-    ethtool -K "$IFACE" lro off >/dev/null 2>&1 || true
+    ethtool -K "\$IFACE" lro off >/dev/null 2>&1 || true
 done
 RPS_EOF
     chmod +x "$RPS_BOOT_SCRIPT"
@@ -969,7 +1035,7 @@ finalize_sysctl_conf() {
         cp "$SYSCTL_CONF" "$SYSCTL_BACKUP" 2>/dev/null || true
     fi
     {
-        echo "# === VPS Optimizer v8.1 PHOENIX-Z+ ==="
+        echo "# === VPS Optimizer v8.1.1 PHOENIX-Z+ ==="
         echo "# Generated $(date -u +%FT%TZ)  preset=$PRESET_NAME  virt=$VIRT  kernel=$(uname -r)"
         echo "# Только параметры, которые ядро/гипервизор реально приняли."
         cat "$SYSCTL_TMP" 2>/dev/null
@@ -1010,7 +1076,7 @@ self_test() {
 
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
-    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.1 PHOENIX-Z+...${NC}"
+    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.1.1 PHOENIX-Z+...${NC}"
 
     VIRT=$(detect_virt)
     _log INFO "  Virt:    $VIRT"
@@ -1885,7 +1951,7 @@ lib_phantom_run() {
 # ===== Vacation mode =====
 # Раз в день кидаем кубик; если выпало — пишем в state-файл время выхода
 # из «отпуска». Все циклы в начале итерации проверяют этот файл и спят.
-VACATION_FILE="/tmp/.vps_noise/vacation_until"
+VACATION_FILE="/var/lib/vps-noise/vacation_until"
 vacation_check_and_sleep() {
     [ "$ENABLE_VACATION" = "1" ] || return 0
     mkdir -p "$(dirname "$VACATION_FILE")"
@@ -1904,7 +1970,7 @@ vacation_check_and_sleep() {
 vacation_maybe_start() {
     [ "$ENABLE_VACATION" = "1" ] || return 0
     local marker
-    marker="/tmp/.vps_noise/vacation_today_$(date +%Y%m%d)"
+    marker="/var/lib/vps-noise/vacation_today_$(date +%Y%m%d)"
     [ -f "$marker" ] && return 0
     mkdir -p "$(dirname "$marker")"
     touch "$marker"
@@ -2032,7 +2098,8 @@ StandardError=null
 PrivateTmp=yes
 ProtectSystem=full
 NoNewPrivileges=yes
-ReadWritePaths=/tmp /var/cache/apt /var/lib/apt
+StateDirectory=vps-noise
+ReadWritePaths=/tmp /var/cache/apt /var/lib/apt /var/lib/vps-noise
 
 [Install]
 WantedBy=multi-user.target
@@ -2136,6 +2203,10 @@ experimental_menu() {
 }
 
 reset_all() {
+    if [ "$DRY_RUN" = "1" ]; then
+        echo -e "${YELLOW}[dry-run] reset_all: ничего не удаляю/не останавливаю.${NC}"
+        return 0
+    fi
     echo -e "${YELLOW}[*] Полный откат...${NC}"
     swapoff -a 2>/dev/null || true
     rm -f /swapfile
@@ -2152,7 +2223,7 @@ reset_all() {
     systemctl stop vps-noise vps-rps dnsmasq >/dev/null 2>&1 || true
     systemctl disable vps-noise vps-rps >/dev/null 2>&1 || true
     rm -f "$NOISE_GEN_SCRIPT" "$NOISE_GEN_SERVICE" "$RPS_BOOT_SCRIPT" "$RPS_BOOT_SERVICE"
-    rm -rf /tmp/.vps_noise
+    rm -rf /tmp/.vps_noise /var/lib/vps-noise
     systemctl daemon-reload >/dev/null 2>&1 || true
     sysctl --system >/dev/null 2>&1 || true
     echo -e "${GREEN}[+] Сброс выполнен.${NC}"
@@ -2710,7 +2781,7 @@ import_config() {
 #  CLI parser
 # ===================================================================
 print_cli_help() {
-    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.1 PHOENIX-Z+"
+    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.1.1 PHOENIX-Z+"
     cat <<EOF
 
 USAGE:
