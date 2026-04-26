@@ -3190,7 +3190,11 @@ reset_all() {
           /etc/systemd/system/vps-optimizer-apply.service \
           /etc/systemd/system/vps-optimizer-health.timer \
           /etc/systemd/system/vps-optimizer-health.service \
-          /etc/rsyslog.d/49-vps-optimizer.conf
+          /etc/rsyslog.d/49-vps-optimizer.conf \
+          /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf
+    # v8.5: если unbound был переведён на dnssec через dns_dnssec_command — reload чтобы
+    # подхватить отсутствие фрагмента.
+    systemctl reload unbound >/dev/null 2>&1 || true
     systemctl restart rsyslog >/dev/null 2>&1 || true
     rm -rf /tmp/.vps_noise /var/lib/vps-noise
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -5099,7 +5103,14 @@ playbook_command() {
         hysteria2-host)
             echo -e "${CYAN}[playbook] hysteria2-host${NC}"
             PRESET=proxy
-            apply_optimizations
+            # v8.5: если apply_optimizations падает (lock-busy=40, rolled-back=60),
+            # не сообщаем ложный success и пробрасываем rc наружу (cron-friendly).
+            local rc=0
+            apply_optimizations || rc=$?
+            if [ $rc -ne 0 ]; then
+                echo -e "${RED}[!] playbook hysteria2-host: apply rc=$rc${NC}"
+                return $rc
+            fi
             modprobe udp_tunnel 2>/dev/null || true
             _audit playbook "name=hysteria2-host"
             echo -e "${GREEN}[+] playbook hysteria2-host применён${NC}"
@@ -5108,14 +5119,24 @@ playbook_command() {
             echo -e "${CYAN}[playbook] wg-vpn-server${NC}"
             PRESET=balanced
             VPN_FORCE=1
-            apply_optimizations
+            local rc=0
+            apply_optimizations || rc=$?
+            if [ $rc -ne 0 ]; then
+                echo -e "${RED}[!] playbook wg-vpn-server: apply rc=$rc${NC}"
+                return $rc
+            fi
             _audit playbook "name=wg-vpn-server"
             echo -e "${GREEN}[+] playbook wg-vpn-server применён (используй 'wg setup' для конфига)${NC}"
             ;;
         web-frontend)
             echo -e "${CYAN}[playbook] web-frontend${NC}"
             PRESET=web
-            apply_optimizations
+            local rc=0
+            apply_optimizations || rc=$?
+            if [ $rc -ne 0 ]; then
+                echo -e "${RED}[!] playbook web-frontend: apply rc=$rc${NC}"
+                return $rc
+            fi
             modprobe tls 2>/dev/null || true
             _audit playbook "name=web-frontend"
             echo -e "${GREEN}[+] playbook web-frontend применён${NC}"
