@@ -2537,7 +2537,8 @@ stun_burst() {
         "stun.cloudflare.com:3478"
         "stun.nextcloud.com:443"
     )
-    local n=$(rrange 1 3) i pick h p
+    local n i pick h p
+    n=$(rrange 1 3)
     for ((i=0; i<n; i++)); do
         pick="${stuns[$(urand 0 $(( ${#stuns[@]} - 1 )) )]}"
         h="${pick%:*}" p="${pick##*:}"
