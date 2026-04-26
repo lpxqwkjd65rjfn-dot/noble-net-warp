@@ -886,13 +886,10 @@ apply_thp() {
     virt=$(detect_virt)
     case "$virt" in
         kvm|xen|hyperv|microsoft|vmware)
-            if [ -w /sys/kernel/mm/ksm/run ]; then
-                echo 1 > /sys/kernel/mm/ksm/run 2>/dev/null && \
-                    _log OK "${GREEN}[+] KSM=on (sleep_millisecs=200)${NC}"
-                [ -w /sys/kernel/mm/ksm/sleep_millisecs ] && \
-                    echo 200 > /sys/kernel/mm/ksm/sleep_millisecs 2>/dev/null || true
-                [ -w /sys/kernel/mm/ksm/pages_to_scan ] && \
-                    echo 1000 > /sys/kernel/mm/ksm/pages_to_scan 2>/dev/null || true
+            if sysfs_safe /sys/kernel/mm/ksm/run 1; then
+                _log OK "${GREEN}[+] KSM=on (sleep_millisecs=200)${NC}"
+                sysfs_safe /sys/kernel/mm/ksm/sleep_millisecs 200
+                sysfs_safe /sys/kernel/mm/ksm/pages_to_scan 1000
             fi
             ;;
     esac
@@ -5045,7 +5042,7 @@ backup_config_command() {
     archive="/tmp/vps-optimizer-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
     tar czf "$archive" -C / \
         etc/sysctl.d/99-vps-optimizer.conf \
-        etc/security/limits.d/99-vps-optimizer.conf \
+        etc/security/limits.d/99-vps-limits.conf \
         etc/vps-noise.conf \
         var/backups/vps-optimizer/ \
         var/log/vps-optimizer-audit.log 2>/dev/null \
@@ -5137,14 +5134,18 @@ dns_dnssec_command() {
     fi
     case "$mode" in
         on)
-            echo "auto-trust-anchor-file: \"/var/lib/unbound/root.key\"" >> /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf 2>/dev/null
+            # v8.5: idempotent — truncate (>) а не append (>>), иначе при повторных
+            # вызовах будут дубли auto-trust-anchor-file и unbound крашится.
+            echo "auto-trust-anchor-file: \"/var/lib/unbound/root.key\"" > /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf 2>/dev/null
             unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
             systemctl reload unbound 2>/dev/null || true
+            _audit dns-dnssec "mode=on"
             echo -e "${GREEN}[+] DNSSEC validation = on (unbound)${NC}"
             ;;
         off)
             rm -f /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf
             systemctl reload unbound 2>/dev/null || true
+            _audit dns-dnssec "mode=off"
             echo -e "${YELLOW}[*] DNSSEC validation = off${NC}"
             ;;
         *)
@@ -5183,12 +5184,14 @@ WantedBy=timers.target
 EOF
             systemctl daemon-reload
             systemctl enable --now vps-optimizer-health.timer 2>/dev/null
+            _audit health-watch "action=on"
             echo -e "${GREEN}[+] health-watch enabled (every 5 min, log: /var/log/vps-optimizer-health.log)${NC}"
             ;;
         off|disable)
             systemctl disable --now vps-optimizer-health.timer 2>/dev/null
             rm -f "$timer_unit" "$svc_unit"
             systemctl daemon-reload
+            _audit health-watch "action=off"
             echo -e "${YELLOW}[*] health-watch disabled${NC}"
             ;;
         status|*)
