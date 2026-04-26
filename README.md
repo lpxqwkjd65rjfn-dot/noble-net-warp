@@ -302,7 +302,44 @@ help                            Print full help
 
 ## Changelog
 
-### v8.3 PHOENIX-Z++ — VPN-safe (current)
+### v8.4 — stealth & perf (current)
+
+Расширение v8.3 без изменений defaults — всё новое либо probe-then-write, либо
+opt-in. SSH/VPN-совместимо: ни один новый knob не меняет routing/firewall.
+
+**Стелс / маскировка под iOS** (главный приоритет):
+- **APNs/FCM/WNS rotation** в шуме — реальные мобильные устройства держат TCP до push-сервисов **постоянно**. Раньше был только APNs, теперь — APNs + FCM (`mtalk.google.com:5228`) + Microsoft WNS.
+- **WebRTC STUN UDP бёрсты** — Safari/Chrome регулярно стучатся в `stun.l.google.com:19302` / Cloudflare STUN. Теперь имитируем (1-3 STUN Binding Request раз в 10-40 минут).
+- **WebSocket-style long-poll** — длинные TCP/443 keepalive (5-20 мин) к крупным сайтам. Раньше шум был request/response, теперь имитируем Telegram/Discord-pattern.
+- **HTTP/3 в шуме чаще** (1/2 вместо 1/3) — Safari/Chrome ходят h3 ~50%.
+- **TLS 1.3 0-RTT / Early Data** на resumed sessions через curl `--tls-earlydata` (если поддерживается).
+
+**Производительность TCP/UDP** (probe-then-write):
+- `tcp_min_rtt_wlen 600` — стабильнее BBR на джиттере.
+- `bpf_jit_enable=1` + `bpf_jit_kallsyms=1` + `bpf_jit_harden=1` — JIT для eBPF, +10-100x для XDP.
+- `nf_conntrack_tcp_be_liberal=1` — меньше drop'ов на ASN-roaming.
+- `vm.min_free_kbytes` авто (~0.5% RAM, 64MB-1GB bounds) — нет direct-reclaim под burst.
+- `initcwnd=30 / initrwnd=30` через `ip route change` на default-маршруте (skip VPN-iface) — Google-style.
+- `modprobe tls` — kTLS-модуль (sendfile-on-TLS, -30-50% CPU для nginx-ktls).
+- **OOM-protect** для xray/sing-box/hysteria/v2ray/tuic/wireguard-go (`oom_score_adj=-500`).
+
+**NIC enhancements** (best-effort, ошибки игнорируются):
+- `rx-flow-hash udp4/tcp4 sdfn` — RSS hash включает src/dst ports → лучше распределение QUIC.
+- `hw-tc-offload on`, `ntuple on`, `gso_max_size 65536`, `gro_max_size 65536`.
+
+**doctor дополнения:**
+- top-3 connections by retransmits через `ss -tin`.
+- PCIe gen warning (gen3 на gen4-капабельной hw).
+- kTLS статус (`/sys/module/tls`).
+
+**Новые CLI команды:**
+- `top` — TUI: live conntrack, TCP states, top-10 connections by retransmits (`watch -n 2`).
+- `mtr <host>` — обёртка над mtr для quick-troubleshoot линка.
+- `prom-push <gw-url>` — push-режим для cron-jobs (Pushgateway).
+
+**Backward-compat:** все default-флаги совпадают с v8.3. v8.3-конфиги работают без изменений.
+
+### v8.3 PHOENIX-Z++ — VPN-safe
 
 **Главное:** apply теперь VPN/SSH-friendly по дефолту, сам себя откатывает если потерял связь.
 

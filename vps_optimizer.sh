@@ -90,7 +90,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.3"
+SCRIPT_VERSION="8.4"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -765,6 +765,26 @@ apply_iface_tuning() {
             fi
             ethtool -C "$iface" adaptive-rx on adaptive-tx on >/dev/null 2>&1 || \
                 ethtool -C "$iface" rx-usecs 8 tx-usecs 8 >/dev/null 2>&1 || true
+
+            # v8.4 NIC enhancements (best-effort, ошибки игнорируются):
+            #  - rx-flow-hash udp4/udp6 sdfn — RSS hash включает src/dst ports,
+            #    иначе все QUIC-сессии с одной пары IP идут на одну очередь.
+            #  - hw-tc-offload — TC-классы выполняются в железе на Mellanox/Intel
+            #    800-series, экономит CPU.
+            #  - gso-max-size 65536 — большие GSO-фреймы для virtio-net,
+            #    снижают packet-rate в host kernel.
+            #  - ntuple-filters — нужно для kernel-bypass правил RSS.
+            if nic_offload_safe_for_iface "$iface"; then
+                ethtool -N "$iface" rx-flow-hash udp4 sdfn >/dev/null 2>&1 || true
+                ethtool -N "$iface" rx-flow-hash udp6 sdfn >/dev/null 2>&1 || true
+                ethtool -N "$iface" rx-flow-hash tcp4 sdfn >/dev/null 2>&1 || true
+                ethtool -N "$iface" rx-flow-hash tcp6 sdfn >/dev/null 2>&1 || true
+                ethtool -K "$iface" hw-tc-offload on >/dev/null 2>&1 || true
+                ethtool -K "$iface" ntuple on >/dev/null 2>&1 || true
+                # gso-max-size требует Linux 5.18+ и драйверной поддержки
+                ip link set dev "$iface" gso_max_size 65536 >/dev/null 2>&1 || true
+                ip link set dev "$iface" gro_max_size 65536 >/dev/null 2>&1 || true
+            fi
         fi
     done
 }
@@ -964,6 +984,14 @@ apply_sysctls() {
     sysctl_safe net.core.optmem_max 4194304
     sysctl_safe net.core.dev_weight 128
     sysctl_safe net.core.flow_limit_table_len 8192
+    # v8.4: bpf_jit_enable — JIT для всех eBPF/XDP программ. Default=0 на многих
+    # ядрах. JIT даёт 10-100x ускорение интерпретатора (нужен для XDP/cilium-style
+    # фильтров, для нашего шум-генератора — нейтрально, но для будущих helpers — критично).
+    sysctl_safe net.core.bpf_jit_enable 1
+    # v8.4: bpf_jit_kallsyms=1 (отладка/perf), bpf_jit_harden=1 (анти-spectre v1) —
+    # включаем оба, незначительный CPU-overhead, заметно лучше observability.
+    sysctl_safe net.core.bpf_jit_kallsyms 1
+    sysctl_safe net.core.bpf_jit_harden 1
 
     # NAPI defer (Linux 5.12+)
     if [ "$kvi" -ge 51200 ]; then
@@ -1016,7 +1044,9 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_max_orphans "$PRESET_TCP_MAX_ORPHANS"
     sysctl_safe net.ipv4.tcp_orphan_retries 2
     sysctl_safe net.ipv4.tcp_min_snd_mss 536
-    sysctl_safe net.ipv4.tcp_min_rtt_wlen 300
+    # v8.4: shifted from 300s → 600s — стабильнее BBR-оценка при джиттере на
+    # длинных линиях (РФ↔Европа), без потери adaptивности на мобильных.
+    sysctl_safe net.ipv4.tcp_min_rtt_wlen 600
     sysctl_safe net.ipv4.tcp_pacing_ss_ratio "$PRESET_BBR_PACING_SS"
     sysctl_safe net.ipv4.tcp_pacing_ca_ratio "$PRESET_BBR_PACING_CA"
     sysctl_safe net.ipv4.tcp_collapse_max_bytes 6291456
@@ -1181,6 +1211,10 @@ apply_sysctls() {
         sysctl_safe net.netfilter.nf_conntrack_tcp_timeout_close_wait 30
         sysctl_safe net.netfilter.nf_conntrack_tcp_timeout_fin_wait 30
         sysctl_safe net.netfilter.nf_conntrack_generic_timeout 120
+        # v8.4: tcp_be_liberal — не дропаем TCP-сегменты с «странным» seq,
+        # типичная проблема под ASN-roaming / mobile-NAT и асимметричной маршрутизацией.
+        # Не открывает уязвимостей: conntrack продолжает следить за state, просто терпимее.
+        sysctl_safe net.netfilter.nf_conntrack_tcp_be_liberal 1
     fi
 
     # VM / ZRAM tuning
@@ -1191,7 +1225,15 @@ apply_sysctls() {
     sysctl_safe vm.dirty_ratio 10
     sysctl_safe vm.dirty_writeback_centisecs 500
     sysctl_safe vm.dirty_expire_centisecs 1500
-    sysctl_safe vm.min_free_kbytes 65536
+    # v8.4: vm.min_free_kbytes — поднимаем под размер RAM (~0.5%), но min 64MB,
+    # max 1GB. Иначе под burst (тысячи TLS-handshake'ов) kswapd не успевает,
+    # начинаются direct-reclaim'ы, latency-spike'и или OOM. На VPS 1GB RAM
+    # default ~22MB — катастрофически мало для прокси-нагрузки.
+    local min_free_target
+    min_free_target=$(( mem_mb * 1024 / 200 ))   # 0.5% RAM в kB
+    [ "$min_free_target" -lt 65536 ] && min_free_target=65536
+    [ "$min_free_target" -gt 1048576 ] && min_free_target=1048576
+    sysctl_safe vm.min_free_kbytes "$min_free_target"
     sysctl_safe vm.zone_reclaim_mode 0
     # Доводки v8.1:
     #  - max_map_count: высоко-thread'овые прокси (sing-box, gomod-сервисы)
@@ -1420,6 +1462,59 @@ self_test() {
     echo ""
 }
 
+# v8.4: initcwnd via `ip route` — Google ставит 30, мы тоже. На дефолтном
+# маршруте даёт ~3-4х данных в первом RTT (десятки KB вместо ~14KB при cwnd=10).
+# Не персистентно (живёт до перезагрузки), но apply переустанавливает.
+apply_route_initcwnd() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    local def_line def_iface def_via
+    def_line=$(ip -4 route show default 2>/dev/null | head -1)
+    [ -z "$def_line" ] && return 0
+    def_iface=$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$def_line")
+    def_via=$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$def_line")
+    [ -z "$def_iface" ] && return 0
+    # Пропускаем VPN-iface — там initcwnd не имеет смысла, а route change может
+    # перетереть ту, что VPN-приложение само поставило.
+    case "$def_iface" in
+        tun*|tap*|wg*|ppp*|ipsec*) return 0 ;;
+    esac
+    local change_args=(default dev "$def_iface" initcwnd 30 initrwnd 30)
+    [ -n "$def_via" ] && change_args=(default via "$def_via" dev "$def_iface" initcwnd 30 initrwnd 30)
+    if ip route change "${change_args[@]}" >/dev/null 2>&1; then
+        _log OK "  route initcwnd=30 / initrwnd=30 на ${def_iface}"
+    fi
+}
+
+# v8.4: kernel TLS (kTLS). modprobe tls — даёт ядру способность делать sendfile()
+# на TLS-сокетах (zero-copy). Прирост -30-50% CPU на TLS-heavy нагрузках,
+# если приложение умеет (nginx со сборкой `--with-openssl-opt=enable-ktls`).
+# Сам `modprobe tls` безопасен: не меняет поведения других сокетов.
+apply_ktls_module() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    modprobe tls 2>/dev/null && _log OK "  kTLS module loaded (sendfile-on-TLS available)"
+}
+
+# v8.4: OOM hint — если на машине крутятся проксильки (xray/sing-box/hysteria/v2ray),
+# ставим им oom_score_adj=-500 (но не -1000, т.к. это «никогда не убивать» —
+# опасно если процесс утекает память). Отрицательное значение = реже убивает,
+# чем других. Без --force ничего не делаем для незнакомых процессов.
+apply_oom_hints() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    local proc pids p
+    for proc in xray sing-box hysteria hysteria2 v2ray tuic-server wireguard-go; do
+        if ! command -v pgrep >/dev/null 2>&1; then
+            return 0
+        fi
+        pids=$(pgrep -x "$proc" 2>/dev/null)
+        for p in $pids; do
+            if [ -w "/proc/$p/oom_score_adj" ]; then
+                echo -500 > "/proc/$p/oom_score_adj" 2>/dev/null && \
+                    _log OK "  OOM-protect $proc (pid=$p) → score_adj=-500"
+            fi
+        done
+    done
+}
+
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
     _log INFO "${YELLOW}[*] Глобальный тюнинг v${SCRIPT_VERSION} PHOENIX-Z++...${NC}"
@@ -1497,6 +1592,9 @@ apply_optimizations() {
     apply_sysctls
     apply_persistent_units
     apply_limits
+    apply_route_initcwnd
+    apply_ktls_module
+    apply_oom_hints
 
     # B1: idempotency — если новый sysctl-файл побитово совпадает с уже существующим,
     # пропускаем перезапись и `sysctl -p` (всё уже применено).
@@ -1611,6 +1709,9 @@ PROFILE="ru"
 # --- Что включено ---
 ENABLE_IOS_BURST=1        # фон iOS Safari (apple.com / icloud.com / ...)
 ENABLE_APNS=1             # TCP-keepalive courier.push.apple.com:5223
+ENABLE_PUSH=1             # v8.4: ротация APNs / FCM / WNS push-keepalive
+ENABLE_STUN=1             # v8.4: WebRTC STUN UDP бёрсты (Google/Cloudflare)
+ENABLE_WEBSOCKET=1        # v8.4: длинные TCP/443 keepalive (Telegram/Discord-like)
 ENABLE_EMAIL=1            # заходы в Яндекс.Почту / Mail.ru / Max.ru
 ENABLE_NEWS=1             # новостные сайты + соцсети РФ
 ENABLE_APT_PHANTOM=1      # фантомные APT-загрузки (libs + OS images)
@@ -1793,6 +1894,9 @@ PROFILE="$PROFILE"
 
 ENABLE_IOS_BURST=$ENABLE_IOS_BURST
 ENABLE_APNS=$ENABLE_APNS
+ENABLE_PUSH=${ENABLE_PUSH:-1}
+ENABLE_STUN=${ENABLE_STUN:-1}
+ENABLE_WEBSOCKET=${ENABLE_WEBSOCKET:-1}
 ENABLE_EMAIL=$ENABLE_EMAIL
 ENABLE_NEWS=$ENABLE_NEWS
 ENABLE_APT_PHANTOM=$ENABLE_APT_PHANTOM
@@ -2322,10 +2426,17 @@ http_request() {
     args+=("${referer_arg[@]}")
     args+=("${cache_args[@]}")
     if [ "$CURL_BIN" = "curl" ]; then
-        if (( $(urand 0 2) == 0 )) && curl --help all 2>/dev/null | grep -q -- '--http3'; then
+        # v8.4: Safari/Chrome ходят h3 ~50% когда сервер поддерживает,
+        # а у нас было 1/3. Бампим до 1/2.
+        if (( $(urand 0 1) == 0 )) && curl --help all 2>/dev/null | grep -q -- '--http3'; then
             args+=(--http3)
         else
             args+=(--http2)
+        fi
+        # v8.4: TLS 1.3 0-RTT / Early Data — Safari делает на resumed sessions.
+        # curl поддерживает с 7.79+. Если не поддерживается — флаг проигнорится.
+        if curl --help all 2>/dev/null | grep -q -- '--tls-earlydata'; then
+            (( $(urand 0 2) == 0 )) && args+=(--tls-earlydata)
         fi
     fi
 
@@ -2383,6 +2494,86 @@ cloud_phantom() {
 # ===== APNs keepalive =====
 apns_keepalive() {
     timeout 6 bash -c 'exec 3<>/dev/tcp/courier.push.apple.com/5223 && sleep 3' 2>/dev/null || true
+}
+
+# ===== FCM / Microsoft / Apple push keepalive (v8.4) =====
+# Реальные мобильные устройства (Android, Win, Mac) держат TCP до push-сервисов
+# **постоянно**, периодически слегка «дёргают» соединение. Чисто TCP-handshake +
+# короткое ожидание. Никаких HTTP-запросов, никаких данных в /dev/null.
+# FCM_HOSTS перечисляет несколько endpoint'ов — алгоритм случайно выбирает один.
+push_keepalive() {
+    local hosts=(
+        "courier.push.apple.com:5223"     # APNs (Apple)
+        "1-courier.push.apple.com:5223"
+        "2-courier.push.apple.com:5223"
+        "mtalk.google.com:5228"           # FCM (Android / Chrome)
+        "mtalk4.google.com:5228"
+        "mtalk-staging.google.com:5228"
+        "db5p.notify.windows.com:443"     # WNS (Windows)
+        "vap04.notify.windows.com:443"
+    )
+    local pick="${hosts[$(urand 0 $(( ${#hosts[@]} - 1 )) )]}"
+    local h="${pick%:*}" p="${pick##*:}"
+    timeout 6 bash -c "exec 3<>/dev/tcp/$h/$p && sleep 3" 2>/dev/null || true
+}
+
+# ===== STUN UDP burst (v8.4) =====
+# Браузеры/приложения регулярно делают WebRTC discovery: маленький UDP-пакет
+# к публичному STUN серверу, ответ ~32-60 байт. Имитируем через bash UDP socket.
+# Рассылаем 1-3 STUN Binding Request'а к рандомным STUN-серверам.
+stun_burst() {
+    # Сырой STUN Binding Request: 20 байт.
+    # 0x0001 (Binding Request) + 0x0000 (length=0) + 0x2112A442 (magic cookie) +
+    # 12-байтовый transaction ID. Собираем как `\xNN`-escape-строку (а не сырыми
+    # байтами через $'...'), потому что bash-строки не могут содержать NUL —
+    # любая `\x00` в \$'…' усекает переменную в 0 длины. printf %b развернёт.
+    local stun_pkt='\x00\x01\x00\x00\x21\x12\xa4\x42'
+    local b
+    for ((b=0; b<12; b++)); do
+        stun_pkt+=$(printf '\\x%02x' "$(urand 0 255)")
+    done
+    local stuns=(
+        "stun.l.google.com:19302"
+        "stun1.l.google.com:19302"
+        "stun2.l.google.com:19302"
+        "stun.cloudflare.com:3478"
+        "stun.nextcloud.com:443"
+    )
+    local n i pick h p
+    n=$(rrange 1 3)
+    for ((i=0; i<n; i++)); do
+        pick="${stuns[$(urand 0 $(( ${#stuns[@]} - 1 )) )]}"
+        h="${pick%:*}" p="${pick##*:}"
+        timeout 2 bash -c "
+            exec 3<>/dev/udp/$h/$p
+            printf '%b' '$stun_pkt' >&3
+            head -c 64 <&3 >/dev/null 2>&1 &
+            sleep 0.5
+            kill %1 2>/dev/null
+        " 2>/dev/null || true
+        sleep "$(rrange 1 4)"
+    done
+}
+
+# ===== WebSocket-style long-poll (v8.4) =====
+# Реальные приложения (Telegram, Discord, IM в браузере, Push) держат TCP/443
+# до сервиса 5-30+ минут с маленьким heartbeat'ом. У нас всё было request/response.
+# Здесь — открыть TCP/443 к https-эндпоинту, дёрнуть HEAD, ждать молча 5-15 мин.
+# Не нагружаем ничего: bash-сокет тратит ~12KB RAM, никаких HTTP-запросов внутри.
+websocket_keepalive() {
+    local hosts=(
+        "edge-mqtt.facebook.com"
+        "graph.facebook.com"
+        "www.cloudflare.com"
+        "icloud.com"
+        "apple.com"
+        "yandex.ru"
+        "vk.com"
+    )
+    local h="${hosts[$(urand 0 $(( ${#hosts[@]} - 1 )) )]}"
+    local secs
+    secs=$(rrange 300 1200)   # 5-20 мин
+    timeout "$secs" bash -c "exec 3<>/dev/tcp/$h/443 && sleep $secs" 2>/dev/null || true
 }
 
 # ===== iOS Safari бёрст =====
@@ -2653,6 +2844,30 @@ loop_apns() {
         sleep "$(rrange 1500 2400)"   # ~25–40 мин
     done
 }
+# v8.4: push_keepalive — APNs/FCM/WNS rotation
+loop_push() {
+    while true; do
+        vacation_check_and_sleep
+        push_keepalive
+        sleep "$(rrange 600 1800)"    # 10-30 мин
+    done
+}
+# v8.4: STUN UDP бёрсты — WebRTC-style discovery (Safari/Chrome делают регулярно)
+loop_stun() {
+    while true; do
+        sleep "$(rrange 600 2400)"    # 10-40 мин
+        vacation_check_and_sleep
+        stun_burst
+    done
+}
+# v8.4: websocket-like long-poll
+loop_ws() {
+    while true; do
+        sleep "$(rrange 60 600)"      # 1-10 мин между сессиями
+        vacation_check_and_sleep
+        websocket_keepalive
+    done
+}
 loop_email() {
     while true; do
         sleep_minutes "$EMAIL_INTERVAL_MIN" "$EMAIL_INTERVAL_MAX"
@@ -2727,6 +2942,9 @@ loop_health() {
 PIDS=()
 [ "$ENABLE_IOS_BURST"   = "1" ] && { loop_ios   & PIDS+=($!); }
 [ "$ENABLE_APNS"        = "1" ] && { loop_apns  & PIDS+=($!); }
+[ "${ENABLE_PUSH:-1}"   = "1" ] && { loop_push  & PIDS+=($!); }   # v8.4: APNs/FCM/WNS rotation
+[ "${ENABLE_STUN:-1}"   = "1" ] && { loop_stun  & PIDS+=($!); }   # v8.4: WebRTC STUN burst
+[ "${ENABLE_WEBSOCKET:-1}" = "1" ] && { loop_ws & PIDS+=($!); }   # v8.4: long-poll TCP keepalive
 [ "$ENABLE_EMAIL"       = "1" ] && { loop_email & PIDS+=($!); }
 [ "$ENABLE_NEWS"        = "1" ] && { loop_news  & PIDS+=($!); }
 [ "$ENABLE_APT_PHANTOM" = "1" ] && command -v apt-get >/dev/null 2>&1 && { loop_apt & PIDS+=($!); }
@@ -3978,6 +4196,43 @@ doctor_command() {
         echo -e "${GREEN}[ok]${NC} VPN-iface обнаружен — рекомендуется apply --vpn"
     fi
 
+    # 9. (v8.4) ss -tin top connections by retransmits — реальная картина а не sysctl drift
+    if command -v ss >/dev/null 2>&1; then
+        local top_retr
+        top_retr=$(ss -tin state established 2>/dev/null \
+            | awk '/retrans/ {
+                for (i=1; i<=NF; i++) {
+                    if ($i ~ /^retrans:/) {
+                        n=split($i, a, "/")
+                        if (n>=2 && a[2]+0 > 0) print a[2]"\t"$0
+                    }
+                }
+              }' | sort -rn -k1 | head -3)
+        if [ -n "$top_retr" ]; then
+            echo -e "${YELLOW}[i]${NC} top-3 connections by retransmits (live ss -tin):"
+            echo "$top_retr" | awk '{ printf "    %s retrans, line=%s\n", $1, substr($0, length($1)+2, 90) }'
+        fi
+    fi
+
+    # 10. (v8.4) PCIe link generation warning — VPS-провайдеры иногда выделяют gen3 вместо gen4
+    if command -v lspci >/dev/null 2>&1; then
+        local pcie_warn
+        pcie_warn=$(lspci -vv 2>/dev/null | awk '
+            /Ethernet/ { eth_seen=1; eth_block=$0; next }
+            eth_seen && /LnkCap:.*Speed/ {
+                if ($0 ~ /Speed 8GT\/s/) print "Ethernet NIC: PCIe gen3 (8 GT/s) — на gen4-капабельной hw мог быть gen4 (16 GT/s)"
+                eth_seen=0
+            }')
+        [ -n "$pcie_warn" ] && echo -e "${YELLOW}[i]${NC} $pcie_warn"
+    fi
+
+    # 11. (v8.4) kTLS статус
+    if [ -d /sys/module/tls ]; then
+        echo -e "${GREEN}[ok]${NC} kTLS модуль загружен (sendfile-on-TLS доступен для nginx-ktls/h2o)"
+    else
+        echo -e "${GRAY}[i]${NC} kTLS модуль не загружен — выполни: modprobe tls"
+    fi
+
     echo ""
     if [ "$issues" -eq 0 ]; then
         echo -e "${GREEN}${BOLD}=== всё ок, проблем не найдено ===${NC}"
@@ -4510,6 +4765,104 @@ EOF
     echo -e "${GREEN}[+] Baseline сохранён: $COMPARE_FILE${NC}"
 }
 
+# v8.4: top — TUI-просмотрщик активных connections, retransmits, conntrack util.
+# Не требует никаких внешних tools кроме coreutils + ss + watch (в util-linux).
+top_command() {
+    if ! command -v ss >/dev/null 2>&1; then
+        echo -e "${RED}top: ss не найден (установи iproute2)${NC}"
+        return 1
+    fi
+    if ! command -v watch >/dev/null 2>&1; then
+        echo -e "${YELLOW}top: watch не найден — выполню один snapshot${NC}"
+        _top_snapshot
+        return 0
+    fi
+    local self="$0"
+    watch -n 2 -t -c "$self _top_snapshot 2>/dev/null"
+}
+
+_top_snapshot() {
+    echo -e "${BOLD}vps-optimizer top  $(date '+%H:%M:%S')${NC}"
+    echo ""
+    local cc cm
+    cc=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    cm=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
+    if [ "$cm" -gt 0 ]; then
+        echo "  conntrack: $cc / $cm  ($(( cc * 100 / cm ))%)"
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        local est tw fw
+        est=$(ss -tan state established 2>/dev/null | tail -n +2 | wc -l)
+        tw=$(ss -tan state time-wait 2>/dev/null | tail -n +2 | wc -l)
+        fw=$(ss -tan state fin-wait-1 2>/dev/null | tail -n +2 | wc -l)
+        echo "  TCP: established=$est  time-wait=$tw  fin-wait=$fw"
+    fi
+    echo ""
+    echo -e "${BOLD}Top-10 by retransmits (ss -tin):${NC}"
+    ss -tin state established 2>/dev/null \
+        | awk 'BEGIN{getline header} {
+            line=$0; getline metrics;
+            r=0
+            n=split(metrics, parts, " ")
+            for (i=1; i<=n; i++) {
+                if (parts[i] ~ /^retrans:/) {
+                    split(parts[i], a, /[:\/]/)
+                    if (a[3]+0 > 0) r=a[3]+0
+                }
+            }
+            print r"|"line
+        }' \
+        | sort -t'|' -rn -k1 \
+        | head -10 \
+        | awk -F'|' '{ printf "  retrans=%-4s %s\n", $1, $2 }'
+}
+
+# v8.4: mtr <host> — обёртка над mtr с упрощённой выдачей.
+# Требует mtr/mtr-tiny. Если нет — даём подсказку, не падаем.
+mtr_command() {
+    local host="$1"
+    if ! command -v mtr >/dev/null 2>&1; then
+        echo -e "${YELLOW}mtr не установлен. Поставь:${NC} apt-get install -y mtr-tiny"
+        return 1
+    fi
+    echo -e "${CYAN}${BOLD}=== mtr → $host (10 cycles) ===${NC}"
+    if mtr -r -c 10 -n -w "$host" 2>/dev/null; then
+        echo ""
+        echo -e "${GREEN}[ok]${NC} mtr завершён"
+    else
+        echo -e "${RED}[!] mtr вернул ошибку (host недостижим?)${NC}"
+        return 1
+    fi
+}
+
+# v8.4: prom-push — отправка метрик в Pushgateway. Удобно для cron-jobs:
+#       */5 * * * * vps_optimizer.sh prom-push http://prometheus:9091
+prom_push_command() {
+    local gw="$1" job="${2:-vps-optimizer}"
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}prom-push: curl не найден${NC}"
+        return 1
+    fi
+    local instance
+    instance=$(hostname -s 2>/dev/null || echo unknown)
+    local url="${gw%/}/metrics/job/$job/instance/$instance"
+    local metrics
+    metrics=$(prom_metrics 2>/dev/null)
+    if [ -z "$metrics" ]; then
+        echo -e "${RED}prom-push: метрики пустые${NC}"
+        return 1
+    fi
+    local http_code
+    http_code=$(curl -fsS --max-time 10 -X POST -H 'Content-Type: text/plain' \
+        --data-binary "$metrics" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null) || http_code="0"
+    if [ "$http_code" = "200" ] || [ "$http_code" = "202" ]; then
+        echo -e "${GREEN}[+] метрики запушены в $gw (job=$job instance=$instance)${NC}"
+        return 0
+    fi
+    echo -e "${RED}[!] prom-push провалился (HTTP $http_code)${NC}"
+    return 1
+}
+
 print_cli_help() {
     echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v${SCRIPT_VERSION} PHOENIX-Z++"
     cat <<EOF
@@ -4529,6 +4882,9 @@ COMMANDS:
     audit [--json]           Глубокая диагностика (drift, conntrack, RPS, dnscrypt-proxy)
     doctor                   Actionable-диагностика с рекомендациями (v8.3)
     why <key>                Объяснить почему конкретный sysctl такой (v8.3)
+    top                      TUI: live top-connections, conntrack util, retransmits (v8.4)
+    mtr <host>               Bundled mtr с прогнозом потерь (требует mtr) (v8.4)
+    prom-push <gw-url> [job] Push Prometheus метрик в pushgateway (v8.4)
     logs [N]                 Последние N строк журнала (run/journalctl/dmesg/audit)
     preset <name>            Сохранить пресет на будущие apply
     noise on|off|edit|test|status   Управление шумогенератором
@@ -4639,6 +4995,21 @@ cli_dispatch() {
             fi
             ;;
         doctor)         doctor_command ;;
+        top)            top_command ;;
+        mtr)
+            if [ -z "${args[0]:-}" ]; then
+                echo -e "${RED}mtr: укажи host (например: 1.1.1.1 или google.com)${NC}"
+                return "$EXIT_INVALID_ARGS"
+            fi
+            mtr_command "${args[0]}"
+            ;;
+        prom-push)
+            if [ -z "${args[0]:-}" ]; then
+                echo -e "${RED}prom-push: укажи URL pushgateway (например http://prom:9091)${NC}"
+                return "$EXIT_INVALID_ARGS"
+            fi
+            prom_push_command "${args[0]}" "${args[1]:-vps-optimizer}"
+            ;;
         why)
             if [ -z "${args[0]:-}" ]; then
                 echo -e "${RED}why: укажи sysctl-key (например: net.ipv4.tcp_rmem)${NC}"
@@ -4668,6 +5039,7 @@ cli_dispatch() {
         prom-metrics)   prom_metrics ;;
         prom-serve)     prom_serve "${args[0]:-9777}" ;;
         _prom_handler)  _prom_handler ;;
+        _top_snapshot)  _top_snapshot ;;
         self-test)
             apply_optimizations >/dev/null
             self_test
