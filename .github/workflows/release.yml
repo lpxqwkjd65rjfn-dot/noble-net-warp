@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: validate
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yq shellcheck
+          bash -n vps_optimizer.sh
+          shellcheck -S warning vps_optimizer.sh
+
+      - name: compute checksums
+        id: sums
+        run: |
+          sha256sum vps_optimizer.sh | tee vps_optimizer.sh.sha256
+          sha256sum README.md       | tee README.md.sha256
+
+      - name: extract changelog for tag
+        id: changelog
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          {
+            echo "## ${tag}"
+            echo
+            awk -v v="$version" '
+              BEGIN { gsub(/\./, "\\.", v); pat = "^### v" v "([ (]|$)" }
+              $0 ~ pat {flag=1; next}
+              flag && /^### v/ {exit}
+              flag {print}
+            ' README.md
+          } > /tmp/release_body.md
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: github release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.changelog.outputs.tag }}
+          name: ${{ steps.changelog.outputs.tag }}
+          body_path: /tmp/release_body.md
+          files: |
+            vps_optimizer.sh
+            vps_optimizer.sh.sha256
+            README.md
+            README.md.sha256
