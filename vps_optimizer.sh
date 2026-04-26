@@ -2026,6 +2026,7 @@ NOISE_REQ_TOTAL=0
 NOISE_REQ_OK=0
 NOISE_REQ_ERR=0
 NOISE_LAST_TS=0
+START_TS=$(date +%s)
 update_health() {
     [ -w "$(dirname "$HEALTH_FILE_NOISE")" ] || return 0
     cat > "$HEALTH_FILE_NOISE" 2>/dev/null <<HJEOF
@@ -2513,7 +2514,7 @@ loop_dns_prefetch() {
             1) pool=("${URLS_NEWS_RU[@]}") ;;
             2) pool=("${URLS_IOS_RU_GOV[@]}") ;;
             3) pool=("${URLS_GLOBAL[@]}") ;;
-            *) pool=("${URLS_LIB[@]}") ;;
+            *) pool=("${URLS_LIB_DOWNLOADS[@]}") ;;
         esac
         if [ "${#pool[@]}" -gt 0 ]; then
             local url="${pool[$(urand 0 $(( ${#pool[@]} - 1 )) )]}"
@@ -2524,7 +2525,6 @@ loop_dns_prefetch() {
 
 # Health-touch loop: каждые 30с обновляет TS в health.json (даже если другие
 # loops спят/в vacation), показывает что сервис живой.
-START_TS=$(date +%s)
 loop_health() {
     while true; do
         update_health
