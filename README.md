@@ -191,9 +191,15 @@ sudo ./vps_optimizer.sh harden all
 install                         Setup base components (dnsmasq, ethtool, jq, socat...)
                                 use `--impersonate` to also install curl-impersonate
 apply [--preset NAME]           Apply sysctl/sysfs/ZRAM. NAME: balanced (default) / proxy / web
+    [--vpn]                     Force VPN-friendly knobs (rp_filter=2, ip_forward=1, accept_local=1)
+    [--no-rollback]             Disable the post-apply auto-rollback safety net
+    [--boot]                    Install one-shot systemd unit so `apply` runs on every boot
 status [--json]                 Status dashboard, or JSON for cron / Grafana
 self-test                       Re-verify applied settings
-audit                           Deep diagnostics: sysctl drift, conntrack, RPS, dnscrypt-proxy, etc.
+audit [--json]                  Deep diagnostics (drift / conntrack / RPS / DNS / PTR), `--json` for monitoring
+doctor                          Actionable diagnostics with concrete fixes (conntrack, retransmits, softnet, /var, DNS)
+why <key>                       Knowledge base: explain a specific sysctl key (e.g. `why net.ipv4.tcp_rmem`)
+wg setup                        Opt-in WireGuard helper: ICMP-based MTU autodetect + base config
 logs [N]                        Last N log lines: own log + journalctl + dmesg + audit
 preset <name>                   Save a preset for the next apply
 noise on|off|edit|test|status|health   Manage the stealth noise generator
@@ -204,7 +210,7 @@ compare [target]                Save / diff a ping baseline (default 1.1.1.1)
 harden ssh|ufw|upgrades|all     Opt-in security baseline (does NOT touch default apply)
 prom-metrics                    Dump Prometheus metrics to stdout
 prom-serve [port]               Start a Prometheus exporter (default :9777)
-reset                           Full rollback of all changes
+reset [--soft]                  Full rollback. `--soft` keeps DNS / noise / swap untouched
 uninstall                       Reset + remove the script itself
 export [path.tar.gz]            Bundle all configs (with manifest)
 import <path.tar.gz>            Apply a bundle (with version check)
@@ -222,7 +228,23 @@ help                            Print full help
 --preset NAME    use a specific preset (balanced|proxy|web)
 --impersonate    use curl-impersonate in noise (if installed)
 --ecmp           force ECMP/multipath knobs (multi-NIC)
---json           JSON output (for `status`)
+--vpn            force VPN-friendly knobs (auto-detected by default)
+--no-rollback    disable the auto-rollback safety net after `apply`
+--soft           soft mode for `reset` — keep DNS / noise / swap intact
+--boot           install one-shot systemd unit for `apply` (re-applies on every boot)
+--json           JSON output (for `status` / `audit`)
+```
+
+### Cron-friendly exit codes
+
+```text
+ 0   ok
+10   already-applied (idempotent no-op)
+20   no internet (probe failed)
+30   blocked by hypervisor/container restrictions
+40   another instance is running (lock busy)
+50   invalid arguments / unknown preset
+60   auto-rolled-back due to connectivity loss
 ```
 
 ---
@@ -280,7 +302,52 @@ help                            Print full help
 
 ## Changelog
 
-### v8.2 PHOENIX-Z++ (current)
+### v8.3 PHOENIX-Z++ — VPN-safe (current)
+
+**Главное:** apply теперь VPN/SSH-friendly по дефолту, сам себя откатывает если потерял связь.
+
+**SSH/VPN safety net:**
+- **Auto-rollback** после `apply`: пробуем DNS + TCP/443; если связь упала — откатываем на pre-apply snapshot. Защита от своего же sysctl. Отключаемо: `--no-rollback`.
+- **VPN-friendly auto-detect** (opt-in): если виден `tun*`/`wg*`/`ppp*` iface, или передан `--vpn` — автоматически переключаем `rp_filter` со strict (=1) на loose (=2), включаем `accept_local=1`, `ip_forward=1`, `nf_conntrack_helper=0`. Без VPN остаётся прежний strict-режим (backward-compat).
+
+**UDP / QUIC / VPN скорость:**
+- **UDP-GRO/GSO** ethtool offloads: `rx-udp-gro-forwarding`, `tx-udp-segmentation` — даёт **2-3x throughput** для QUIC/Hysteria2/TUIC/WireGuard на 5.18+ ядрах.
+- **TCP Fast Open black-hole defuse**: `tcp_fastopen_blackhole_timeout_sec=0` — без этого после первой неудачи TFO лочился на 1 час.
+- **UDP stack hardening**: `udp_rmem_min`/`udp_wmem_min`/`udp_mem` подняты — нужно для тяжёлого QUIC. `net.core.optmem_max` остался 4MB (как было в v8.2) — этого достаточно для SO_ZEROCOPY у sing-box/xray.
+- **gRPC keepalive sysctl**: для long-lived потоков sing-box/xray.
+- **netdev_max_backlog/dev_weight** автомасштаб: 25G+ → 300000/128, 10G+ → 100000/96, иначе 30000/64.
+
+**Новые команды:**
+- `doctor` — actionable-диагностика: проверяет conntrack, retransmits, softnet drops, /var, DNS — с подсказками как починить.
+- `why <key>` — объясняет почему конкретный sysctl такой (knowledge base ~30 ключей).
+- `audit --json` — машиночитаемый аудит для мониторинга.
+- `wg setup` — WireGuard helper (opt-in): автодетект MTU через ICMP needs-frag, генерация конфига, ip_forward.
+- `reset --soft` — откат только sysctl, оставляет DNS/noise/swap.
+- `apply --boot` — one-shot systemd unit для apply на каждом boot (для OpenVZ, где `/etc/sysctl.d/` иногда вытирается).
+- `apply --vpn` — явный VPN-режим без auto-detect.
+- PTR sanity check в `audit` (только warn).
+
+**Cron-friendly exit codes:**
+`0`=ok, `10`=already-applied, `20`=internet-down, `30`=hypervisor-blocked, `40`=lock-busy, `50`=invalid-args, `60`=rolled-back.
+
+**Daily snapshots:**
+`/var/backups/vps-optimizer/daily-YYYYMMDD.tar.gz` — 1 в сутки, держим 7 дней. Pre-apply снапшоты держим до 30 штук с авто-rotation.
+
+**Микро-фиксы (Q1-Q5,Q7,Q8):**
+- audit drift parser: `awk` вместо `IFS='='` для значений с `=`.
+- `_prom_handler` различает `/metrics`, `/`, `/healthz` (Prometheus + k8s liveness).
+- `install_curl_impersonate` тянет latest tag через GitHub API (fallback 0.6.1).
+- dmesg log filter: `out of memory|invoked oom-killer` вместо `killed` (меньше ложных).
+- `detect_provider` hostname-эвристика теперь требует доменный суффикс, не любую подстроку.
+
+**Не сделано (отложено по соображениям SSH/VPN-безопасности):**
+- Egress-firewall preset (мог закрыть SSH).
+- Disable kernel watchdog (мог скрыть реальные проблемы ядра).
+- GRUB-tweaks (требует ребут).
+- AppArmor profile noise (мог сломать на нестандартных ядрах).
+- HugePages (мог OOM на маленьких VPS).
+
+### v8.2 PHOENIX-Z++
 
 - New TCP knobs: `tcp_rto_min_us`, `tcp_comp_sack_*`, `tcp_pingpong_thresh`,
   `tcp_min_tso_segs`, `tcp_tso_win_divisor`, `tcp_no_ssthresh_metrics_save`,

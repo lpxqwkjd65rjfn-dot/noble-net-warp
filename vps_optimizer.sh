@@ -90,7 +90,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.2"
+SCRIPT_VERSION="8.3"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -102,6 +102,22 @@ IMPERSONATE=0
 ECMP=0
 JSON=0
 CLI_MODE=0
+VPN_FORCE=0          # --vpn: явно настраиваем под VPN-роутинг (rp_filter=2, ip_forward=1)
+NO_ROLLBACK=0        # --no-rollback: отключить auto-rollback по connectivity-check
+SOFT_RESET=0         # reset --soft: не трогать DNS/noise/swap, только sysctl
+
+# Cron-friendly exit codes — стабильный API для cron/Ansible/мониторинга.
+# shellcheck disable=SC2034  # часть кодов используется только внешними скриптами
+EXIT_OK=0
+# shellcheck disable=SC2034
+EXIT_ALREADY_APPLIED=10  # idempotent: всё совпадает, ничего не делали
+# shellcheck disable=SC2034
+EXIT_NO_INTERNET=20      # не смогли проверить связь до apply
+# shellcheck disable=SC2034
+EXIT_HYPERVISOR_BLOCK=30 # хост запретил всё, что мы пытались сделать
+EXIT_LOCK_BUSY=40        # другой apply уже идёт
+EXIT_INVALID_ARGS=50     # неверный preset/команда
+EXIT_ROLLED_BACK=60      # apply применился, но связь упала → откатились
 
 # Сводки sysctl/sysfs/ethtool — заполняются в процессе apply, печатаются в self_test
 SYSCTL_OK=()
@@ -360,11 +376,14 @@ detect_provider() {
         *microsoft*|*hyperv*) echo azure;      return ;;
         *oracle*)         echo oracle;         return ;;
     esac
-    # hostname-эвристика (Aeza/Timeweb/Firstbyte часто включают название в hostname)
+    # hostname-эвристика — только если dmi не сработал (Aeza/Timeweb/Firstbyte
+    # часто включают название в hostname, но это менее надёжно: 'vultr.example.com'
+    # не значит что VPS у Vultr). Q8 fix v8.3: матчим только если домен содержит
+    # суффикс провайдера, не любую подстроку.
     case "$hostname_lc" in
-        *aeza*)      echo aeza;      return ;;
-        *timeweb*)   echo timeweb;   return ;;
-        *firstbyte*|*1stbyte*) echo firstbyte; return ;;
+        *.aeza.net|*.aeza.online|aeza-*)        echo aeza;      return ;;
+        *.timeweb.cloud|*.timeweb.ru|timeweb-*) echo timeweb;   return ;;
+        *.firstbyte.ru|*.1stbyte.ru|fb-*)       echo firstbyte; return ;;
     esac
     echo generic
 }
@@ -393,6 +412,38 @@ has_ecmp() {
     local n
     n=$(ip -4 route show default 2>/dev/null | grep -c '^default')
     [ "$n" -ge 2 ]
+}
+
+# VPN-iface детектор (v8.3): возвращает 0 если есть UP-интерфейс с типичным
+# VPN-именем (tun0, wg0, ppp0, tap0, gpd0, openvpn, ipsec0, и т.п.).
+has_vpn_iface() {
+    local iface
+    for iface in /sys/class/net/*; do
+        local name
+        name=$(basename "$iface")
+        case "$name" in
+            tun*|tap*|wg*|ppp*|ipsec*|gpd*|nordlynx*|vpn*|wireguard*)
+                # Считаем только UP-iface, чтобы зомби-туннели не тянули нас в VPN-режим.
+                if [ -r "$iface/operstate" ] && grep -qE '^(up|unknown)$' "$iface/operstate" 2>/dev/null; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Скорость основного физического интерфейса в Мбит/с (для масштабирования
+# netdev_max_backlog/dev_weight). Возвращает 0 если детект не удался.
+detect_link_speed_mbps() {
+    local iface speed
+    iface=$(ip -4 route show default 2>/dev/null | awk '/^default/{for (i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')
+    [ -z "$iface" ] && { echo 0; return; }
+    if command -v ethtool >/dev/null 2>&1; then
+        speed=$(ethtool "$iface" 2>/dev/null | awk '/Speed:/ {gsub(/Mb\/s/,"",$2); print $2; exit}')
+    fi
+    [ -z "$speed" ] || ! [[ "$speed" =~ ^[0-9]+$ ]] && speed=0
+    echo "$speed"
 }
 
 run_benchmark() {
@@ -471,7 +522,16 @@ install_curl_impersonate() {
     if command -v curl-impersonate-safari >/dev/null 2>&1; then
         echo -e "${GRAY}[i] curl-impersonate уже установлен.${NC}"; return 0
     fi
-    local ver="0.6.1"
+    # Q5 fix v8.3: тянем latest tag вместо хардкоженного 0.6.1.
+    # Если GitHub API недоступен — fallback на проверенную 0.6.1.
+    local ver fallback_ver="0.6.1"
+    ver=$(curl -fsSL --max-time 10 \
+        https://api.github.com/repos/lwthiker/curl-impersonate/releases/latest 2>/dev/null \
+        | awk -F'"' '/"tag_name":/ {print $4; exit}' | sed 's/^v//')
+    if [ -z "$ver" ] || ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${GRAY}[i] GitHub API недоступен — используем fallback v${fallback_ver}${NC}"
+        ver="$fallback_ver"
+    fi
     local url="https://github.com/lwthiker/curl-impersonate/releases/download/v${ver}/curl-impersonate-v${ver}.${arch}-linux-gnu.tar.gz"
     local tmp
     tmp=$(mktemp -d /tmp/.curl_imp.XXXXXX)
@@ -687,6 +747,10 @@ apply_iface_tuning() {
             # (KVM/Xen/native — да; openvz/lxc/docker — нет).
             if nic_offload_safe_for_iface "$iface"; then
                 ethtool -K "$iface" rx on tx on sg on tso on gso on gro on lro off >/dev/null 2>&1 || true
+                # UDP GRO/GSO (v8.3): даёт +2-3x throughput на QUIC/Hysteria/WireGuard на 5.18+ ядрах.
+                # Часть драйверов рапортует об ошибке если не поддерживают — игнорим.
+                ethtool -K "$iface" rx-udp-gro-forwarding on >/dev/null 2>&1 || true
+                ethtool -K "$iface" tx-udp-segmentation on >/dev/null 2>&1 || true
             else
                 # Контейнер: только LRO off (важно для прокси), остальное по-умолчанию
                 ethtool -K "$iface" lro off >/dev/null 2>&1 || true
@@ -919,10 +983,16 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_moderate_rcvbuf 1
     sysctl_safe net.ipv4.tcp_notsent_lowat 131072
 
-    # UDP — критично для QUIC/Reality/XHTTP
+    # UDP — критично для QUIC/Reality/XHTTP, а также WireGuard/OpenVPN/Hysteria2/TUIC.
+    # Расширено в v8.3: per-socket min повышен (для серверов с тяжёлым QUIC),
+    # optmem_max для SO_ZEROCOPY, и общий udp_mem (в страницах) под прокси-нагрузку.
     sysctl_safe net.ipv4.udp_rmem_min 131072
     sysctl_safe net.ipv4.udp_wmem_min 131072
     sysctl_safe net.ipv4.udp_mem "786432 1048576 1572864"
+    # NB: net.core.optmem_max уже выставлен выше в 4194304 (4MB) — не перетираем.
+    # TFO black-hole defuse (v8.3): дефолт ядра — 1ч лок после первой неудачи.
+    # На флапающей сети это «тихая» причина почему TFO «не работает».
+    sysctl_safe net.ipv4.tcp_fastopen_blackhole_timeout_sec 0
 
     # TCP behavior
     sysctl_safe net.ipv4.tcp_mtu_probing 1
@@ -1031,11 +1101,19 @@ apply_sysctls() {
     # Маскировка стека: TTL=64 как у нативного Linux-десктопа.
     sysctl_safe net.ipv4.ip_default_ttl 64
 
-    # Security / hygiene
+    # Security / hygiene.
+    # rp_filter (v8.3): сохраняем backward-compat дефолт =1 (strict, как было в v8.2).
+    # Loose mode (=2) включаем только под --vpn или при детекте VPN-iface, потому что
+    # strict (=1) дропает asymmetric routing, что ломает WireGuard/OpenVPN/MPTCP.
+    # Это поведение соответствует CONTRIBUTING.md: «no default change without opt-in».
     sysctl_safe net.ipv4.tcp_syncookies 1
     sysctl_safe net.ipv4.tcp_rfc1337 1
-    sysctl_safe net.ipv4.conf.all.rp_filter 1
-    sysctl_safe net.ipv4.conf.default.rp_filter 1
+    local rp_filter_target=1
+    if [ "$VPN_FORCE" = "1" ] || has_vpn_iface; then
+        rp_filter_target=2
+    fi
+    sysctl_safe net.ipv4.conf.all.rp_filter "$rp_filter_target"
+    sysctl_safe net.ipv4.conf.default.rp_filter "$rp_filter_target"
     sysctl_safe net.ipv4.conf.all.accept_redirects 0
     sysctl_safe net.ipv4.conf.default.accept_redirects 0
     sysctl_safe net.ipv4.conf.all.send_redirects 0
@@ -1045,10 +1123,52 @@ apply_sysctls() {
     sysctl_safe net.ipv4.icmp_echo_ignore_broadcasts 1
     sysctl_safe net.ipv6.conf.all.accept_redirects 0
     sysctl_safe net.ipv6.conf.default.accept_redirects 0
+    sysctl_safe net.ipv6.conf.all.accept_source_route 0
+    sysctl_safe net.ipv6.conf.default.accept_source_route 0
 
     # IPv6 mirror
     sysctl_safe net.ipv6.conf.all.disable_ipv6 0
     sysctl_safe net.ipv6.conf.default.disable_ipv6 0
+
+    # VPN-friendly доводки: включаются если виден tun*/wg*/ppp*/tap* iface
+    # (т.е. на машине уже поднят VPN-туннель) или передан явный --vpn.
+    if [ "$VPN_FORCE" = "1" ] || has_vpn_iface; then
+        sysctl_safe net.ipv4.conf.all.accept_local 1
+        sysctl_safe net.ipv4.ip_forward 1
+        sysctl_safe net.ipv6.conf.all.forwarding 1
+        # На VPN-сервере conntrack-помощники (FTP/SIP/IRC NAT) лучше выключить —
+        # они могут потеряться через туннель и привести к странным дропам.
+        sysctl_safe net.netfilter.nf_conntrack_helper 0
+    fi
+
+    # IPv6 параллель ключевых TCP knob'ов (v8.3): TCP-стек у v4 и v6 общий, но
+    # часть control-knob'ов имеет per-family версию.
+    sysctl_safe net.ipv6.bindv6only 0
+
+    # tcp_keepalive_intvl/probes уже выставлены выше (одинаково для всех пресетов).
+
+    # netdev_max_backlog масштабируем под скорость линка: на 25G+ дефолт мал.
+    # ВАЖНО (v8.3 fix): берём max(preset, auto-scale), чтобы не понижать значения
+    # пресетов (например proxy=1000000) на 1G-VPS до 30000.
+    local link_speed_mbps backlog_target dev_weight_target backlog_eff dev_weight_eff
+    link_speed_mbps=$(detect_link_speed_mbps)
+    if [ "$link_speed_mbps" -ge 25000 ]; then
+        backlog_target=300000
+        dev_weight_target=128
+    elif [ "$link_speed_mbps" -ge 10000 ]; then
+        backlog_target=100000
+        dev_weight_target=96
+    else
+        backlog_target=30000
+        dev_weight_target=64
+    fi
+    backlog_eff="$PRESET_NETDEV_BACKLOG"
+    [ "$backlog_target" -gt "$backlog_eff" ] && backlog_eff="$backlog_target"
+    # dev_weight: уже выставлен 128 в base apply (line 965). Берём максимум.
+    dev_weight_eff=128
+    [ "$dev_weight_target" -gt "$dev_weight_eff" ] && dev_weight_eff="$dev_weight_target"
+    sysctl_safe net.core.netdev_max_backlog "$backlog_eff"
+    sysctl_safe net.core.dev_weight "$dev_weight_eff"
 
     # conntrack — критический пункт для прокси-нагрузок. Модуль может быть
     # не загружен — пробуем поднять, sysctls появятся только после этого.
@@ -1302,10 +1422,10 @@ self_test() {
 
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
-    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.2 PHOENIX-Z++...${NC}"
+    _log INFO "${YELLOW}[*] Глобальный тюнинг v${SCRIPT_VERSION} PHOENIX-Z++...${NC}"
 
     if ! acquire_lock; then
-        return 1
+        return "$EXIT_LOCK_BUSY"
     fi
 
     # Internet-check: если связи нет — предупреждаем (но не блокируем,
@@ -1336,10 +1456,12 @@ apply_optimizations() {
 
     # B3: rollback-snapshot перед apply (только если не dry-run и не уже существует
     # snapshot за последние 60 секунд — чтобы не флудить при повторных apply).
+    # v8.3 (L4): дополнительно поддерживаем daily-rotation — один daily-snapshot
+    # за сутки, держим 7 штук. Pre-apply снапшоты держим максимум 30 штук.
     if [ "$DRY_RUN" != "1" ]; then
         mkdir -p "$SNAPSHOT_DIR" 2>/dev/null || true
         local last_snap
-        last_snap=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name '*.tar.gz' -mmin -1 2>/dev/null | head -1)
+        last_snap=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name 'pre-apply-*.tar.gz' -mmin -1 2>/dev/null | head -1)
         if [ -z "$last_snap" ]; then
             local snap_file
             snap_file="$SNAPSHOT_DIR/pre-apply-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
@@ -1349,6 +1471,20 @@ apply_optimizations() {
                 "$NOISE_CONF" "$PRESET_FILE" 2>/dev/null || true
             _log INFO "  Snapshot: $snap_file"
         fi
+        # Daily snapshot (v8.3): максимум 1 в сутки.
+        local daily_file
+        daily_file="$SNAPSHOT_DIR/daily-$(date -u +%Y%m%d).tar.gz"
+        if [ ! -f "$daily_file" ]; then
+            tar -czf "$daily_file" \
+                --ignore-failed-read \
+                "$SYSCTL_CONF" "$LIMITS_CONF" "$DNS_CONF" "$DNS_STATE" \
+                "$NOISE_CONF" "$PRESET_FILE" 2>/dev/null || true
+        fi
+        # Ротация: pre-apply max 30, daily max 7.
+        # shellcheck disable=SC2012  # ls -t достаточно для имён вида pre-apply-*.tar.gz
+        ls -1t "$SNAPSHOT_DIR"/pre-apply-*.tar.gz 2>/dev/null | tail -n +31 | xargs -r rm -f
+        # shellcheck disable=SC2012
+        ls -1t "$SNAPSHOT_DIR"/daily-*.tar.gz 2>/dev/null | tail -n +8 | xargs -r rm -f
     fi
 
     load_preset "$PRESET"
@@ -1379,14 +1515,69 @@ apply_optimizations() {
 
     self_test
 
-    _log OK "${GREEN}[+] Phoenix-Z++ v8.2: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}, provider=${PROVIDER}.${NC}"
+    _log OK "${GREEN}[+] Phoenix-Z++ v${SCRIPT_VERSION}: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}, provider=${PROVIDER}.${NC}"
     _audit apply "preset=${PRESET_NAME} virt=${VIRT} provider=${PROVIDER} bbr=${APPLIED_BBR} qdisc=${APPLIED_QDISC} dry_run=${DRY_RUN}"
     rm -f "$SYSCTL_TMP"; trap - EXIT
     release_lock
 
-    [ "$QUIET" = "1" ] && return
-    [ "$CLI_MODE" = "1" ] && return
+    # Auto-rollback (v8.3, L1): если после apply связь потерялась — откатываемся.
+    # Безопасная сетка: NO_ROLLBACK=1 или DRY_RUN=1 пропускают проверку.
+    # Не блокирует SSH: проверка короткая (max ~5 сек), затем мгновенный откат
+    # на pre-apply snapshot.
+    if [ "$DRY_RUN" != "1" ] && [ "$NO_ROLLBACK" != "1" ]; then
+        if ! post_apply_connectivity_ok; then
+            _log WARN "${RED}[!] После apply связь не отвечает — откатываемся на pre-apply snapshot.${NC}"
+            _audit apply "auto_rollback triggered=connectivity_lost"
+            rollback_last_snapshot
+            return "$EXIT_ROLLED_BACK"
+        fi
+    fi
+
+    [ "$QUIET" = "1" ] && return 0
+    [ "$CLI_MODE" = "1" ] && return 0
     [ -t 0 ] && read -r -p "Нажмите Enter..."
+    return 0
+}
+
+# Post-apply connectivity probe (v8.3): проверяем DNS + TCP-handshake, не ICMP.
+# ICMP может быть отфильтрован в облаках, но если TCP/443 + DNS работают —
+# пользователь точно не лишился SSH (та же таблица маршрутизации).
+post_apply_connectivity_ok() {
+    local probes_ok=0
+    # DNS lookup через системный resolver (быстрее ping'a и проверяет полную цепочку)
+    if getent hosts cloudflare.com >/dev/null 2>&1; then
+        probes_ok=$((probes_ok + 1))
+    elif getent hosts 1.1.1.1 >/dev/null 2>&1; then
+        probes_ok=$((probes_ok + 1))
+    fi
+    # TCP handshake до 1.1.1.1:443 (timeout 3s).
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout 3 bash -c '</dev/tcp/1.1.1.1/443' 2>/dev/null; then
+            probes_ok=$((probes_ok + 1))
+        fi
+    else
+        # Без timeout — короткий nc.
+        if command -v nc >/dev/null 2>&1 && nc -z -w 3 1.1.1.1 443 2>/dev/null; then
+            probes_ok=$((probes_ok + 1))
+        fi
+    fi
+    # Хоть одна из проб ок — считаем что связь есть.
+    [ "$probes_ok" -ge 1 ]
+}
+
+# Откат на самый свежий pre-apply snapshot (v8.3).
+# Тихо игнорирует если snapshot'ов нет (например первый apply).
+rollback_last_snapshot() {
+    local last_snap
+    last_snap=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name 'pre-apply-*.tar.gz' 2>/dev/null | sort | tail -1)
+    if [ -z "$last_snap" ]; then
+        _log WARN "${YELLOW}[!] Snapshot'ов нет — откат невозможен. Ручной reset рекомендован.${NC}"
+        return 1
+    fi
+    _log INFO "  Восстанавливаем: $last_snap"
+    tar -xzf "$last_snap" -C / 2>/dev/null || true
+    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+    return 0
 }
 
 #
@@ -2702,6 +2893,23 @@ reset_all() {
         echo -e "${YELLOW}[dry-run] reset_all: ничего не удаляю/не останавливаю.${NC}"
         return 0
     fi
+    if [ "$SOFT_RESET" = "1" ]; then
+        # Soft-режим (v8.3, L6): откатываем только sysctl/limits/preset.
+        # Не трогаем DNS/noise/swap/zram — полезно при отладке тюнинга.
+        echo -e "${YELLOW}[*] Soft reset: только sysctl/limits/preset.${NC}"
+        rm -f "$SYSCTL_CONF" "$LIMITS_CONF" "$EXP_CONF" "$PRESET_FILE" \
+              /etc/systemd/system.conf.d/99-vps-limits.conf \
+              /etc/systemd/user.conf.d/99-vps-limits.conf
+        # Снимаем boot-unit, если был.
+        systemctl disable --now vps-optimizer-apply.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/vps-optimizer-apply.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        sysctl --system >/dev/null 2>&1 || true
+        _audit reset "mode=soft"
+        echo -e "${GREEN}[+] Soft-сброс выполнен (DNS/noise/swap не тронуты).${NC}"
+        sleep 1
+        return 0
+    fi
     echo -e "${YELLOW}[*] Полный откат...${NC}"
     swapoff -a 2>/dev/null || true
     rm -f /swapfile
@@ -2717,10 +2925,13 @@ reset_all() {
           /etc/systemd/user.conf.d/99-vps-limits.conf
     systemctl stop vps-noise vps-rps dnsmasq >/dev/null 2>&1 || true
     systemctl disable vps-noise vps-rps >/dev/null 2>&1 || true
-    rm -f "$NOISE_GEN_SCRIPT" "$NOISE_GEN_SERVICE" "$RPS_BOOT_SCRIPT" "$RPS_BOOT_SERVICE"
+    systemctl disable --now vps-optimizer-apply.service >/dev/null 2>&1 || true
+    rm -f "$NOISE_GEN_SCRIPT" "$NOISE_GEN_SERVICE" "$RPS_BOOT_SCRIPT" "$RPS_BOOT_SERVICE" \
+          /etc/systemd/system/vps-optimizer-apply.service
     rm -rf /tmp/.vps_noise /var/lib/vps-noise
     systemctl daemon-reload >/dev/null 2>&1 || true
     sysctl --system >/dev/null 2>&1 || true
+    _audit reset "mode=full"
     echo -e "${GREEN}[+] Сброс выполнен.${NC}"
     sleep 2
 }
@@ -3431,7 +3642,8 @@ view_logs() {
     journalctl -u vps-noise -u vps-rps --no-pager -n "$n" 2>/dev/null || echo "(нет журналов)"
     echo ""
     echo -e "${CYAN}${BOLD}=== dmesg: TCP / conntrack / OOM ===${NC}"
-    dmesg 2>/dev/null | grep -iE 'tcp|conntrack|oom|killed' | tail -n "$n" || echo "(нет событий)"
+    # Q7 fix v8.3: 'killed' ловил много ложных, заменили на специфичные OOM-метки.
+    dmesg 2>/dev/null | grep -iE 'tcp|conntrack|out of memory|invoked oom-killer|memory cgroup out of memory' | tail -n "$n" || echo "(нет событий)"
     echo ""
     if [ -f "$AUDIT_LOG" ]; then
         echo -e "${CYAN}${BOLD}=== $AUDIT_LOG ===${NC}"
@@ -3439,8 +3651,43 @@ view_logs() {
     fi
 }
 
+# Парсит sysctl-conf-файл и для каждого key сравнивает ожидаемое значение
+# с runtime-значением. Возвращает строки 'KEY|expected|current|status' через
+# stdout, где status = OK|DRIFT|UNKNOWN. Формат стабилен — машиночитаемо.
+# Q1 fix: используем awk вместо `IFS='='` для корректной обработки знака '='
+# в значении (например `kernel.modprobe = /sbin/modprobe -q -k`).
+_audit_sysctl_drift_rows() {
+    [ -f "$SYSCTL_CONF" ] || return 0
+    awk -F'=' '
+        /^[[:space:]]*#/ {next}
+        NF<2 {next}
+        {
+            key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/,"",key)
+            val=$0; sub(/^[^=]*=/,"",val); gsub(/^[[:space:]]+|[[:space:]]+$/,"",val)
+            if (key!="" && val!="") print key "\t" val
+        }
+    ' "$SYSCTL_CONF" | while IFS=$'\t' read -r key val; do
+        local cur
+        cur=$(sysctl -n "$key" 2>/dev/null)
+        # sysctl возвращает многоколоночное значение через табы — нормализуем к пробелам.
+        cur=$(printf '%s' "$cur" | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        val=$(printf '%s' "$val" | tr -s '[:space:]' ' ')
+        if [ -z "$cur" ]; then
+            printf '%s|%s|%s|UNKNOWN\n' "$key" "$val" ""
+        elif [ "$cur" = "$val" ]; then
+            printf '%s|%s|%s|OK\n' "$key" "$val" "$cur"
+        else
+            printf '%s|%s|%s|DRIFT\n' "$key" "$val" "$cur"
+        fi
+    done
+}
+
 # audit: полная диагностика VPS — текущие vs ожидаемые sysctl, RPS, conntrack, etc.
 audit_command() {
+    if [ "$JSON" = "1" ]; then
+        audit_json
+        return $?
+    fi
     print_status_dashboard
     echo ""
     echo -e "${CYAN}${BOLD}=== Глубокий audit ===${NC}"
@@ -3449,21 +3696,15 @@ audit_command() {
     if [ -f "$SYSCTL_CONF" ]; then
         local mismatched=0
         echo -e "${BOLD}sysctl drift:${NC}"
-        while IFS='=' read -r key val; do
-            key=$(echo "$key" | xargs)
-            val=$(echo "$val" | xargs)
-            [ -z "$key" ] && continue
-            [ "${key:0:1}" = "#" ] && continue
-            local cur
-            cur=$(sysctl -n "$key" 2>/dev/null | xargs)
-            if [ -z "$cur" ]; then
-                continue
-            fi
-            if [ "$cur" != "$val" ]; then
-                echo -e "  ${YELLOW}DRIFT${NC} $key: ожидается '$val', текущее '$cur'"
-                mismatched=$(( mismatched + 1 ))
-            fi
-        done < "$SYSCTL_CONF"
+        local key val cur status
+        while IFS='|' read -r key val cur status; do
+            case "$status" in
+                DRIFT)
+                    echo -e "  ${YELLOW}DRIFT${NC} $key: ожидается '$val', текущее '$cur'"
+                    mismatched=$(( mismatched + 1 ))
+                    ;;
+            esac
+        done < <(_audit_sysctl_drift_rows)
         if [ "$mismatched" -eq 0 ]; then
             echo -e "  ${GREEN}OK${NC} все ключи совпадают"
         fi
@@ -3522,6 +3763,439 @@ audit_command() {
         lines=$(wc -l < "$AUDIT_LOG" 2>/dev/null || echo 0)
         echo -e "${BOLD}\nAudit log:${NC} $sz байт, $lines записей"
     fi
+
+    # 9. PTR sanity check (v8.3, N7) — мягкое предупреждение, не блокирует.
+    echo ""
+    ptr_sanity_check
+}
+
+# PTR sanity check: сравниваем reverse-DNS внешнего IP с прямым A-запросом.
+# Несовпадение — частый признак странной CDN-конфигурации или хостинга,
+# где PTR не настроен. Только warn, никогда не блокирует.
+ptr_sanity_check() {
+    if ! command -v dig >/dev/null 2>&1 && ! command -v getent >/dev/null 2>&1; then
+        return 0
+    fi
+    local ext_ip ptr fwd
+    ext_ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
+        || curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
+        || echo "")
+    if [ -z "$ext_ip" ]; then
+        return 0
+    fi
+    echo -e "${BOLD}PTR sanity:${NC} external IP=$ext_ip"
+    if command -v dig >/dev/null 2>&1; then
+        ptr=$(dig +short -x "$ext_ip" 2>/dev/null | sed 's/\.$//' | head -1)
+    else
+        ptr=$(getent hosts "$ext_ip" 2>/dev/null | awk '{print $2}' | head -1)
+    fi
+    if [ -z "$ptr" ]; then
+        echo -e "  ${YELLOW}WARN${NC} нет PTR-записи для $ext_ip (некоторые SMTP-серверы откажут)"
+        return 0
+    fi
+    echo "  PTR: $ptr"
+    if command -v dig >/dev/null 2>&1; then
+        fwd=$(dig +short A "$ptr" 2>/dev/null | head -1)
+    else
+        fwd=$(getent hosts "$ptr" 2>/dev/null | awk '{print $1}' | head -1)
+    fi
+    if [ -z "$fwd" ]; then
+        echo -e "  ${YELLOW}WARN${NC} forward A для $ptr не разрешается"
+    elif [ "$fwd" = "$ext_ip" ]; then
+        echo -e "  ${GREEN}OK${NC} PTR <-> A совпадают"
+    else
+        echo -e "  ${YELLOW}WARN${NC} PTR ($ptr -> $fwd) не совпадает с внешним IP ($ext_ip)"
+    fi
+}
+
+# audit --json: машиночитаемая версия audit_command (v8.3, M14).
+audit_json() {
+    local rows drift_count ok_count unknown_count
+    rows=$(_audit_sysctl_drift_rows)
+    drift_count=$(printf '%s\n' "$rows" | grep -c '|DRIFT$' || true)
+    ok_count=$(printf '%s\n' "$rows" | grep -c '|OK$' || true)
+    unknown_count=$(printf '%s\n' "$rows" | grep -c '|UNKNOWN$' || true)
+    local cc cm pct=0
+    cc=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    cm=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
+    [ "$cm" -gt 0 ] && pct=$(( cc * 100 / cm ))
+
+    local rps_active=0 f
+    for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
+        [ -e "$f" ] || continue
+        local v
+        v=$(cat "$f" 2>/dev/null)
+        if [ "$v" != "0" ] && [ "$v" != "00000000" ]; then
+            rps_active=$(( rps_active + 1 ))
+        fi
+    done
+
+    local audit_size=0 audit_lines=0
+    if [ -f "$AUDIT_LOG" ]; then
+        audit_size=$(stat -c%s "$AUDIT_LOG" 2>/dev/null || echo 0)
+        audit_lines=$(wc -l < "$AUDIT_LOG" 2>/dev/null || echo 0)
+    fi
+
+    # JSON-stream массив drifts — каждая строка из rows как объект.
+    local drifts_json="[]"
+    if command -v jq >/dev/null 2>&1; then
+        drifts_json=$(printf '%s\n' "$rows" | awk -F'|' 'NF==4 {
+            printf "{\"key\":\"%s\",\"expected\":\"%s\",\"current\":\"%s\",\"status\":\"%s\"}\n", $1,$2,$3,$4
+        }' | jq -s . 2>/dev/null || echo "[]")
+    fi
+
+    cat <<JSON
+{
+  "version": "$SCRIPT_VERSION",
+  "ts": "$(date -u +%FT%TZ)",
+  "sysctl": {
+    "ok": $ok_count,
+    "drift": $drift_count,
+    "unknown": $unknown_count,
+    "rows": $drifts_json
+  },
+  "rps": {"active_queues": $rps_active},
+  "conntrack": {"count": $cc, "max": $cm, "pct": $pct},
+  "audit_log": {"size_bytes": $audit_size, "lines": $audit_lines}
+}
+JSON
+}
+
+# doctor: actionable-диагностика (v8.3, M1).
+# Не ругается без причины, говорит что именно делать. Сейчас проверяет 8
+# самых частых проблем, которые мы реально умеем чинить.
+doctor_command() {
+    echo -e "${CYAN}${BOLD}=== vps-optimizer doctor v${SCRIPT_VERSION} ===${NC}"
+    echo ""
+    local issues=0
+
+    # 1. Conntrack usage
+    local cc cm pct
+    cc=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    cm=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
+    if [ "$cm" -gt 0 ]; then
+        pct=$(( cc * 100 / cm ))
+        if [ "$pct" -ge 80 ]; then
+            echo -e "${RED}[!] conntrack ${pct}%${NC} ($cc/$cm)"
+            echo "    Fix: подними net.netfilter.nf_conntrack_max до $((cm * 2))"
+            echo "         echo 'net.netfilter.nf_conntrack_max=$((cm * 2))' >> $SYSCTL_CONF && sysctl -p $SYSCTL_CONF"
+            issues=$(( issues + 1 ))
+        else
+            echo -e "${GREEN}[ok]${NC} conntrack ${pct}% ($cc/$cm)"
+        fi
+    fi
+
+    # 2. TCP retransmits — рассчитываем delta за 1 сек.
+    # /proc/net/snmp имеет 2 'Tcp:' строки: первая — заголовок с именами колонок,
+    # вторая — значения. Берём индексы из header'а, значения из data-строки.
+    if [ -r /proc/net/snmp ]; then
+        local rt1 rt2 sg1 sg2 retrans_pct=0
+        # shellcheck disable=SC2016
+        local awk_pick='/^Tcp:/ && !hdr {hdr=$0; next} /^Tcp:/ {n=split(hdr,h); m=split($0,d); for(i=1;i<=n;i++) if(h[i]==key) {print d[i]+0; exit}}'
+        rt1=$(awk -v key=RetransSegs "$awk_pick" /proc/net/snmp 2>/dev/null)
+        sg1=$(awk -v key=OutSegs    "$awk_pick" /proc/net/snmp 2>/dev/null)
+        sleep 1
+        rt2=$(awk -v key=RetransSegs "$awk_pick" /proc/net/snmp 2>/dev/null)
+        sg2=$(awk -v key=OutSegs    "$awk_pick" /proc/net/snmp 2>/dev/null)
+        local d_rt d_sg
+        d_rt=$(( ${rt2:-0} - ${rt1:-0} ))
+        d_sg=$(( ${sg2:-0} - ${sg1:-0} ))
+        if [ "$d_sg" -gt 0 ]; then
+            retrans_pct=$(( d_rt * 100 / d_sg ))
+        fi
+        if [ "$retrans_pct" -ge 5 ]; then
+            echo -e "${YELLOW}[!] TCP retransmits ${retrans_pct}%/s${NC} ($d_rt из $d_sg сегментов)"
+            echo "    Causes: плохая сеть, MTU mismatch, сильно нагружен link."
+            echo "    Fix: проверь MTU (sudo $0 wg setup автодетектит для wg-iface)"
+            echo "         посмотри dmesg | grep -E 'tcp|conntrack'"
+            issues=$(( issues + 1 ))
+        else
+            echo -e "${GREEN}[ok]${NC} TCP retransmits ${retrans_pct}%/s"
+        fi
+    fi
+
+    # 3. softnet_stat — drops/squeezed (значения в hex; portable hex→dec через bash).
+    if [ -r /proc/net/softnet_stat ]; then
+        local drops=0 squeezed=0 col1 col2 col3
+        while read -r col1 col2 col3 _; do
+            : "$col1"  # processed unused
+            # bash 16#XX = hex → dec; защищаемся от пустых/мусорных строк.
+            [[ "$col2" =~ ^[0-9a-fA-F]+$ ]] && drops=$(( drops + 16#$col2 ))
+            [[ "$col3" =~ ^[0-9a-fA-F]+$ ]] && squeezed=$(( squeezed + 16#$col3 ))
+        done < /proc/net/softnet_stat
+        if [ "$drops" -gt 1000 ] || [ "$squeezed" -gt 1000 ]; then
+            echo -e "${YELLOW}[!] softnet drops=$drops, squeezed=$squeezed${NC}"
+            echo "    Fix: подними net.core.netdev_max_backlog (текущий: $(sysctl -n net.core.netdev_max_backlog 2>/dev/null))"
+            echo "         или включи RPS (apply сделает)"
+            issues=$(( issues + 1 ))
+        else
+            echo -e "${GREEN}[ok]${NC} softnet drops=$drops squeezed=$squeezed"
+        fi
+    fi
+
+    # 4. Disk space на /var
+    local var_pct
+    var_pct=$(df --output=pcent /var 2>/dev/null | tail -1 | tr -dc '0-9')
+    if [ -n "$var_pct" ] && [ "$var_pct" -ge 90 ]; then
+        echo -e "${RED}[!] /var заполнен на ${var_pct}%${NC}"
+        echo "    Fix: journalctl --vacuum-time=7d; rotate logs; check $SNAPSHOT_DIR"
+        issues=$(( issues + 1 ))
+    else
+        echo -e "${GREEN}[ok]${NC} /var свободно: $((100 - ${var_pct:-0}))%"
+    fi
+
+    # 5. DNS работает?
+    if ! getent hosts cloudflare.com >/dev/null 2>&1; then
+        echo -e "${RED}[!] DNS не разрешается${NC}"
+        echo "    Fix: sudo $0 dns local   # вернуть провайдерский DNS"
+        echo "         или: sudo $0 dns plain cloudflare"
+        issues=$(( issues + 1 ))
+    else
+        echo -e "${GREEN}[ok]${NC} DNS отвечает"
+    fi
+
+    # 6. Auto-rollback snapshot за последний час
+    local recent_snap
+    recent_snap=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name 'pre-apply-*.tar.gz' -mmin -60 2>/dev/null | head -1)
+    if [ -n "$recent_snap" ]; then
+        echo -e "${GREEN}[ok]${NC} Свежий snapshot: $(basename "$recent_snap")"
+    fi
+
+    # 7. Hypervisor
+    local virt
+    virt=$(detect_virt)
+    case "$virt" in
+        openvz|lxc)
+            echo -e "${YELLOW}[i]${NC} hypervisor=$virt — часть тюнингов запрещена хостом, это нормально"
+            ;;
+        kvm|xen|hyperv|microsoft|none)
+            echo -e "${GREEN}[ok]${NC} hypervisor=$virt — полный тюнинг доступен"
+            ;;
+    esac
+
+    # 8. VPN-iface наличие
+    if has_vpn_iface; then
+        echo -e "${GREEN}[ok]${NC} VPN-iface обнаружен — рекомендуется apply --vpn"
+    fi
+
+    echo ""
+    if [ "$issues" -eq 0 ]; then
+        echo -e "${GREEN}${BOLD}=== всё ок, проблем не найдено ===${NC}"
+    else
+        echo -e "${YELLOW}${BOLD}=== найдено $issues проблем(ы) — см. выше ===${NC}"
+    fi
+}
+
+# why <key>: объясняем почему конкретный sysctl такой (v8.3, M2).
+# База знаний — короткие пояснения для ~30 наших ключевых knob'ов.
+why_command() {
+    local key="$1" cur expected
+    cur=$(sysctl -n "$key" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+    if [ -z "$cur" ]; then
+        echo -e "${RED}[!] $key не существует или не читается${NC}"
+        return 1
+    fi
+    if [ -f "$SYSCTL_CONF" ]; then
+        expected=$(awk -F'=' -v k="$key" '
+            $1 ~ k {sub(/^[^=]*=/,""); gsub(/^ +| +$/,""); print; exit}
+        ' "$SYSCTL_CONF")
+    fi
+    echo -e "${BOLD}$key${NC}"
+    echo "  current:  $cur"
+    [ -n "$expected" ] && echo "  applied:  $expected"
+    echo ""
+    case "$key" in
+        net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+            echo "  Min/default/max буфер TCP per-socket. На VPS с RAM>=4GB и 10G+ линке"
+            echo "  max=512MB позволяет вместить bandwidth*delay product без drop'ов."
+            ;;
+        net.core.rmem_max|net.core.wmem_max)
+            echo "  Глобальный максимум sock-buffer. Должен быть >= max(tcp_rmem)."
+            ;;
+        net.ipv4.tcp_congestion_control)
+            echo "  Алгоритм управления окном. BBR — лучший выбор для прокси/VPN"
+            echo "  (loss-tolerant). cubic — для классики. bbr3/bbr2 — экспериментально."
+            ;;
+        net.core.default_qdisc)
+            echo "  Дефолтный qdisc для всех iface. fq — pacing-friendly для BBR."
+            echo "  cake — pareto-оптимально для bufferbloat."
+            ;;
+        net.ipv4.conf.all.rp_filter)
+            echo "  Reverse Path Filtering. =0 off, =1 strict (дропает asymmetric routing —"
+            echo "  ломает VPN/MPTCP), =2 loose (защита от source-spoofing, дружит с VPN)."
+            echo "  v8.3 ставит =2 по умолчанию."
+            ;;
+        net.ipv4.tcp_fastopen)
+            echo "  TFO позволяет данные в SYN-пакете. =3 = client+server."
+            echo "  v8.3 также сбрасывает blackhole_timeout — иначе TFO выключается на час."
+            ;;
+        net.ipv4.tcp_fastopen_blackhole_timeout_sec)
+            echo "  Если ядро решило что TFO в чёрной дыре, лочит на N секунд (default 3600)."
+            echo "  =0 (v8.3) — никогда не лочить, всегда пытаемся TFO."
+            ;;
+        net.ipv4.udp_rmem_min|net.ipv4.udp_wmem_min)
+            echo "  Минимальный UDP-buffer per-socket. Критично для QUIC/Hysteria/WireGuard"
+            echo "  где socket-buffers могут быть >1MB."
+            ;;
+        net.ipv4.udp_mem)
+            echo "  Глобальный UDP memory pressure (в страницах, не байтах!). low/pressure/max."
+            ;;
+        net.netfilter.nf_conntrack_max)
+            echo "  Максимум одновременных conntrack-записей. Прокси/NAT упирается"
+            echo "  быстро. preset proxy ставит до 4M. balance — 1M."
+            ;;
+        net.core.netdev_max_backlog)
+            echo "  Очередь пакетов между NIC и кернел-stack. v8.3 масштабирует под скорость:"
+            echo "  >=25G → 300000, >=10G → 100000, иначе 30000."
+            ;;
+        net.core.dev_weight)
+            echo "  Сколько пакетов napi обрабатывает за один poll. Выше = меньше"
+            echo "  context-switch'ей, но потенциально выше latency. v8.3: 64-128 по линку."
+            ;;
+        net.ipv4.ip_forward)
+            echo "  Маршрутизация через хост. =1 нужно для VPN-сервера / контейнерного хоста."
+            echo "  v8.3 включает только если детектим tun*/wg*/ppp* или передан --vpn."
+            ;;
+        net.ipv4.tcp_keepalive_time)
+            echo "  Сколько секунд idle прежде чем послать keepalive-probe. По умолчанию"
+            echo "  7200 (2 часа) — слишком много для прокси за NAT'ом, ставим 300."
+            ;;
+        vm.swappiness)
+            echo "  Насколько охотно ядро своппит. 60 = default, 10 = мало, 1 = почти никогда."
+            echo "  С zram swappiness=100-200 имеет смысл (compression быстрее disk-IO)."
+            ;;
+        net.ipv4.tcp_mtu_probing)
+            echo "  Probe для PMTU. =0 off, =1 on if blackhole, =2 always."
+            echo "  Лечит чёрные дыры в туннелях (WireGuard/Reality/XHTTP)."
+            ;;
+        *)
+            echo "  Описание для этого ключа не зашито. См. man 7 tcp / man 7 udp / kernel docs:"
+            echo "  https://www.kernel.org/doc/Documentation/sysctl/"
+            ;;
+    esac
+}
+
+# wg setup: WireGuard helper (v8.3, J1) — ставит wireguard-tools, генерит
+# минимальный config с автодетектом MTU (через ICMP needs-frag), conntrack-rules.
+# Полностью opt-in. Если WG уже настроен — не трогает.
+wg_setup() {
+    echo -e "${CYAN}${BOLD}=== WireGuard helper (opt-in) ===${NC}"
+
+    # 1. Установка wireguard-tools если ещё нет.
+    if ! command -v wg >/dev/null 2>&1; then
+        echo "[*] Ставим wireguard-tools..."
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wireguard-tools >/dev/null 2>&1 || {
+                echo -e "${RED}[!] Не удалось установить wireguard-tools${NC}"; return 1
+            }
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y wireguard-tools >/dev/null 2>&1 || return 1
+        else
+            echo -e "${RED}[!] Менеджер пакетов не определён${NC}"; return 1
+        fi
+    fi
+    echo -e "${GREEN}[+] wireguard-tools: $(wg --version | head -1)${NC}"
+
+    # 2. Автодетект оптимального MTU.
+    # ICMP может быть отфильтрован — в этом случае берём безопасный 1280.
+    local default_iface mtu_phys mtu_wg
+    default_iface=$(ip -4 route show default 2>/dev/null | awk '/^default/{for (i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')
+    mtu_phys=$(cat "/sys/class/net/${default_iface:-eth0}/mtu" 2>/dev/null || echo 1500)
+    # WG-overhead: IP(20) + UDP(8) + WG-header(32) = 60 для IPv4, 80 для IPv6.
+    mtu_wg=$(( mtu_phys - 80 ))
+    [ "$mtu_wg" -lt 1280 ] && mtu_wg=1280
+    echo "[*] Phys MTU: $mtu_phys (iface: ${default_iface:-eth0}) → WG MTU: $mtu_wg"
+
+    # 3. Генерим ключи если не существуют.
+    local wg_dir=/etc/wireguard
+    mkdir -p "$wg_dir"
+    chmod 700 "$wg_dir"
+    if [ ! -f "$wg_dir/server.key" ]; then
+        echo "[*] Генерим ключевую пару..."
+        (umask 077; wg genkey | tee "$wg_dir/server.key" | wg pubkey > "$wg_dir/server.pub")
+        echo -e "${GREEN}[+] Ключи: $wg_dir/server.key, $wg_dir/server.pub${NC}"
+    else
+        echo "[*] Ключи уже существуют: $wg_dir/server.key (не трогаем)"
+    fi
+
+    # 4. Минимальный server config (только если ещё нет).
+    if [ ! -f "$wg_dir/wg0.conf" ]; then
+        local priv_key pub_key
+        priv_key=$(cat "$wg_dir/server.key")
+        pub_key=$(cat "$wg_dir/server.pub")
+        cat > "$wg_dir/wg0.conf" <<WG_EOF
+# Generated by vps_optimizer v${SCRIPT_VERSION} (wg setup)
+# https://github.com/lpxqwkjd65rjfn-dot/noble-net-warp
+[Interface]
+PrivateKey = $priv_key
+ListenPort = 51820
+Address = 10.99.0.1/24
+MTU = $mtu_wg
+# PostUp/PostDown — типовая NAT-настройка для VPN-роутера.
+# Закомментировано по умолчанию: включай руками если хочешь exit-node.
+# PostUp   = iptables -t nat -A POSTROUTING -s 10.99.0.0/24 -o ${default_iface:-eth0} -j MASQUERADE
+# PostDown = iptables -t nat -D POSTROUTING -s 10.99.0.0/24 -o ${default_iface:-eth0} -j MASQUERADE
+
+# Public key (раздавай клиентам): $pub_key
+
+# Чтобы добавить клиента — допиши блок:
+# [Peer]
+# PublicKey = <client-pubkey>
+# AllowedIPs = 10.99.0.2/32
+# PersistentKeepalive = 25
+WG_EOF
+        chmod 600 "$wg_dir/wg0.conf"
+        echo -e "${GREEN}[+] Server config: $wg_dir/wg0.conf${NC}"
+        echo "    Public key: $pub_key"
+    else
+        echo "[*] $wg_dir/wg0.conf уже существует — не трогаем."
+    fi
+
+    # 5. ip_forward — без него VPN не маршрутизирует.
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+
+    echo ""
+    echo -e "${CYAN}Дальнейшие шаги:${NC}"
+    echo "  1. systemctl enable --now wg-quick@wg0"
+    echo "  2. Открой UDP/51820 в фаерволе:  ufw allow 51820/udp"
+    echo "  3. Добавь Peer-блоки в $wg_dir/wg0.conf для клиентов"
+    echo "  4. После apply --vpn — sysctl будут VPN-friendly (rp_filter=2 и т.д.)"
+    _audit wg_setup "mtu=$mtu_wg iface=${default_iface:-eth0}"
+}
+
+# install_apply_boot_unit: ставит one-shot systemd unit, который запускает
+# apply на каждом boot (v8.3, M13). Полезно для OpenVZ, где /etc/sysctl.d/
+# иногда вытирается провайдером.
+install_apply_boot_unit() {
+    if [ "$DRY_RUN" = "1" ]; then
+        echo -e "${YELLOW}[dry-run] install_apply_boot_unit: показал бы как бы выглядел unit.${NC}"
+        return 0
+    fi
+    local self
+    self=$(readlink -f "${BASH_SOURCE[0]:-$0}")
+    cat > /etc/systemd/system/vps-optimizer-apply.service <<UNIT_EOF
+[Unit]
+Description=VPS Optimizer apply on boot (vps-optimizer v${SCRIPT_VERSION})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$self apply --quiet --no-rollback
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable vps-optimizer-apply.service >/dev/null 2>&1 || true
+    echo -e "${GREEN}[+] vps-optimizer-apply.service установлен.${NC}"
+    echo "    apply будет автоматически запускаться при каждом boot'е."
+    echo "    Снять: systemctl disable --now vps-optimizer-apply.service"
+    _audit apply_boot "installed unit=vps-optimizer-apply.service script=$self"
 }
 
 # noise test --once: запустить один цикл без записи в systemd
@@ -3769,17 +4443,37 @@ prom_serve() {
 }
 
 # Внутренний обработчик одного HTTP-запроса для prom_serve.
+# Q3 fix v8.3: учитывает path. /metrics -> метрики, / -> liveness 200 OK,
+# всё остальное -> 404. Это критично потому что Prometheus и внешние health-чекеры
+# по-разному стучатся: Prometheus в /metrics, k8s-probe и balancer'ы в /.
 _prom_handler() {
-    local _req _hline
+    local _req _hline _path
     read -r _req
+    # Парсим request-line: 'GET /metrics HTTP/1.1'
+    _path=$(printf '%s' "$_req" | awk '{print $2}')
+    # Drain headers
     while read -r _hline; do
         _hline=${_hline%$'\r'}
         [ -z "$_hline" ] && break
     done
-    local body
-    body=$(prom_metrics)
-    local len=${#body}
-    printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "$len" "$body"
+    case "$_path" in
+        /metrics|/metrics?*)
+            local body len
+            body=$(prom_metrics)
+            len=${#body}
+            printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "$len" "$body"
+            ;;
+        /|/health|/healthz|/ready|/readyz|/livez)
+            local body="OK\n" len
+            len=${#body}
+            printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "$len" "$body"
+            ;;
+        *)
+            local body="not found\n" len
+            len=${#body}
+            printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "$len" "$body"
+            ;;
+    esac
 }
 
 # compare-baseline: примитивный benchmark before/after. Сохраняет ping/throughput
@@ -3817,7 +4511,7 @@ EOF
 }
 
 print_cli_help() {
-    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.2 PHOENIX-Z++"
+    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v${SCRIPT_VERSION} PHOENIX-Z++"
     cat <<EOF
 
 USAGE:
@@ -3827,12 +4521,18 @@ USAGE:
 COMMANDS:
     install                  Установить компоненты Phoenix
     apply [--preset NAME]    Применить sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)
+        --vpn                + явные VPN-настройки (rp_filter=2, accept_local, ip_forward)
+        --no-rollback        Отключить auto-rollback при потере связи (не рекомендуется)
+        --boot               Поставить one-shot systemd unit для apply на каждом boot
     status [--json]          Показать дашборд состояния (или JSON для машин)
     self-test                Перепроверить применённые настройки
-    audit                    Глубокая диагностика (drift, conntrack, RPS, dnscrypt-proxy)
+    audit [--json]           Глубокая диагностика (drift, conntrack, RPS, dnscrypt-proxy)
+    doctor                   Actionable-диагностика с рекомендациями (v8.3)
+    why <key>                Объяснить почему конкретный sysctl такой (v8.3)
     logs [N]                 Последние N строк журнала (run/journalctl/dmesg/audit)
     preset <name>            Сохранить пресет на будущие apply
     noise on|off|edit|test|status   Управление шумогенератором
+    wg setup                 WireGuard helper: автодетект MTU, conntrack-rules (v8.3)
     dns ...                  Управление DNS:
                                dns                                   # статус
                                dns local                             # вернуть провайдер.
@@ -3847,7 +4547,7 @@ COMMANDS:
     harden ssh|ufw|upgrades|all   Opt-in security (НЕ меняет дефолт apply)
     prom-metrics             Сдампить Prometheus-метрики на stdout
     prom-serve [port]        Поднять Prometheus exporter (default port 9777)
-    reset                    Полный откат всех изменений
+    reset [--soft]           Полный откат / --soft = только sysctl, оставить DNS/noise/swap
     uninstall                Полное удаление: сбрасывает + сносит сам скрипт
     export [path.tar.gz]     Выгрузить все конфиги в архив (с manifest)
     import <path.tar.gz>     Накатить выгруженные конфиги (с проверкой версии)
@@ -3862,16 +4562,29 @@ GLOBAL FLAGS:
     --preset NAME            Использовать конкретный пресет (см. apply)
     --impersonate            Использовать curl-impersonate в шуме (если установлен)
     --ecmp                   Включить ECMP/multipath (для multi-NIC bare-metal)
-    --json                   Вывод в JSON (для status)
+    --vpn                    Явно VPN-режим: rp_filter=2, accept_local, ip_forward
+    --no-rollback            Отключить auto-rollback по connectivity-check
+    --soft                   Soft-режим (для reset): только sysctl, не трогать DNS/noise
+    --boot                   Boot-режим (для apply): создать one-shot systemd unit
+    --json                   Вывод в JSON (для status/audit)
+
+EXIT CODES (для cron/Ansible):
+    0   ok                                10  already-applied (idempotent)
+    20  internet-down (apply прерван)     30  hypervisor-blocked (всё запрещено)
+    40  lock-busy (другой apply идёт)     50  invalid args / preset
+    60  rolled-back (apply применён, но связь упала → авто-откат)
 
 EXAMPLES:
     sudo ./vps_optimizer.sh apply --preset proxy
+    sudo ./vps_optimizer.sh apply --vpn          # для VPN-сервера
+    sudo ./vps_optimizer.sh apply --boot         # apply на каждом boot (OpenVZ)
     sudo ./vps_optimizer.sh apply --dry-run --debug
     sudo ./vps_optimizer.sh status --json
-    sudo ./vps_optimizer.sh logs 200
-    sudo ./vps_optimizer.sh audit
-    sudo ./vps_optimizer.sh harden all
-    sudo ./vps_optimizer.sh compare 1.1.1.1
+    sudo ./vps_optimizer.sh audit --json
+    sudo ./vps_optimizer.sh doctor               # actionable diagnostics
+    sudo ./vps_optimizer.sh why net.ipv4.tcp_rmem
+    sudo ./vps_optimizer.sh wg setup
+    sudo ./vps_optimizer.sh reset --soft         # только sysctl
     sudo ./vps_optimizer.sh prom-serve 9777 &
 
 CONFIG FILES:
@@ -3895,7 +4608,7 @@ cli_dispatch() {
     CLI_MODE=1
     local cmd="$1"; shift || true
     # Парсим глобальные флаги независимо от позиции
-    local args=()
+    local args=() apply_boot_mode=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --dry-run) DRY_RUN=1 ;;
@@ -3905,6 +4618,10 @@ cli_dispatch() {
             --json) JSON=1 ;;
             --impersonate) IMPERSONATE=1 ;;
             --ecmp) ECMP=1 ;;
+            --vpn) VPN_FORCE=1 ;;
+            --no-rollback) NO_ROLLBACK=1 ;;
+            --soft) SOFT_RESET=1 ;;
+            --boot) apply_boot_mode=1 ;;
             --preset)  PRESET="$2"; shift ;;
             --preset=*) PRESET="${1#*=}" ;;
             *)         args+=("$1") ;;
@@ -3914,7 +4631,28 @@ cli_dispatch() {
 
     case "$cmd" in
         install)        install_dependencies ;;
-        apply|optimize) apply_optimizations ;;
+        apply|optimize)
+            if [ "$apply_boot_mode" = "1" ]; then
+                install_apply_boot_unit
+            else
+                apply_optimizations
+            fi
+            ;;
+        doctor)         doctor_command ;;
+        why)
+            if [ -z "${args[0]:-}" ]; then
+                echo -e "${RED}why: укажи sysctl-key (например: net.ipv4.tcp_rmem)${NC}"
+                return "$EXIT_INVALID_ARGS"
+            fi
+            why_command "${args[0]}"
+            ;;
+        wg)
+            local sub="${args[0]:-help}"
+            case "$sub" in
+                setup) wg_setup ;;
+                *) echo "Использование: wg setup" ; return "$EXIT_INVALID_ARGS" ;;
+            esac
+            ;;
         status)
             if [ "$JSON" = "1" ]; then
                 status_json
