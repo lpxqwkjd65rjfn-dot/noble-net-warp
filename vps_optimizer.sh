@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.1.1 PHOENIX-Z+)
+# VPS Global Optimization Script (v8.2 PHOENIX-Z++)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -80,11 +80,28 @@ DNS_RESOLV_BACKUP="/etc/.vps_optimizer_resolv_backup"
 SELF_URL="https://raw.githubusercontent.com/lpxqwkjd65rjfn-dot/noble-net-warp/main/vps_optimizer.sh"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 RUN_LOG="/var/log/vps-optimizer.log"
+AUDIT_LOG="/var/log/vps-optimizer-audit.log"
+DEBUG_LOG="/var/log/vps-optimizer-debug.log"
+LOCK_FILE="/var/lock/vps-optimizer.lock"
+SNAPSHOT_DIR="/var/backups/vps-optimizer"
+HEALTH_DIR="/run/vps-noise"
+HEALTH_FILE="$HEALTH_DIR/health.json"
+# shellcheck disable=SC2034  # used in deploy_noise_generator
+NOISE_STATE_DIR="/var/lib/vps-noise"
+INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
+EXPORT_FORMAT_VERSION=2
+SCRIPT_VERSION="8.2"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
 QUIET=0
 PRESET=""
+DEBUG=0
+FORCE=0
+IMPERSONATE=0
+ECMP=0
+JSON=0
+CLI_MODE=0
 
 # Сводки sysctl/sysfs/ethtool — заполняются в процессе apply, печатаются в self_test
 SYSCTL_OK=()
@@ -97,7 +114,7 @@ print_header() {
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "       ULTRA VPS ACCELERATOR v8.1.1 (PHOENIX-Z+)                   "
+    echo "       ULTRA VPS ACCELERATOR v8.2 (PHOENIX-Z++)                  "
     echo "================================================================="
     echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
     echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
@@ -118,6 +135,76 @@ _log() {
     local msg="$*"
     [ "$QUIET" = "1" ] || echo -e "$msg"
     echo "[$(date -u +%FT%TZ)] [$level] $(echo -e "$msg" | sed 's/\x1b\[[0-9;]*m//g')" >> "$RUN_LOG" 2>/dev/null || true
+}
+
+# Audit-log: фиксирует каждую mutating-команду (apply / reset / dns / noise / harden / uninstall).
+# Пишется в отдельный append-only лог, не зависящий от $QUIET.
+_audit() {
+    local action="$1"; shift
+    local user="${SUDO_USER:-${USER:-root}}"
+    local detail="$*"
+    mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
+    echo "[$(date -u +%FT%TZ)] user=$user action=$action $detail" >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+# Debug-log: подробный вывод каждой sysctl/sysfs-записи. Включается флагом --debug.
+_debug() {
+    [ "$DEBUG" = "1" ] || return 0
+    mkdir -p "$(dirname "$DEBUG_LOG")" 2>/dev/null || true
+    echo "[$(date -u +%FT%T.%3NZ)] $*" >> "$DEBUG_LOG" 2>/dev/null || true
+}
+
+# /dev/urandom-based случайное число в диапазоне [a, b]. Используем когда $RANDOM
+# даёт коллизии в параллельных bash-процессах (например loop_ios + loop_news запущены
+# одновременно — получают одинаковую seed, тянут одинаковые URL'ы → паттерн).
+urand_range() {
+    local lo="$1" hi="$2" span r
+    span=$(( hi - lo + 1 ))
+    [ "$span" -le 0 ] && { echo "$lo"; return; }
+    if [ -r /dev/urandom ]; then
+        r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
+        [ -z "$r" ] && r=$RANDOM
+        echo $(( r % span + lo ))
+    else
+        echo $(( RANDOM % span + lo ))
+    fi
+}
+
+# Lock-файл для предотвращения одновременных apply/reset.
+acquire_lock() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    [ "$FORCE" = "1" ] && return 0
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+    exec 9>"$LOCK_FILE" 2>/dev/null || return 0
+    if ! flock -n 9 2>/dev/null; then
+        echo -e "${RED}[!] Другой инстанс vps_optimizer уже работает (lock=$LOCK_FILE).${NC}"
+        echo -e "${GRAY}    Запусти с --force чтобы проигнорировать.${NC}"
+        return 1
+    fi
+    return 0
+}
+
+release_lock() {
+    exec 9>&- 2>/dev/null || true
+}
+
+# Быстрая проверка наличия интернета — чтобы не сломать DNS если связь уже отвалилась.
+check_internet() {
+    local timeout=3
+    if curl -sf --max-time "$timeout" "$INTERNET_PROBE_URL" >/dev/null 2>&1; then
+        return 0
+    fi
+    if timeout "$timeout" bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Простой SHA256 — для idempotency и self_update integrity check
+file_sha256() {
+    local f="$1"
+    [ -f "$f" ] || { echo ""; return; }
+    sha256sum "$f" 2>/dev/null | awk '{print $1}'
 }
 
 # ===================================================================
@@ -161,19 +248,23 @@ sysctl_safe() {
     local key="$1" value="$2"
     if ! kernel_supports_sysctl "$key"; then
         SYSCTL_SKIP+=("$key=unsupported")
+        _debug "sysctl SKIP unsupported: $key=$value"
         return 1
     fi
     if [ "$DRY_RUN" = "1" ]; then
         SYSCTL_OK+=("$key=$value (dry-run)")
         [ -n "$SYSCTL_TMP" ] && echo "$key = $value" >> "$SYSCTL_TMP"
+        _debug "sysctl DRY: $key=$value"
         return 0
     fi
     if sysctl -w "$key=$value" >/dev/null 2>&1; then
         SYSCTL_OK+=("$key=$value")
         [ -n "$SYSCTL_TMP" ] && echo "$key = $value" >> "$SYSCTL_TMP"
+        _debug "sysctl OK: $key=$value"
         return 0
     else
         SYSCTL_SKIP+=("$key=denied")
+        _debug "sysctl DENIED: $key=$value"
         return 1
     fi
 }
@@ -183,17 +274,21 @@ sysfs_safe() {
     local path="$1" value="$2"
     if [ ! -e "$path" ]; then
         SYSFS_SKIP+=("$path:missing")
+        _debug "sysfs SKIP missing: $path"
         return 1
     fi
     if [ "$DRY_RUN" = "1" ]; then
         SYSFS_OK+=("$path=$value (dry-run)")
+        _debug "sysfs DRY: $path=$value"
         return 0
     fi
     if echo "$value" > "$path" 2>/dev/null; then
         SYSFS_OK+=("$path=$value")
+        _debug "sysfs OK: $path=$value"
         return 0
     else
         SYSFS_SKIP+=("$path:denied")
+        _debug "sysfs DENIED: $path=$value"
         return 1
     fi
 }
@@ -247,6 +342,59 @@ list_real_ifaces() {
         awk -F': ' '$2 !~ /^(lo|virbr|docker|veth|wg|tun|tap|gre|ppp|br-|cilium|kube|cni)/ {print $2}'
 }
 
+# Detect VPS-провайдера через dmidecode / hostname / IP-ranges.
+# Возвращает: hetzner|digitalocean|vultr|aws|gcp|azure|aeza|timeweb|firstbyte|generic
+detect_provider() {
+    local sys_vendor sys_product hostname_lc
+    sys_vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    sys_product=$(cat /sys/class/dmi/id/product_name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    hostname_lc=$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')
+
+    # DMI-сигнатуры провайдеров
+    case "$sys_vendor$sys_product" in
+        *hetzner*)        echo hetzner;        return ;;
+        *digitalocean*)   echo digitalocean;   return ;;
+        *vultr*)          echo vultr;          return ;;
+        *amazon*|*aws*)   echo aws;            return ;;
+        *google*)         echo gcp;            return ;;
+        *microsoft*|*hyperv*) echo azure;      return ;;
+        *oracle*)         echo oracle;         return ;;
+    esac
+    # hostname-эвристика (Aeza/Timeweb/Firstbyte часто включают название в hostname)
+    case "$hostname_lc" in
+        *aeza*)      echo aeza;      return ;;
+        *timeweb*)   echo timeweb;   return ;;
+        *firstbyte*|*1stbyte*) echo firstbyte; return ;;
+    esac
+    echo generic
+}
+
+# Безопасная проверка: можем ли мы включать GRO/GSO/TSO на этом NIC без рисков?
+# На некоторых virtio-net конфигурациях GRO+TSO ломает packet flow для XHTTP/Reality.
+# Стратегия: если виртуализация openvz/lxc/docker — не трогаем offload вообще
+# (всё равно контролируется хостом). На KVM/Xen — оставляем default настройки,
+# но фиксируем `gro on` (важно для производительности) и `lro off` (важно для
+# корректной работы прокси).
+nic_offload_safe_for_iface() {
+    local iface="$1"
+    local virt
+    virt=$(detect_virt 2>/dev/null)
+    case "$virt" in
+        openvz|lxc|docker) return 1 ;;
+    esac
+    [ -n "$iface" ] && [ -d "/sys/class/net/$iface" ] || return 1
+    return 0
+}
+
+# ECMP детектор: возвращает 0 если сейчас есть несколько default-маршрутов
+# на разных интерфейсах (multipath сценарий — имеет смысл включить
+# fib_multipath_hash_policy=1).
+has_ecmp() {
+    local n
+    n=$(ip -4 route show default 2>/dev/null | grep -c '^default')
+    [ "$n" -ge 2 ]
+}
+
 run_benchmark() {
     clear
     echo -e "${CYAN}${BOLD}=== ТЕСТ ЗАДЕРЖКИ (BENCHMARK) ===${NC}"
@@ -295,10 +443,53 @@ server=8.8.4.4
 EOF
     systemctl restart dnsmasq >/dev/null 2>&1 || true
 
+    # Опционально — socat (нужен для prom-serve)
+    apt-get install -y --no-install-recommends socat >/dev/null 2>&1 || true
+
     echo -e "${GREEN}[+] Базовые компоненты установлены.${NC}"
     echo -e "${YELLOW}[i] Опционально: curl-impersonate-safari даёт TLS/JA3 как у iOS.${NC}"
     echo -e "${YELLOW}    https://github.com/lwthiker/curl-impersonate (release binaries)${NC}"
+
+    # IMPERSONATE: при флаге --impersonate автоматически качаем curl-impersonate.
+    if [ "$IMPERSONATE" = "1" ]; then
+        install_curl_impersonate
+    fi
+
+    _audit install "deps_installed=ok impersonate=${IMPERSONATE}"
     sleep 1
+}
+
+# Опциональная установка curl-impersonate (TLS/JA3-fingerprint реального Safari).
+install_curl_impersonate() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *) echo -e "${YELLOW}[!] curl-impersonate: не поддерживается архитектура $arch${NC}"; return 1 ;;
+    esac
+    if command -v curl-impersonate-safari >/dev/null 2>&1; then
+        echo -e "${GRAY}[i] curl-impersonate уже установлен.${NC}"; return 0
+    fi
+    local ver="0.6.1"
+    local url="https://github.com/lwthiker/curl-impersonate/releases/download/v${ver}/curl-impersonate-v${ver}.${arch}-linux-gnu.tar.gz"
+    local tmp
+    tmp=$(mktemp -d /tmp/.curl_imp.XXXXXX)
+    echo -e "${CYAN}[*] Качаем curl-impersonate v${ver} ${arch}...${NC}"
+    if curl -fsSL "$url" -o "$tmp/curl-imp.tgz" 2>/dev/null; then
+        tar xzf "$tmp/curl-imp.tgz" -C "$tmp" 2>/dev/null
+        local bin
+        bin=$(find "$tmp" -name 'curl-impersonate-safari' -type f 2>/dev/null | head -1)
+        if [ -n "$bin" ] && [ -x "$bin" ]; then
+            install -m 0755 "$bin" /usr/local/bin/curl-impersonate-safari
+            echo -e "${GREEN}[+] /usr/local/bin/curl-impersonate-safari установлен.${NC}"
+        else
+            echo -e "${RED}[!] Не нашли curl-impersonate-safari в архиве.${NC}"
+        fi
+    else
+        echo -e "${RED}[!] Не удалось скачать $url${NC}"
+    fi
+    rm -rf "$tmp"
 }
 
 # ===================================================================
@@ -492,7 +683,14 @@ apply_iface_tuning() {
 
         # ВАЖНО: LRO выключаем — он ломает форвардинг.
         if [ "$DRY_RUN" != "1" ]; then
-            ethtool -K "$iface" rx on tx on sg on tso on gso on gro on lro off >/dev/null 2>&1 || true
+            # Offload-настройки только если nic_offload_safe_for_iface даёт зелёный свет
+            # (KVM/Xen/native — да; openvz/lxc/docker — нет).
+            if nic_offload_safe_for_iface "$iface"; then
+                ethtool -K "$iface" rx on tx on sg on tso on gso on gro on lro off >/dev/null 2>&1 || true
+            else
+                # Контейнер: только LRO off (важно для прокси), остальное по-умолчанию
+                ethtool -K "$iface" lro off >/dev/null 2>&1 || true
+            fi
 
             # Ring buffers до железного максимума
             local ring_max_rx ring_max_tx
@@ -797,6 +995,34 @@ apply_sysctls() {
     sysctl_safe net.core.netdev_budget_usecs 8000
     sysctl_safe net.ipv4.tcp_invalid_ratelimit 500
 
+    # Доводки v8.2 (PHOENIX-Z++):
+    #  - tcp_rto_min_us — минимальный RTO в микросекундах (новое в 6.x). Уменьшает
+    #    время до retransmit на jitter'ных РФ-облаках с ~30-80мс выигрышем на потерях.
+    #  - tcp_comp_sack_delay_ns / tcp_comp_sack_nr — SACK compression уменьшает
+    #    CPU на каждый ACK при множестве потерь (важно для MPTCP/sing-box).
+    #  - tcp_comp_sack_slack_ns — допустимая задержка перед сжатием.
+    #  - tcp_pingpong_thresh — порог переключения в pingpong mode (новое в 6.1+).
+    #  - tcp_min_tso_segs / tcp_tso_win_divisor — балансируем TSO под прокси.
+    #  - tcp_no_ssthresh_metrics_save — не сохраняем устаревший ssthresh между сессиями.
+    sysctl_safe net.ipv4.tcp_rto_min_us 100000
+    sysctl_safe net.ipv4.tcp_comp_sack_delay_ns 1000000
+    sysctl_safe net.ipv4.tcp_comp_sack_nr 44
+    sysctl_safe net.ipv4.tcp_comp_sack_slack_ns 100000
+    sysctl_safe net.ipv4.tcp_min_tso_segs 2
+    sysctl_safe net.ipv4.tcp_tso_win_divisor 3
+    sysctl_safe net.ipv4.tcp_no_ssthresh_metrics_save 1
+    sysctl_safe net.ipv4.tcp_pingpong_thresh 1
+
+    # ECMP / multipath: если у VPS реально несколько default-маршрутов на разные
+    # интерфейсы или включён --ecmp флаг, разрешаем мульти-путь по hash от L4-портов.
+    if [ "$ECMP" = "1" ] || has_ecmp; then
+        sysctl_safe net.ipv4.fib_multipath_use_neigh 1
+        sysctl_safe net.ipv4.fib_multipath_hash_policy 1
+    fi
+
+    # high-order аллокатор страниц: разрешаем jumbo-skb на >10G линках.
+    sysctl_safe net.core.high_order_alloc_disable 0
+
     # MPTCP (Linux 5.6+)
     if [ "$kvi" -ge 50600 ]; then
         sysctl_safe net.mptcp.enabled 1
@@ -1035,7 +1261,7 @@ finalize_sysctl_conf() {
         cp "$SYSCTL_CONF" "$SYSCTL_BACKUP" 2>/dev/null || true
     fi
     {
-        echo "# === VPS Optimizer v8.1.1 PHOENIX-Z+ ==="
+        echo "# === VPS Optimizer v8.2 PHOENIX-Z++ ==="
         echo "# Generated $(date -u +%FT%TZ)  preset=$PRESET_NAME  virt=$VIRT  kernel=$(uname -r)"
         echo "# Только параметры, которые ядро/гипервизор реально приняли."
         cat "$SYSCTL_TMP" 2>/dev/null
@@ -1076,10 +1302,22 @@ self_test() {
 
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
-    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.1.1 PHOENIX-Z+...${NC}"
+    _log INFO "${YELLOW}[*] Глобальный тюнинг v8.2 PHOENIX-Z++...${NC}"
+
+    if ! acquire_lock; then
+        return 1
+    fi
+
+    # Internet-check: если связи нет — предупреждаем (но не блокируем,
+    # пользователь может специально применять оффлайн).
+    if [ "$DRY_RUN" != "1" ] && ! check_internet; then
+        _log WARN "${YELLOW}[!] Нет интернета — продолжаем, но some checks могут не пройти.${NC}"
+    fi
 
     VIRT=$(detect_virt)
-    _log INFO "  Virt:    $VIRT"
+    PROVIDER=$(detect_provider)
+    _log INFO "  Virt:     $VIRT"
+    _log INFO "  Provider: $PROVIDER"
 
     # Под OpenVZ половина sysctl запрещена — это нормально, всё пройдёт через
     # probe-then-write и просто залогируется как skipped.
@@ -1096,6 +1334,23 @@ apply_optimizations() {
     SYSCTL_TMP=$(mktemp /tmp/.vps_sysctl.XXXXXX)
     trap 'rm -f "$SYSCTL_TMP"' EXIT
 
+    # B3: rollback-snapshot перед apply (только если не dry-run и не уже существует
+    # snapshot за последние 60 секунд — чтобы не флудить при повторных apply).
+    if [ "$DRY_RUN" != "1" ]; then
+        mkdir -p "$SNAPSHOT_DIR" 2>/dev/null || true
+        local last_snap
+        last_snap=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name '*.tar.gz' -mmin -1 2>/dev/null | head -1)
+        if [ -z "$last_snap" ]; then
+            local snap_file
+            snap_file="$SNAPSHOT_DIR/pre-apply-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+            tar -czf "$snap_file" \
+                --ignore-failed-read \
+                "$SYSCTL_CONF" "$LIMITS_CONF" "$DNS_CONF" "$DNS_STATE" \
+                "$NOISE_CONF" "$PRESET_FILE" 2>/dev/null || true
+            _log INFO "  Snapshot: $snap_file"
+        fi
+    fi
+
     load_preset "$PRESET"
     apply_zram
     apply_iface_tuning
@@ -1106,14 +1361,31 @@ apply_optimizations() {
     apply_sysctls
     apply_persistent_units
     apply_limits
-    finalize_sysctl_conf
+
+    # B1: idempotency — если новый sysctl-файл побитово совпадает с уже существующим,
+    # пропускаем перезапись и `sysctl -p` (всё уже применено).
+    if [ "$DRY_RUN" != "1" ] && [ -f "$SYSCTL_CONF" ] && [ -s "$SYSCTL_TMP" ]; then
+        local new_hash old_hash
+        new_hash=$(awk 'NF && !/^#/' "$SYSCTL_TMP" 2>/dev/null | sort -u | sha256sum | awk '{print $1}')
+        old_hash=$(awk 'NF && !/^#/' "$SYSCTL_CONF" 2>/dev/null | sort -u | sha256sum | awk '{print $1}')
+        if [ -n "$new_hash" ] && [ "$new_hash" = "$old_hash" ]; then
+            _log INFO "${GRAY}[i] sysctl-конфиг не изменился — пропускаем перезапись.${NC}"
+        else
+            finalize_sysctl_conf
+        fi
+    else
+        finalize_sysctl_conf
+    fi
 
     self_test
 
-    _log OK "${GREEN}[+] Phoenix-Z+ v8.1: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}.${NC}"
+    _log OK "${GREEN}[+] Phoenix-Z++ v8.2: BBR=${APPLIED_BBR}, qdisc=${APPLIED_QDISC}, preset=${PRESET_NAME}, provider=${PROVIDER}.${NC}"
+    _audit apply "preset=${PRESET_NAME} virt=${VIRT} provider=${PROVIDER} bbr=${APPLIED_BBR} qdisc=${APPLIED_QDISC} dry_run=${DRY_RUN}"
     rm -f "$SYSCTL_TMP"; trap - EXIT
+    release_lock
 
     [ "$QUIET" = "1" ] && return
+    [ "$CLI_MODE" = "1" ] && return
     [ -t 0 ] && read -r -p "Нажмите Enter..."
 }
 
@@ -1223,6 +1495,27 @@ PEAK_MORNING_FROM=7
 PEAK_MORNING_TO=9
 PEAK_EVENING_FROM=18
 PEAK_EVENING_TO=23
+
+# === Время-зависимый профиль «места» (новое в v8.2) ===
+# auto      — стандартная кривая дня (как было)
+# office    — активность 9-18, тишина в остальное время (рабочая VPS)
+# home      — пик 19-23, лёгкая утренняя проверка (домашняя VPS)
+# always_on — равномерно 24/7 (для серверов «без хозяина»)
+PLACE_PROFILE=auto
+
+# === Cloud / NTP / cloud-init phantoms (новое в v8.2) ===
+# Реальная Ubuntu всегда тянет NTP/apt/snapcraft в фоне. Включает фоновые
+# запросы к archive.ubuntu.com, security.ubuntu.com, time.ubuntu.com,
+# api.snapcraft.io. Без этого профиль «слишком чистый» и подозрительный.
+ENABLE_CLOUD_PHANTOM=1
+CLOUD_PHANTOM_INTERVAL_MIN=30
+CLOUD_PHANTOM_INTERVAL_MAX=180
+
+# === DNS prefetch (новое в v8.2) ===
+# Имитирует браузерный DNS-preconnect — тихо резолвит host'ы заранее.
+# Без HTTP, только DNS-запрос — попадает в логи провайдера как обычный
+# браузерный preconnect.
+ENABLE_DNS_PREFETCH=1
 CONF_EOF
 }
 
@@ -1720,11 +2013,53 @@ COOKIE_JAR_DIR="/tmp/.vps_noise"
 mkdir -p "$COOKIE_JAR_DIR"
 chmod 700 "$COOKIE_JAR_DIR"
 
-# Случайное число в диапазоне [a, b]
-rrange() { echo $(( RANDOM % ($2 - $1 + 1) + $1 )); }
+# Per-session referer (имитирует браузерную навигационную цепочку:
+# главная → статья → статья → ... — тот же session, тот же Referer).
+declare -A LAST_URL_PER_TAG
+declare -A ETAG_PER_URL
+declare -A LASTMOD_PER_URL
+
+# Health-state — пишется в /run/vps-noise/health.json для status-команды.
+HEALTH_FILE_NOISE="/run/vps-noise/health.json"
+mkdir -p "$(dirname "$HEALTH_FILE_NOISE")" 2>/dev/null || true
+NOISE_REQ_TOTAL=0
+NOISE_REQ_OK=0
+NOISE_REQ_ERR=0
+NOISE_LAST_TS=0
+update_health() {
+    [ -w "$(dirname "$HEALTH_FILE_NOISE")" ] || return 0
+    cat > "$HEALTH_FILE_NOISE" 2>/dev/null <<HJEOF
+{
+  "last_request_ts": $NOISE_LAST_TS,
+  "requests_total": $NOISE_REQ_TOTAL,
+  "requests_ok": $NOISE_REQ_OK,
+  "requests_error": $NOISE_REQ_ERR,
+  "pid": $$,
+  "started_at": $START_TS
+}
+HJEOF
+}
+
+# /dev/urandom-based случайное число (для параллельных loops без коллизий)
+urand() {
+    local lo="$1" hi="$2" span r
+    span=$(( hi - lo + 1 ))
+    [ "$span" -le 0 ] && { echo "$lo"; return; }
+    r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
+    [ -z "$r" ] && r=$RANDOM
+    echo $(( r % span + lo ))
+}
+
+# Случайное число в диапазоне [a, b] — теперь через /dev/urandom.
+rrange() { urand "$1" "$2"; }
 
 # Случайный rate-limit
-rand_rate() { echo $(( RANDOM % (RATE_KB_MAX - RATE_KB_MIN + 1) + RATE_KB_MIN )); }
+rand_rate() { urand "$RATE_KB_MIN" "$RATE_KB_MAX"; }
+
+# Извлечь схему+host (https://example.com) — для Sec-Fetch-Site и Referer cross-site детекции.
+url_origin() {
+    echo "$1" | awk -F/ '{print $1"//"$3}'
+}
 
 # ===== Один HTTP-запрос =====
 # Аргументы: $1 — URL, $2 — UA-pool name (ios|desktop|mobile_ru), $3 — lang (ru|en), $4 — cookie tag
@@ -1742,8 +2077,36 @@ http_request() {
 
     touch "$jar"
 
+    # Referer chain: если в этой сессии уже был запрос, делаем Referer.
+    # Sec-Fetch-Site вычисляется как same-origin / cross-site / none.
+    local prev="${LAST_URL_PER_TAG[$tag]:-}"
+    local sec_fetch_site="none"
+    local referer_arg=()
+    if [ -n "$prev" ] && [ "$prev" != "$url" ]; then
+        referer_arg=(-H "Referer: $prev")
+        if [ "$(url_origin "$prev")" = "$(url_origin "$url")" ]; then
+            sec_fetch_site="same-origin"
+        else
+            sec_fetch_site="cross-site"
+        fi
+    fi
+
+    # Cache headers: если у нас уже есть ETag/Last-Modified для этого URL, отправляем их.
+    local cache_args=()
+    if [ -n "${ETAG_PER_URL[$url]:-}" ]; then
+        cache_args+=(-H "If-None-Match: ${ETAG_PER_URL[$url]}")
+    fi
+    if [ -n "${LASTMOD_PER_URL[$url]:-}" ]; then
+        cache_args+=(-H "If-Modified-Since: ${LASTMOD_PER_URL[$url]}")
+    fi
+
     local rate
     rate=$(rand_rate)
+
+    # Дамп заголовков ответа во временный файл для парсинга ETag/Last-Modified.
+    local hdr_tmp
+    hdr_tmp=$(mktemp /tmp/.vps_noise_hdr.XXXXXX 2>/dev/null) || hdr_tmp="/dev/null"
+
     local args=(
         -s -o /dev/null
         --max-time 25 --connect-timeout 8
@@ -1751,24 +2114,78 @@ http_request() {
         --compressed
         --cookie-jar "$jar" --cookie "$jar"
         -A "$ua"
+        -D "$hdr_tmp"
         -H "Accept: $ACCEPT"
         -H "Accept-Language: $accept_lang"
         -H "Accept-Encoding: $ACCEPT_ENC"
         -H "Sec-Fetch-Dest: document"
         -H "Sec-Fetch-Mode: navigate"
-        -H "Sec-Fetch-Site: none"
+        -H "Sec-Fetch-Site: $sec_fetch_site"
+        -H "Sec-Fetch-User: ?1"
         -H "Upgrade-Insecure-Requests: 1"
         -H "Priority: u=0, i"
+        -H "DNT: 1"
         --limit-rate "${rate}K"
     )
+    args+=("${referer_arg[@]}")
+    args+=("${cache_args[@]}")
     if [ "$CURL_BIN" = "curl" ]; then
-        if (( RANDOM % 3 == 0 )) && curl --help all 2>/dev/null | grep -q -- '--http3'; then
+        if (( $(urand 0 2) == 0 )) && curl --help all 2>/dev/null | grep -q -- '--http3'; then
             args+=(--http3)
         else
             args+=(--http2)
         fi
     fi
-    "$CURL_BIN" "${args[@]}" "$url" 2>/dev/null || true
+
+    NOISE_REQ_TOTAL=$(( NOISE_REQ_TOTAL + 1 ))
+    NOISE_LAST_TS=$(date +%s)
+    if "$CURL_BIN" "${args[@]}" "$url" 2>/dev/null; then
+        NOISE_REQ_OK=$(( NOISE_REQ_OK + 1 ))
+    else
+        NOISE_REQ_ERR=$(( NOISE_REQ_ERR + 1 ))
+    fi
+    update_health
+
+    # Cache headers: парсим из ответа (берём чистые значения).
+    if [ -f "$hdr_tmp" ]; then
+        local etag lastmod
+        etag=$(awk -F': ' 'tolower($1)=="etag"{sub(/\r$/,"",$2); print $2; exit}' "$hdr_tmp" 2>/dev/null)
+        lastmod=$(awk -F': ' 'tolower($1)=="last-modified"{sub(/\r$/,"",$2); print $2; exit}' "$hdr_tmp" 2>/dev/null)
+        [ -n "$etag" ]    && ETAG_PER_URL[$url]="$etag"
+        [ -n "$lastmod" ] && LASTMOD_PER_URL[$url]="$lastmod"
+        rm -f "$hdr_tmp"
+    fi
+
+    LAST_URL_PER_TAG[$tag]="$url"
+}
+
+# ===== DNS prefetch — имитация браузерного DNS preconnect =====
+# Реальный браузер всегда резолвит host'ы заранее. Делаем дополнительный
+# trace через `getent` чтобы попасть в DNS-логи провайдера.
+dns_prefetch() {
+    local host
+    host=$(echo "$1" | awk -F/ '{print $3}')
+    [ -n "$host" ] && getent hosts "$host" >/dev/null 2>&1 || true
+}
+
+# ===== Cloud / NTP / metadata phantoms =====
+# Реальная Ubuntu периодически тянет NTP и cloud-init metadata. Ставим эти
+# запросы рандомно, чтобы trace выглядел нативно.
+cloud_phantom() {
+    local choice=$(( $(urand 0 99) ))
+    if (( choice < 40 )); then
+        # NTP запрос (UDP 123)
+        timeout 3 bash -c 'exec 3<>/dev/udp/time.ubuntu.com/123 && echo -ne "\x1b\x00\x00\x00" >&3 && sleep 0.5' 2>/dev/null || true
+    elif (( choice < 70 )); then
+        # apt-метаданные
+        http_request "http://archive.ubuntu.com/ubuntu/dists/noble/Release" desktop en cloud_phantom
+    elif (( choice < 90 )); then
+        # security-апдейты
+        http_request "http://security.ubuntu.com/ubuntu/dists/noble-security/Release" desktop en cloud_phantom
+    else
+        # snap refresh (просто HEAD без install)
+        http_request "https://api.snapcraft.io/v2/snaps/info/core24" desktop en cloud_phantom
+    fi
 }
 
 # ===== APNs keepalive =====
@@ -1981,19 +2398,40 @@ vacation_maybe_start() {
     fi
 }
 
-# ===== Профиль времени суток (множитель пауз) =====
+# ===== Профиль времени суток + «места» (множитель пауз) =====
+# PLACE_PROFILE: office (9-18 быстрые бёрсты), home (19-23 ютуб/новости),
+# auto — по часам.
 # Возвращает целочисленный множитель (в процентах) к базовому интервалу.
 hour_factor() {
-    local h
+    local h profile="${PLACE_PROFILE:-auto}"
     h=$(date +%H); h=$((10#$h))
+    case "$profile" in
+        office)
+            # «офис» — активность 9-18, минимальная остальное время
+            if (( h >= 9 && h <= 18 )); then echo 60
+            elif (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then echo 350
+            else echo 200; fi
+            return ;;
+        home)
+            # «дом» — пик вечером, лёгкая утренняя проверка
+            if (( h >= 19 && h <= 23 )); then echo 60
+            elif (( h >= 7 && h <= 9 )); then echo 80
+            elif (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then echo 300
+            else echo 130; fi
+            return ;;
+        always_on)
+            # 24/7 (сервер)
+            echo 100; return ;;
+    esac
+    # auto (default): кривая дня
     if (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then
-        echo 250                  # ночь — паузы в 2.5 раза длиннее
+        echo 250
     elif (( h >= PEAK_MORNING_FROM && h <= PEAK_MORNING_TO )); then
-        echo 60                   # утренний пик — короче
+        echo 60
     elif (( h >= PEAK_EVENING_FROM && h <= PEAK_EVENING_TO )); then
-        echo 70                   # вечерний пик
+        echo 70
     else
-        echo 100                  # день
+        echo 100
     fi
 }
 
@@ -2054,6 +2492,46 @@ loop_libdl() {
     done
 }
 
+# Cloud / NTP / metadata phantom — реальная Ubuntu всегда тянет эти эндпоинты в фоне.
+loop_cloud() {
+    while true; do
+        sleep_minutes "${CLOUD_PHANTOM_INTERVAL_MIN:-30}" "${CLOUD_PHANTOM_INTERVAL_MAX:-180}"
+        vacation_check_and_sleep
+        cloud_phantom
+    done
+}
+
+# DNS-prefetch loop: имитация браузерного DNS preconnect. Тихо, без HTTP.
+loop_dns_prefetch() {
+    while true; do
+        sleep "$(rrange 30 240)"
+        vacation_check_and_sleep
+        # Берём случайный URL из всех пулов и резолвим только host
+        local pool
+        case $(( $(urand 0 4) )) in
+            0) pool=("${URLS_IOS[@]}") ;;
+            1) pool=("${URLS_NEWS_RU[@]}") ;;
+            2) pool=("${URLS_IOS_RU_GOV[@]}") ;;
+            3) pool=("${URLS_GLOBAL[@]}") ;;
+            *) pool=("${URLS_LIB[@]}") ;;
+        esac
+        if [ "${#pool[@]}" -gt 0 ]; then
+            local url="${pool[$(urand 0 $(( ${#pool[@]} - 1 )) )]}"
+            dns_prefetch "$url"
+        fi
+    done
+}
+
+# Health-touch loop: каждые 30с обновляет TS в health.json (даже если другие
+# loops спят/в vacation), показывает что сервис живой.
+START_TS=$(date +%s)
+loop_health() {
+    while true; do
+        update_health
+        sleep 30
+    done
+}
+
 # Старт включённых модулей в фоне
 PIDS=()
 [ "$ENABLE_IOS_BURST"   = "1" ] && { loop_ios   & PIDS+=($!); }
@@ -2062,6 +2540,9 @@ PIDS=()
 [ "$ENABLE_NEWS"        = "1" ] && { loop_news  & PIDS+=($!); }
 [ "$ENABLE_APT_PHANTOM" = "1" ] && command -v apt-get >/dev/null 2>&1 && { loop_apt & PIDS+=($!); }
 [ "$ENABLE_LIB_PHANTOM" = "1" ] && { loop_libdl & PIDS+=($!); }
+[ "${ENABLE_CLOUD_PHANTOM:-1}" = "1" ] && { loop_cloud & PIDS+=($!); }
+[ "${ENABLE_DNS_PREFETCH:-1}"  = "1" ] && { loop_dns_prefetch & PIDS+=($!); }
+loop_health & PIDS+=($!)
 
 # Если ни один модуль не включён — спим, чтобы systemd не считал крах.
 if [ "${#PIDS[@]}" -eq 0 ]; then
@@ -2086,20 +2567,34 @@ Wants=network-online.target
 [Service]
 ExecStart=$NOISE_GEN_SCRIPT
 EnvironmentFile=-$NOISE_CONF
-Restart=always
-RestartSec=15
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
 Nice=15
 IOSchedulingClass=idle
 CPUWeight=20
 MemoryHigh=128M
 MemoryMax=256M
+TasksMax=64
 StandardOutput=null
 StandardError=null
 PrivateTmp=yes
 ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
 StateDirectory=vps-noise
-ReadWritePaths=/tmp /var/cache/apt /var/lib/apt /var/lib/vps-noise
+RuntimeDirectory=vps-noise
+RuntimeDirectoryMode=0750
+ReadWritePaths=/tmp /var/cache/apt /var/lib/apt /var/lib/vps-noise /run/vps-noise
 
 [Install]
 WantedBy=multi-user.target
@@ -2720,21 +3215,60 @@ print_status_dashboard() {
 #  Self-update / export / import
 # ===================================================================
 self_update() {
-    local tmp
+    local tmp tmp_sha new_sha cur_sha
     tmp=$(mktemp /tmp/.vps_optimizer_new.XXXXXX)
-    if curl -fsSL "$SELF_URL" -o "$tmp" && [ -s "$tmp" ]; then
-        if bash -n "$tmp" 2>/dev/null; then
-            chmod +x "$tmp"
-            mv "$tmp" "$SELF_PATH"
+    tmp_sha=$(mktemp /tmp/.vps_optimizer_new.XXXXXX.sha)
+
+    if ! curl -fsSL "$SELF_URL" -o "$tmp" || [ ! -s "$tmp" ]; then
+        rm -f "$tmp" "$tmp_sha"
+        echo -e "${RED}[!] Не удалось скачать $SELF_URL${NC}"
+        return 1
+    fi
+
+    # 1) bash syntax check
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp" "$tmp_sha"
+        echo -e "${RED}[!] Скачанная версия невалидна (syntax error) — обновление отменено.${NC}"
+        return 1
+    fi
+
+    # 2) SHA256 интегрити-проверка: пробуем скачать sidecar .sha256 (если есть в репе).
+    #    При отсутствии — продолжаем с warning (release без подписей).
+    if curl -fsSL "${SELF_URL}.sha256" -o "$tmp_sha" 2>/dev/null && [ -s "$tmp_sha" ]; then
+        new_sha=$(awk '{print $1}' "$tmp_sha")
+        cur_sha=$(file_sha256 "$tmp")
+        if [ -n "$new_sha" ] && [ -n "$cur_sha" ] && [ "$new_sha" != "$cur_sha" ]; then
+            rm -f "$tmp" "$tmp_sha"
+            echo -e "${RED}[!] SHA256 mismatch: ожидалось $new_sha, получено $cur_sha — отмена.${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}[+] SHA256 verified: $cur_sha${NC}"
+    else
+        echo -e "${GRAY}[i] sha256 sidecar не найден — пропускаем integrity check.${NC}"
+    fi
+
+    # 3) Backup текущей версии (если новый сломан — откатим).
+    local backup="${SELF_PATH}.bak"
+    cp -f "$SELF_PATH" "$backup" 2>/dev/null || true
+
+    chmod +x "$tmp"
+    if mv "$tmp" "$SELF_PATH"; then
+        # 4) Sanity-check: --help должна работать в новой версии
+        if "$SELF_PATH" --help >/dev/null 2>&1 || "$SELF_PATH" help >/dev/null 2>&1; then
+            rm -f "$tmp_sha" "$backup"
             echo -e "${GREEN}[+] Скрипт обновлён до последней версии: $SELF_PATH${NC}"
+            _audit self_update "ok new_sha=${cur_sha:-skipped}"
+            return 0
         else
-            rm -f "$tmp"
-            echo -e "${RED}[!] Скачанная версия невалидна — обновление отменено.${NC}"
+            cp -f "$backup" "$SELF_PATH" 2>/dev/null || true
+            rm -f "$tmp_sha"
+            echo -e "${RED}[!] Новая версия не запускается — откат к $backup.${NC}"
+            _audit self_update "rolled_back"
             return 1
         fi
     else
-        rm -f "$tmp"
-        echo -e "${RED}[!] Не удалось скачать $SELF_URL${NC}"
+        rm -f "$tmp" "$tmp_sha" "$backup"
+        echo -e "${RED}[!] Не удалось заменить $SELF_PATH${NC}"
         return 1
     fi
 }
@@ -2758,9 +3292,26 @@ export_config() {
         echo -e "${YELLOW}[!] Нечего экспортировать (apply ещё не запускался).${NC}"
         return 1
     fi
+
+    # Создаём manifest с версией формата (для backward-compat при import).
+    local manifest="/tmp/.vps_export_manifest.$$.json"
+    cat > "$manifest" <<MEOF
+{
+  "format_version": $EXPORT_FORMAT_VERSION,
+  "script_version": "$SCRIPT_VERSION",
+  "created_at": "$(date -u +%FT%TZ)",
+  "hostname": "$(hostname)",
+  "files": ["${files[*]}"]
+}
+MEOF
+    cp "$manifest" /tmp/.vps_export_manifest.json
+    files+=(/tmp/.vps_export_manifest.json)
+
     tar czf "$target" "${files[@]}" 2>/dev/null
+    rm -f "$manifest" /tmp/.vps_export_manifest.json
     echo -e "${GREEN}[+] Конфигурация выгружена в $target${NC}"
-    echo -e "${GRAY}    Включено файлов: ${#files[@]}${NC}"
+    echo -e "${GRAY}    Формат: v${EXPORT_FORMAT_VERSION}, файлов: ${#files[@]}${NC}"
+    _audit export "target=$target files=${#files[@]}"
 }
 
 import_config() {
@@ -2768,20 +3319,501 @@ import_config() {
     if [ ! -f "$src" ]; then
         echo -e "${RED}[!] Нет файла: $src${NC}"; return 1
     fi
-    tar xzf "$src" -C / 2>/dev/null && {
+
+    # B10: проверяем формат через manifest (если есть).
+    local manifest_data fmt_ver scr_ver
+    manifest_data=$(tar tzf "$src" 2>/dev/null | grep -m1 'vps_export_manifest.json' || true)
+    if [ -n "$manifest_data" ]; then
+        local extract_dir
+        extract_dir=$(mktemp -d /tmp/.vps_import.XXXXXX)
+        tar xzf "$src" -C "$extract_dir" tmp/.vps_export_manifest.json 2>/dev/null || true
+        local mf="$extract_dir/tmp/.vps_export_manifest.json"
+        if [ -f "$mf" ]; then
+            fmt_ver=$(awk -F'[: ,]' '/format_version/{print $4}' "$mf" 2>/dev/null | tr -d '"')
+            scr_ver=$(awk -F'"' '/script_version/{print $4}' "$mf" 2>/dev/null)
+            echo -e "${GRAY}[i] Архив: format=v${fmt_ver:-?}, script=v${scr_ver:-?}${NC}"
+            if [ -n "$fmt_ver" ] && [ "$fmt_ver" -gt "$EXPORT_FORMAT_VERSION" ]; then
+                echo -e "${RED}[!] Формат архива (v${fmt_ver}) новее, чем поддерживаемый (v${EXPORT_FORMAT_VERSION}).${NC}"
+                echo -e "${YELLOW}    Запусти './vps_optimizer.sh update' и попробуй снова.${NC}"
+                rm -rf "$extract_dir"
+                return 1
+            fi
+        fi
+        rm -rf "$extract_dir"
+    else
+        echo -e "${YELLOW}[i] Старый архив без manifest — импортируем как есть.${NC}"
+    fi
+
+    if tar xzf "$src" -C / 2>/dev/null; then
         echo -e "${GREEN}[+] Конфигурация импортирована.${NC}"
+        rm -f /tmp/.vps_export_manifest.json
         sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl restart vps-rps vps-noise 2>/dev/null || true
         echo -e "${GREEN}[+] Сервисы перезапущены.${NC}"
-    } || echo -e "${RED}[!] Распаковка не удалась.${NC}"
+        _audit import "src=$src fmt=${fmt_ver:-?} scr=${scr_ver:-?}"
+    else
+        echo -e "${RED}[!] Распаковка не удалась.${NC}"
+        return 1
+    fi
 }
 
 # ===================================================================
 #  CLI parser
 # ===================================================================
+# ===================================================================
+#  v8.2: status --json / logs / audit / harden / uninstall / noise-test
+# ===================================================================
+
+# JSON-эскейп для строковых значений.
+_json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//	/\\t}"
+    printf '"%s"' "$s"
+}
+
+# status --json: машиночитаемый вывод для cron / Grafana / Zabbix.
+status_json() {
+    local virt provider preset bbr qdisc rmem_max wmem_max
+    virt=$(detect_virt 2>/dev/null)
+    provider=$(detect_provider 2>/dev/null)
+    preset="balanced"; [ -f "$PRESET_FILE" ] && preset=$(cat "$PRESET_FILE" 2>/dev/null)
+    bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null)
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null)
+
+    local conntrack_count conntrack_max ct_used_pct
+    conntrack_count=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    conntrack_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
+    if [ "$conntrack_max" -gt 0 ] 2>/dev/null; then
+        ct_used_pct=$(( conntrack_count * 100 / conntrack_max ))
+    else
+        ct_used_pct=0
+    fi
+
+    local dns_state="local"
+    [ -f "$DNS_STATE" ] && dns_state=$(cat "$DNS_STATE" 2>/dev/null)
+
+    local noise_active="inactive" noise_health="{}"
+    if systemctl is-active vps-noise >/dev/null 2>&1; then noise_active="active"; fi
+    [ -f "$HEALTH_FILE" ] && noise_health=$(cat "$HEALTH_FILE" 2>/dev/null)
+
+    cat <<JEOF
+{
+  "version": "$SCRIPT_VERSION",
+  "virt": $(_json_str "$virt"),
+  "provider": $(_json_str "$provider"),
+  "preset": $(_json_str "$preset"),
+  "bbr": $(_json_str "$bbr"),
+  "qdisc": $(_json_str "$qdisc"),
+  "rmem_max": ${rmem_max:-0},
+  "wmem_max": ${wmem_max:-0},
+  "conntrack_count": ${conntrack_count:-0},
+  "conntrack_max": ${conntrack_max:-0},
+  "conntrack_used_pct": ${ct_used_pct:-0},
+  "dns": $(_json_str "$dns_state"),
+  "noise_active": $(_json_str "$noise_active"),
+  "noise_health": $noise_health
+}
+JEOF
+}
+
+# logs: показать журналы — собственный лог + journalctl + dmesg-сетевые события.
+view_logs() {
+    local n="${1:-100}"
+    echo -e "${CYAN}${BOLD}=== /var/log/vps-optimizer.log (последние $n строк) ===${NC}"
+    [ -f "$RUN_LOG" ] && tail -n "$n" "$RUN_LOG" || echo "(пусто)"
+    echo ""
+    echo -e "${CYAN}${BOLD}=== journalctl: vps-noise + vps-rps (последние $n) ===${NC}"
+    journalctl -u vps-noise -u vps-rps --no-pager -n "$n" 2>/dev/null || echo "(нет журналов)"
+    echo ""
+    echo -e "${CYAN}${BOLD}=== dmesg: TCP / conntrack / OOM ===${NC}"
+    dmesg 2>/dev/null | grep -iE 'tcp|conntrack|oom|killed' | tail -n "$n" || echo "(нет событий)"
+    echo ""
+    if [ -f "$AUDIT_LOG" ]; then
+        echo -e "${CYAN}${BOLD}=== $AUDIT_LOG ===${NC}"
+        tail -n 30 "$AUDIT_LOG"
+    fi
+}
+
+# audit: полная диагностика VPS — текущие vs ожидаемые sysctl, RPS, conntrack, etc.
+audit_command() {
+    print_status_dashboard
+    echo ""
+    echo -e "${CYAN}${BOLD}=== Глубокий audit ===${NC}"
+
+    # 1. Совпадает ли текущий sysctl с конфигом?
+    if [ -f "$SYSCTL_CONF" ]; then
+        local mismatched=0
+        echo -e "${BOLD}sysctl drift:${NC}"
+        while IFS='=' read -r key val; do
+            key=$(echo "$key" | xargs)
+            val=$(echo "$val" | xargs)
+            [ -z "$key" ] && continue
+            [ "${key:0:1}" = "#" ] && continue
+            local cur
+            cur=$(sysctl -n "$key" 2>/dev/null | xargs)
+            if [ -z "$cur" ]; then
+                continue
+            fi
+            if [ "$cur" != "$val" ]; then
+                echo -e "  ${YELLOW}DRIFT${NC} $key: ожидается '$val', текущее '$cur'"
+                mismatched=$(( mismatched + 1 ))
+            fi
+        done < "$SYSCTL_CONF"
+        if [ "$mismatched" -eq 0 ]; then
+            echo -e "  ${GREEN}OK${NC} все ключи совпадают"
+        fi
+    fi
+
+    # 2. RPS/XPS присутствие
+    echo -e "${BOLD}\nRPS/XPS:${NC}"
+    local found=0
+    for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
+        [ -e "$f" ] || continue
+        local v
+        v=$(cat "$f" 2>/dev/null)
+        if [ "$v" != "0" ] && [ "$v" != "00000000" ]; then
+            echo -e "  ${GREEN}OK${NC} $f = $v"
+            found=$(( found + 1 ))
+        fi
+    done
+    [ "$found" -eq 0 ] && echo -e "  ${YELLOW}WARN${NC} нет настроенных RPS-очередей"
+
+    # 3. Conntrack usage
+    local cc cm
+    cc=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    cm=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 1)
+    if [ "$cm" -gt 0 ]; then
+        local pct=$(( cc * 100 / cm ))
+        echo -e "${BOLD}\nConntrack:${NC} $cc / $cm (${pct}%)"
+        if [ "$pct" -gt 80 ]; then
+            echo -e "  ${RED}HIGH${NC} usage > 80% — увеличь nf_conntrack_max"
+        fi
+    fi
+
+    # 4. Дисковое место
+    echo -e "${BOLD}\nDisk:${NC}"
+    df -h / 2>/dev/null | tail -1
+
+    # 5. Swap usage
+    echo -e "${BOLD}\nSwap:${NC}"
+    swapon --show 2>/dev/null | sed 's/^/  /' || echo "  none"
+
+    # 6. dnscrypt-proxy listener
+    if systemctl is-active dnscrypt-proxy >/dev/null 2>&1; then
+        echo -e "${BOLD}\ndnscrypt-proxy:${NC} ${GREEN}active${NC}"
+        ss -lntu 2>/dev/null | grep -E ':53|:5300' | head -3 | sed 's/^/  /'
+    fi
+
+    # 7. Noise health
+    if [ -f "$HEALTH_FILE" ]; then
+        echo -e "${BOLD}\nNoise health:${NC}"
+        cat "$HEALTH_FILE"
+    fi
+
+    # 8. Audit-log size
+    if [ -f "$AUDIT_LOG" ]; then
+        local sz lines
+        sz=$(stat -c%s "$AUDIT_LOG" 2>/dev/null || echo 0)
+        lines=$(wc -l < "$AUDIT_LOG" 2>/dev/null || echo 0)
+        echo -e "${BOLD}\nAudit log:${NC} $sz байт, $lines записей"
+    fi
+}
+
+# noise test --once: запустить один цикл без записи в systemd
+noise_test() {
+    if [ ! -f "$NOISE_GEN_SCRIPT" ]; then
+        echo -e "${RED}[!] $NOISE_GEN_SCRIPT не существует — сначала запусти 'noise on'${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}[*] Однократный прогон шумогенератора (test mode):${NC}"
+    # Запускаем bash-скрипт с переменной NOISE_TEST_ONCE — он должен прочитать
+    # и сделать один цикл. Текущий скрипт это не поддерживает на 100%, поэтому
+    # делаем простую версию: показать какие профили включены и запустить ios_burst.
+    (
+        # shellcheck source=/dev/null
+        [ -f "$NOISE_CONF" ] && set -a && . "$NOISE_CONF" && set +a
+        echo "  PROFILE=${PROFILE:-?}"
+        echo "  ENABLE_IOS_BURST=${ENABLE_IOS_BURST:-?}"
+        echo "  ENABLE_NEWS=${ENABLE_NEWS:-?}"
+        echo "  ENABLE_EMAIL=${ENABLE_EMAIL:-?}"
+        echo "  ENABLE_LIB_PHANTOM=${ENABLE_LIB_PHANTOM:-?}"
+        echo "  ENABLE_CLOUD_PHANTOM=${ENABLE_CLOUD_PHANTOM:-?}"
+        echo "  PLACE_PROFILE=${PLACE_PROFILE:-auto}"
+        echo "  Текущий hour_factor: $(date +%H)h"
+    )
+    echo ""
+    echo -e "${GRAY}[i] Реальный прогон производится сервисом vps-noise.service.${NC}"
+    echo -e "${GRAY}    Чтобы увидеть live-трафик: journalctl -u vps-noise -f${NC}"
+}
+
+# uninstall: удалить ВСЁ — конфиги, скрипты, сервисы. Ставит точку.
+uninstall_command() {
+    echo -e "${RED}${BOLD}=== UNINSTALL ===${NC}"
+    echo -e "${YELLOW}Это удалит:${NC}"
+    echo "  - Все sysctl/limits конфиги"
+    echo "  - vps-noise.service, vps-rps.service"
+    echo "  - $NOISE_GEN_SCRIPT, $RPS_BOOT_SCRIPT"
+    echo "  - $AUDIT_LOG, $RUN_LOG, $DEBUG_LOG"
+    echo "  - $SNAPSHOT_DIR/, /var/lib/vps-noise/"
+    echo "  - сам скрипт $SELF_PATH"
+    echo ""
+    if [ "$FORCE" != "1" ]; then
+        read -r -p "Подтверди (yes для удаления): " confirm
+        [ "$confirm" = "yes" ] || { echo "Отменено."; return 0; }
+    fi
+
+    # 1) Сначала reset (откатывает все настройки)
+    reset_all
+
+    # 2) Удаляем audit/run/debug-логи и снапшоты
+    rm -f "$AUDIT_LOG" "$RUN_LOG" "$DEBUG_LOG"
+    rm -rf "$SNAPSHOT_DIR" /var/lib/vps-noise /run/vps-noise
+
+    # 3) Удаляем сам скрипт
+    if [ -f "$SELF_PATH" ]; then
+        rm -f "$SELF_PATH" "${SELF_PATH}.bak"
+        echo -e "${GREEN}[+] $SELF_PATH удалён.${NC}"
+    fi
+
+    _audit uninstall "complete"
+    echo -e "${GREEN}${BOLD}[+] Uninstall завершён.${NC}"
+}
+
+# harden: включить opt-in security (UFW + SSH-baseline + unattended-upgrades).
+# НЕ затрагивает базовый apply — это отдельная команда.
+harden_command() {
+    local target="${1:-all}"
+    case "$target" in
+        ufw|firewall)        harden_ufw ;;
+        ssh)                 harden_ssh ;;
+        upgrades|unattended) harden_unattended_upgrades ;;
+        all)                 harden_ufw; harden_ssh; harden_unattended_upgrades ;;
+        *)
+            echo -e "${YELLOW}harden: укажи цель${NC}"
+            echo "  harden ssh        — SSH baseline (MaxAuthTries, LoginGraceTime, banner)"
+            echo "  harden ufw        — UFW preset (allow ssh + deny incoming default)"
+            echo "  harden upgrades   — unattended-upgrades security-only"
+            echo "  harden all        — всё сразу"
+            return 1
+            ;;
+    esac
+    _audit harden "target=$target"
+}
+
+harden_ufw() {
+    if ! command -v ufw >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -yq ufw >/dev/null
+        else
+            echo -e "${RED}[!] ufw не установлен и apt недоступен.${NC}"; return 1
+        fi
+    fi
+    echo -e "${CYAN}[*] Настраиваем UFW${NC}"
+    ufw --force reset >/dev/null 2>&1 || true
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    # SSH (порт из sshd_config)
+    local ssh_port
+    ssh_port=$(awk '/^Port[[:space:]]/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+    [ -z "$ssh_port" ] && ssh_port=22
+    ufw allow "$ssh_port"/tcp comment 'SSH' >/dev/null 2>&1
+    # ICMP
+    sed -i '/^-A ufw-before-input -p icmp/d' /etc/ufw/before.rules 2>/dev/null || true
+    ufw --force enable >/dev/null 2>&1 || true
+    echo -e "${GREEN}[+] UFW активирован, разрешён SSH на порту $ssh_port.${NC}"
+}
+
+harden_ssh() {
+    local sshd_cfg=/etc/ssh/sshd_config
+    [ -f "$sshd_cfg" ] || { echo -e "${YELLOW}[!] $sshd_cfg отсутствует — пропуск.${NC}"; return 0; }
+    local drop=/etc/ssh/sshd_config.d/99-vps-optimizer-harden.conf
+    mkdir -p "$(dirname "$drop")" 2>/dev/null
+    cat > "$drop" <<SEOF
+# v8.2 SSH baseline (vps_optimizer harden ssh)
+MaxAuthTries 3
+LoginGraceTime 20
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+Banner /etc/issue.net
+SEOF
+    cat > /etc/issue.net <<'BEOF'
+**********************************************************************
+*  Authorized access only. All activity is logged and monitored.     *
+*  Disconnect IMMEDIATELY if you are not an authorized user.         *
+**********************************************************************
+BEOF
+    if sshd -t 2>/dev/null; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+        echo -e "${GREEN}[+] SSH baseline применён ($drop)${NC}"
+    else
+        rm -f "$drop"
+        echo -e "${RED}[!] sshd -t не прошёл — конфиг откачен.${NC}"
+        return 1
+    fi
+}
+
+harden_unattended_upgrades() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] apt не найден — пропуск unattended-upgrades.${NC}"; return 0
+    fi
+    apt-get install -yq unattended-upgrades apt-listchanges >/dev/null 2>&1 || true
+    cat > /etc/apt/apt.conf.d/52unattended-upgrades-vps <<'UEOF'
+// v8.2: security-only unattended-upgrades (vps_optimizer harden upgrades)
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+UEOF
+    cat > /etc/apt/apt.conf.d/20auto-upgrades-vps <<'AEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AEOF
+    systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+    echo -e "${GREEN}[+] unattended-upgrades активирован (только security).${NC}"
+}
+
+# ===================================================================
+#  v8.2: Prometheus exporter / autotune-stub / compare-baseline
+# ===================================================================
+
+# Prometheus-формат текстовых метрик. Печатает на stdout, использовать с
+# socat/nc/python3 -m http.server для экспонирования на порт 9777.
+prom_metrics() {
+    local virt provider preset bbr qdisc rmem_max wmem_max
+    virt=$(detect_virt 2>/dev/null)
+    provider=$(detect_provider 2>/dev/null)
+    preset="balanced"; [ -f "$PRESET_FILE" ] && preset=$(cat "$PRESET_FILE" 2>/dev/null)
+    bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+
+    local cc cm
+    cc=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    cm=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
+
+    local active=0
+    systemctl is-active vps-noise >/dev/null 2>&1 && active=1
+
+    local req_total=0 req_ok=0 req_err=0
+    if [ -f "$HEALTH_FILE" ]; then
+        req_total=$(awk -F'[: ,]+' '/requests_total/{print $3; exit}' "$HEALTH_FILE" 2>/dev/null)
+        req_ok=$(awk -F'[: ,]+' '/requests_ok/{print $3; exit}' "$HEALTH_FILE" 2>/dev/null)
+        req_err=$(awk -F'[: ,]+' '/requests_error/{print $3; exit}' "$HEALTH_FILE" 2>/dev/null)
+    fi
+
+    cat <<PEOF
+# HELP vps_optimizer_info Static info labels.
+# TYPE vps_optimizer_info gauge
+vps_optimizer_info{version="$SCRIPT_VERSION",virt="$virt",provider="$provider",preset="$preset",bbr="$bbr",qdisc="$qdisc"} 1
+# HELP vps_optimizer_rmem_max sysctl net.core.rmem_max
+# TYPE vps_optimizer_rmem_max gauge
+vps_optimizer_rmem_max ${rmem_max:-0}
+# HELP vps_optimizer_wmem_max sysctl net.core.wmem_max
+# TYPE vps_optimizer_wmem_max gauge
+vps_optimizer_wmem_max ${wmem_max:-0}
+# HELP vps_conntrack_count Current netfilter conntrack count
+# TYPE vps_conntrack_count gauge
+vps_conntrack_count ${cc:-0}
+# HELP vps_conntrack_max sysctl net.netfilter.nf_conntrack_max
+# TYPE vps_conntrack_max gauge
+vps_conntrack_max ${cm:-0}
+# HELP vps_noise_active Whether vps-noise.service is active (1=yes).
+# TYPE vps_noise_active gauge
+vps_noise_active $active
+# HELP vps_noise_requests_total Total HTTP requests issued by vps-noise.
+# TYPE vps_noise_requests_total counter
+vps_noise_requests_total ${req_total:-0}
+# HELP vps_noise_requests_ok Successful HTTP requests.
+# TYPE vps_noise_requests_ok counter
+vps_noise_requests_ok ${req_ok:-0}
+# HELP vps_noise_requests_error Failed HTTP requests.
+# TYPE vps_noise_requests_error counter
+vps_noise_requests_error ${req_err:-0}
+PEOF
+}
+
+# Простой Prometheus exporter на порту 9777 — поднимается в foreground,
+# принимает HTTP GET /metrics и /, отдаёт prom-метрики.
+prom_serve() {
+    local port="${1:-9777}"
+    if ! command -v socat >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] Нужен socat: apt install -y socat${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] Prometheus exporter на :${port}${NC}"
+    _audit prom_serve "port=$port"
+    while true; do
+        socat -T 5 TCP-LISTEN:"$port",reuseaddr,fork SYSTEM:"$0 _prom_handler" 2>/dev/null
+        sleep 1
+    done
+}
+
+# Внутренний обработчик одного HTTP-запроса для prom_serve.
+_prom_handler() {
+    local _req _hline
+    read -r _req
+    while read -r _hline; do
+        _hline=${_hline%$'\r'}
+        [ -z "$_hline" ] && break
+    done
+    local body
+    body=$(prom_metrics)
+    local len=${#body}
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "$len" "$body"
+}
+
+# compare-baseline: примитивный benchmark before/after. Сохраняет ping/throughput
+# в файл, при последующем запуске показывает разницу.
+COMPARE_FILE="/var/lib/vps-optimizer/baseline.txt"
+
+run_compare_baseline() {
+    mkdir -p "$(dirname "$COMPARE_FILE")" 2>/dev/null
+    local target="${1:-1.1.1.1}"
+    local rtt
+    rtt=$(ping -c 5 -q -W 1 "$target" 2>/dev/null | awk -F/ '/^rtt|^round-trip/{print $5}')
+    if [ -z "$rtt" ]; then
+        echo -e "${RED}[!] Ping до $target не удался${NC}"; return 1
+    fi
+    if [ -f "$COMPARE_FILE" ]; then
+        local old
+        old=$(awk -F= '/^rtt_avg/{print $2}' "$COMPARE_FILE" 2>/dev/null)
+        echo -e "${BOLD}Сравнение с baseline:${NC}"
+        echo "  baseline rtt_avg = $old ms"
+        echo "  current  rtt_avg = $rtt ms"
+        if [ -n "$old" ]; then
+            local diff
+            diff=$(awk -v a="$old" -v b="$rtt" 'BEGIN{printf "%.2f", b-a}')
+            echo "  diff             = $diff ms"
+        fi
+    else
+        echo "Создаём новый baseline для $target..."
+    fi
+    cat > "$COMPARE_FILE" <<EOF
+ts=$(date -u +%FT%TZ)
+target=$target
+rtt_avg=$rtt
+EOF
+    echo -e "${GREEN}[+] Baseline сохранён: $COMPARE_FILE${NC}"
+}
+
 print_cli_help() {
-    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.1.1 PHOENIX-Z+"
+    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v8.2 PHOENIX-Z++"
     cat <<EOF
 
 USAGE:
@@ -2791,10 +3823,12 @@ USAGE:
 COMMANDS:
     install                  Установить компоненты Phoenix
     apply [--preset NAME]    Применить sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)
-    status                   Показать дашборд состояния
+    status [--json]          Показать дашборд состояния (или JSON для машин)
     self-test                Перепроверить применённые настройки
+    audit                    Глубокая диагностика (drift, conntrack, RPS, dnscrypt-proxy)
+    logs [N]                 Последние N строк журнала (run/journalctl/dmesg/audit)
     preset <name>            Сохранить пресет на будущие apply
-    noise on|off|edit|status Управление шумогенератором
+    noise on|off|edit|test|status   Управление шумогенератором
     dns ...                  Управление DNS:
                                dns                                   # статус
                                dns local                             # вернуть провайдер.
@@ -2805,26 +3839,56 @@ COMMANDS:
                              doh = 443/HTTPS (через dnscrypt-proxy, ставится автоматически)
     swap <gb>                Создать swap-файл указанного размера в ГБ
     benchmark                Замерить пинг до набора популярных endpoints
+    compare [target]         Сохранить ping baseline / показать diff (default: 1.1.1.1)
+    harden ssh|ufw|upgrades|all   Opt-in security (НЕ меняет дефолт apply)
+    prom-metrics             Сдампить Prometheus-метрики на stdout
+    prom-serve [port]        Поднять Prometheus exporter (default port 9777)
     reset                    Полный откат всех изменений
-    export [path.tar.gz]     Выгрузить все конфиги в архив
-    import <path.tar.gz>     Накатить выгруженные конфиги
-    update                   Обновить скрипт до последней версии (GitHub main)
+    uninstall                Полное удаление: сбрасывает + сносит сам скрипт
+    export [path.tar.gz]     Выгрузить все конфиги в архив (с manifest)
+    import <path.tar.gz>     Накатить выгруженные конфиги (с проверкой версии)
+    update                   Обновить скрипт (с SHA256 verification)
     help                     Эта справка
 
 GLOBAL FLAGS:
     --dry-run                Только показать, что бы изменилось
-    --quiet                  Минимум вывода (для скриптов/cron)
+    --quiet, -q              Минимум вывода (для скриптов/cron)
+    --debug                  Подробный лог в $DEBUG_LOG
+    --force                  Игнорировать lock / подтверждения
     --preset NAME            Использовать конкретный пресет (см. apply)
+    --impersonate            Использовать curl-impersonate в шуме (если установлен)
+    --ecmp                   Включить ECMP/multipath (для multi-NIC bare-metal)
+    --json                   Вывод в JSON (для status)
 
 EXAMPLES:
     sudo ./vps_optimizer.sh apply --preset proxy
-    sudo ./vps_optimizer.sh noise on
-    sudo ./vps_optimizer.sh status
-    sudo ./vps_optimizer.sh apply --dry-run
+    sudo ./vps_optimizer.sh apply --dry-run --debug
+    sudo ./vps_optimizer.sh status --json
+    sudo ./vps_optimizer.sh logs 200
+    sudo ./vps_optimizer.sh audit
+    sudo ./vps_optimizer.sh harden all
+    sudo ./vps_optimizer.sh compare 1.1.1.1
+    sudo ./vps_optimizer.sh prom-serve 9777 &
+
+CONFIG FILES:
+    $SYSCTL_CONF
+    $LIMITS_CONF
+    $NOISE_CONF
+    $DNS_CONF
+    $PRESET_FILE
+
+LOGS:
+    $RUN_LOG     — основной лог
+    $AUDIT_LOG   — append-only audit-log всех mutating-команд
+    $DEBUG_LOG   — детальный лог sysctl/sysfs (--debug)
+
+SEE ALSO:
+    https://github.com/lpxqwkjd65rjfn-dot/noble-net-warp
 EOF
 }
 
 cli_dispatch() {
+    CLI_MODE=1
     local cmd="$1"; shift || true
     # Парсим глобальные флаги независимо от позиции
     local args=()
@@ -2832,6 +3896,11 @@ cli_dispatch() {
         case "$1" in
             --dry-run) DRY_RUN=1 ;;
             --quiet|-q) QUIET=1 ;;
+            --debug) DEBUG=1 ;;
+            --force) FORCE=1 ;;
+            --json) JSON=1 ;;
+            --impersonate) IMPERSONATE=1 ;;
+            --ecmp) ECMP=1 ;;
             --preset)  PRESET="$2"; shift ;;
             --preset=*) PRESET="${1#*=}" ;;
             *)         args+=("$1") ;;
@@ -2842,7 +3911,21 @@ cli_dispatch() {
     case "$cmd" in
         install)        install_dependencies ;;
         apply|optimize) apply_optimizations ;;
-        status)         print_status_dashboard ;;
+        status)
+            if [ "$JSON" = "1" ]; then
+                status_json
+            else
+                print_status_dashboard
+            fi
+            ;;
+        logs)           view_logs "${args[0]:-100}" ;;
+        audit)          audit_command ;;
+        compare)        run_compare_baseline "${args[0]:-1.1.1.1}" ;;
+        harden)         harden_command "${args[0]:-all}" ;;
+        uninstall)      uninstall_command ;;
+        prom-metrics)   prom_metrics ;;
+        prom-serve)     prom_serve "${args[0]:-9777}" ;;
+        _prom_handler)  _prom_handler ;;
         self-test)
             apply_optimizations >/dev/null
             self_test
@@ -2861,16 +3944,24 @@ cli_dispatch() {
                 on|start)
                     [ -f "$NOISE_CONF" ] || write_default_noise_conf
                     deploy_noise_generator
+                    _audit noise "action=on"
                     echo -e "${GREEN}[+] vps-noise.service запущен.${NC}"
                     ;;
                 off|stop)
                     systemctl stop vps-noise 2>/dev/null
                     systemctl disable vps-noise 2>/dev/null
+                    _audit noise "action=off"
                     echo -e "${YELLOW}[*] vps-noise.service остановлен.${NC}"
                     ;;
                 edit)
                     [ -f "$NOISE_CONF" ] || write_default_noise_conf
                     "${EDITOR:-nano}" "$NOISE_CONF"
+                    ;;
+                test)
+                    noise_test
+                    ;;
+                health)
+                    [ -f "$HEALTH_FILE" ] && cat "$HEALTH_FILE" || echo "no health data yet"
                     ;;
                 status|*)
                     if systemctl is-active --quiet vps-noise; then
@@ -2879,6 +3970,7 @@ cli_dispatch() {
                         echo -e "vps-noise: ${GRAY}inactive${NC}"
                     fi
                     [ -f "$NOISE_CONF" ] && grep -E '^[A-Z_]+=' "$NOISE_CONF" | head -20
+                    [ -f "$HEALTH_FILE" ] && { echo ""; echo "Health:"; cat "$HEALTH_FILE"; }
                     ;;
             esac
             ;;
@@ -3040,13 +4132,22 @@ main_menu() {
 # ===================================================================
 
 if [ $# -gt 0 ]; then
-    # help/status — без проверки root, остальные команды требуют sudo
+    CLI_MODE=1
+    # help/status/version/prom-metrics — без проверки root, остальные команды требуют sudo
     case "$1" in
         help|-h|--help) print_cli_help; exit 0 ;;
+        version|--version|-V) echo "vps_optimizer.sh v$SCRIPT_VERSION"; exit 0 ;;
         status)
+            shift
+            # Поддержка --json без root
+            for a in "$@"; do
+                [ "$a" = "--json" ] && { status_json; exit 0; }
+            done
             print_status_dashboard
             exit 0
             ;;
+        prom-metrics) prom_metrics; exit 0 ;;
+        _prom_handler) _prom_handler; exit 0 ;;
     esac
     check_root
     cli_dispatch "$@"

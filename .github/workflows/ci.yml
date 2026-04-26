@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n on host script
+        run: bash -n vps_optimizer.sh
+
+      - name: shellcheck on host script
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yq shellcheck
+          shellcheck -S warning vps_optimizer.sh
+
+      - name: extract embedded noise generator
+        run: |
+          awk '/cat > "\$NOISE_GEN_SCRIPT" <<'\''NOISE_EOF'\''/{f=1;next} f && /^NOISE_EOF$/{f=0} f' \
+              vps_optimizer.sh > /tmp/noise_gen.sh
+          test -s /tmp/noise_gen.sh
+
+      - name: bash -n on noise generator
+        run: bash -n /tmp/noise_gen.sh
+
+      - name: shellcheck on noise generator
+        run: shellcheck -S warning /tmp/noise_gen.sh
+
+      - name: smoke-test CLI (no-root paths)
+        run: |
+          ./vps_optimizer.sh version
+          ./vps_optimizer.sh --help > /dev/null
+          ./vps_optimizer.sh status --json | jq -e .
+          ./vps_optimizer.sh prom-metrics > /dev/null
