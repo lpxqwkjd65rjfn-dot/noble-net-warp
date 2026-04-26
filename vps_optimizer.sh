@@ -884,15 +884,21 @@ apply_thp() {
     # ест CPU). Скорость merge — sleep_millisecs=200 (мягкий, default 20).
     local virt
     virt=$(detect_virt)
-    case "$virt" in
-        kvm|xen|hyperv|microsoft|vmware)
-            if sysfs_safe /sys/kernel/mm/ksm/run 1; then
-                _log OK "${GREEN}[+] KSM=on (sleep_millisecs=200)${NC}"
-                sysfs_safe /sys/kernel/mm/ksm/sleep_millisecs 200
-                sysfs_safe /sys/kernel/mm/ksm/pages_to_scan 1000
-            fi
-            ;;
-    esac
+    # v8.5: KSM ставим только под preset=proxy в виртуализации.
+    # На balanced/web KSM ест CPU непрерывным сканированием — это меняет default
+    # apply behaviour (CONTRIBUTING #5). Прокси-нагрузки сами решают что 5-15%
+    # экономия RAM выгоднее CPU-overhead.
+    if [ "$PRESET_NAME" = "proxy" ]; then
+        case "$virt" in
+            kvm|xen|hyperv|microsoft|vmware)
+                if sysfs_safe /sys/kernel/mm/ksm/run 1; then
+                    _log OK "${GREEN}[+] KSM=on (sleep_millisecs=200)${NC}"
+                    sysfs_safe /sys/kernel/mm/ksm/sleep_millisecs 200
+                    sysfs_safe /sys/kernel/mm/ksm/pages_to_scan 1000
+                fi
+                ;;
+        esac
+    fi
 }
 
 # I/O scheduler: для NVMe — none, для SSD — mq-deadline. Плюс readahead.
@@ -5055,7 +5061,10 @@ backup_config_command() {
     fi
     local archive
     archive="/tmp/vps-optimizer-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+    # v8.5: --ignore-failed-read — некоторые файлы могут отсутствовать (например
+    # noise не запущен → нет /etc/vps-noise.conf), это нормально, не считаем за fail.
     tar czf "$archive" -C / \
+        --ignore-failed-read \
         etc/sysctl.d/99-vps-optimizer.conf \
         etc/security/limits.d/99-vps-limits.conf \
         etc/vps-noise.conf \
