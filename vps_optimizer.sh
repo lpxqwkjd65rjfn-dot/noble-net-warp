@@ -1009,22 +1009,21 @@ apply_sysctls() {
     sysctl_safe net.core.bpf_jit_kallsyms 1
     sysctl_safe net.core.bpf_jit_harden 1
 
-    # v8.5: io_uring — современный async-IO API. Default disabled на некоторых
-    # secure-конфигах (Ubuntu 22.04+ disable=2 в LSM). Включаем (=0) ТОЛЬКО для
-    # preset=proxy — потому что:
-    #   - проксы (sing-box/h2o) реально используют io_uring и получают +20-40% throughput;
-    #   - на hardened/web-серверах io_uring имеет шлейф CVE'ов, по умолчанию отключён
-    #     не зря (CONTRIBUTING rule #5: не меняем default apply без opt-in);
-    # Балансед/web preset'ы не трогают этот knob.
-    if [ "$PRESET" = "proxy" ]; then
+    # v8.5: io_uring и scheduler tuning — ТОЛЬКО для preset=proxy.
+    # Используем $PRESET_NAME (resolved preset из preset_balanced/proxy/web), а не
+    # $PRESET (CLI arg, может быть пустой если preset загружен из файла).
+    # CONTRIBUTING rule #5: default apply (balanced/web) не трогает security-sensitive
+    # и latency-sensitive ядерные knob'ы.
+    if [ "$PRESET_NAME" = "proxy" ]; then
+        # io_uring — современный async-IO API. Default disabled на secure-конфигах
+        # (Ubuntu 22.04+ disable=2 в LSM). Прокси (sing-box/h2o) умеют — +20-40% throughput.
         sysctl_safe kernel.io_uring_disabled 0
+        # sched_min_granularity_ns=10ms (default 1.5ms) — больше CPU-time per task,
+        # меньше context-switch overhead. На balanced/web ставить не нужно — они хотят
+        # низкую latency, а 6.7x granularity её ухудшит.
+        sysctl_safe kernel.sched_min_granularity_ns 10000000
+        sysctl_safe kernel.sched_wakeup_granularity_ns 15000000
     fi
-
-    # v8.5: scheduler tuning для CPU-bound прокси.
-    # sched_min_granularity_ns=10ms (default 1.5ms) — больше CPU-time per task,
-    # меньше context-switch overhead. sched_wakeup_granularity_ns=15ms.
-    sysctl_safe kernel.sched_min_granularity_ns 10000000
-    sysctl_safe kernel.sched_wakeup_granularity_ns 15000000
 
     # NAPI defer (Linux 5.12+)
     if [ "$kvi" -ge 51200 ]; then
@@ -3177,8 +3176,16 @@ reset_all() {
     systemctl stop vps-noise vps-rps dnsmasq >/dev/null 2>&1 || true
     systemctl disable vps-noise vps-rps >/dev/null 2>&1 || true
     systemctl disable --now vps-optimizer-apply.service >/dev/null 2>&1 || true
+    # v8.5: cleanup health-watch таймера и rsyslog-фрагмента (created by
+    # health_watch_command / audit_syslog_command). Иначе после reset/uninstall
+    # таймер продолжает дёргать удалённый скрипт и мусорит в health.log.
+    systemctl disable --now vps-optimizer-health.timer >/dev/null 2>&1 || true
     rm -f "$NOISE_GEN_SCRIPT" "$NOISE_GEN_SERVICE" "$RPS_BOOT_SCRIPT" "$RPS_BOOT_SERVICE" \
-          /etc/systemd/system/vps-optimizer-apply.service
+          /etc/systemd/system/vps-optimizer-apply.service \
+          /etc/systemd/system/vps-optimizer-health.timer \
+          /etc/systemd/system/vps-optimizer-health.service \
+          /etc/rsyslog.d/49-vps-optimizer.conf
+    systemctl restart rsyslog >/dev/null 2>&1 || true
     rm -rf /tmp/.vps_noise /var/lib/vps-noise
     systemctl daemon-reload >/dev/null 2>&1 || true
     sysctl --system >/dev/null 2>&1 || true
