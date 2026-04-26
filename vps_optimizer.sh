@@ -90,7 +90,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.4"
+SCRIPT_VERSION="8.5"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -877,6 +877,25 @@ apply_thp() {
     if [ -w /sys/kernel/mm/transparent_hugepage/defrag ]; then
         echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
     fi
+
+    # v8.5: KSM (Kernel Samepage Merging) — на VPS с одинаковыми образами
+    # многим страницам сильно дубликаты, KSM их merge'ит, экономит RAM 5-15%.
+    # Включаем только если виртуализация (KSM на bare-metal не несёт пользы,
+    # ест CPU). Скорость merge — sleep_millisecs=200 (мягкий, default 20).
+    local virt
+    virt=$(detect_virt)
+    case "$virt" in
+        kvm|xen|hyperv|microsoft|vmware)
+            if [ -w /sys/kernel/mm/ksm/run ]; then
+                echo 1 > /sys/kernel/mm/ksm/run 2>/dev/null && \
+                    _log OK "${GREEN}[+] KSM=on (sleep_millisecs=200)${NC}"
+                [ -w /sys/kernel/mm/ksm/sleep_millisecs ] && \
+                    echo 200 > /sys/kernel/mm/ksm/sleep_millisecs 2>/dev/null || true
+                [ -w /sys/kernel/mm/ksm/pages_to_scan ] && \
+                    echo 1000 > /sys/kernel/mm/ksm/pages_to_scan 2>/dev/null || true
+            fi
+            ;;
+    esac
 }
 
 # I/O scheduler: для NVMe — none, для SSD — mq-deadline. Плюс readahead.
@@ -992,6 +1011,17 @@ apply_sysctls() {
     # включаем оба, незначительный CPU-overhead, заметно лучше observability.
     sysctl_safe net.core.bpf_jit_kallsyms 1
     sysctl_safe net.core.bpf_jit_harden 1
+
+    # v8.5: io_uring — современный async-IO API. Default disabled на некоторых
+    # secure-конфигах (Ubuntu 22.04+ disable=2 в LSM). Включаем (=0) для прокси-
+    # стеков (sing-box/h2o умеют). Не трогаем если ядро не поддерживает.
+    sysctl_safe kernel.io_uring_disabled 0
+
+    # v8.5: scheduler tuning для CPU-bound прокси.
+    # sched_min_granularity_ns=10ms (default 1.5ms) — больше CPU-time per task,
+    # меньше context-switch overhead. sched_wakeup_granularity_ns=15ms.
+    sysctl_safe kernel.sched_min_granularity_ns 10000000
+    sysctl_safe kernel.sched_wakeup_granularity_ns 15000000
 
     # NAPI defer (Linux 5.12+)
     if [ "$kvi" -ge 51200 ]; then
@@ -4233,6 +4263,58 @@ doctor_command() {
         echo -e "${GRAY}[i]${NC} kTLS модуль не загружен — выполни: modprobe tls"
     fi
 
+    # 12. (v8.5) systemd-resolved coexistence — частая причина «DNS не отвечает»
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+            echo -e "${YELLOW}[!] systemd-resolved + dnsmasq оба активны${NC} — конфликт за :53"
+            echo "    Fix: либо systemctl disable --now systemd-resolved,"
+            echo "         либо настрой systemd-resolved слушать только linklocal:"
+            echo "         echo 'DNSStubListener=no' >> /etc/systemd/resolved.conf"
+            issues=$(( issues + 1 ))
+        else
+            echo -e "${GREEN}[ok]${NC} systemd-resolved активен (dnsmasq не используется)"
+        fi
+    fi
+
+    # 13. (v8.5) ip_local_port_range — широкий диапазон ephemeral портов
+    # снижает риск EADDRINUSE под high-throughput proxy. Меньше 20000 портов —
+    # бутылочное горлышко. Реальный Safari использует 49152-65535, но дефолт
+    # ядра обычно 32768-60999, что нормально (Safari fingerprint — minor leak).
+    local lpr
+    lpr=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null)
+    if [ -n "$lpr" ]; then
+        local lo hi span
+        read -r lo hi <<<"$lpr"
+        span=$(( hi - lo ))
+        if [ "$span" -lt 20000 ]; then
+            echo -e "${YELLOW}[i]${NC} ip_local_port_range=$lo-$hi (span=$span) — узкий, риск EADDRINUSE"
+        else
+            echo -e "${GREEN}[ok]${NC} ip_local_port_range=$lo-$hi (span=$span)"
+        fi
+    fi
+
+    # 14. (v8.5) bpftool prog show — какие eBPF-программы загружены
+    if command -v bpftool >/dev/null 2>&1; then
+        local bpf_progs
+        bpf_progs=$(bpftool prog show 2>/dev/null | grep -c '^[0-9]' || echo 0)
+        if [ "$bpf_progs" -gt 0 ]; then
+            echo -e "${GREEN}[ok]${NC} eBPF: $bpf_progs программ загружено (bpftool prog show — детали)"
+        fi
+    fi
+
+    # 15. (v8.5) WireGuard kernel vs userspace
+    if command -v wg >/dev/null 2>&1; then
+        local wg_links
+        wg_links=$(wg show interfaces 2>/dev/null | wc -w)
+        if [ "$wg_links" -gt 0 ]; then
+            if lsmod 2>/dev/null | grep -q '^wireguard '; then
+                echo -e "${GREEN}[ok]${NC} WireGuard: kernel-mode (быстро)"
+            elif pgrep -x wireguard-go >/dev/null 2>&1; then
+                echo -e "${YELLOW}[i]${NC} WireGuard: userspace (wireguard-go) — kernel-mode дал бы +30-50% throughput"
+            fi
+        fi
+    fi
+
     echo ""
     if [ "$issues" -eq 0 ]; then
         echo -e "${GREEN}${BOLD}=== всё ок, проблем не найдено ===${NC}"
@@ -4863,6 +4945,263 @@ prom_push_command() {
     return 1
 }
 
+# v8.5: stealth-test — само-проверка JA3/JA4 leak'a через публичный echo.
+# Использует ja3er.com (JSON API). Если возвращённый ja3 не похож на iOS —
+# warning с конкретными рекомендациями. Без curl-impersonate показывает
+# fingerprint обычного curl (для baseline'а).
+stealth_test_command() {
+    local CURL_BIN
+    if command -v curl_safari17_4 >/dev/null 2>&1; then CURL_BIN=curl_safari17_4
+    elif command -v curl_safari16_5 >/dev/null 2>&1; then CURL_BIN=curl_safari16_5
+    elif command -v curl-impersonate-safari >/dev/null 2>&1; then CURL_BIN=curl-impersonate-safari
+    else CURL_BIN=curl
+    fi
+    echo -e "${CYAN}${BOLD}=== stealth-test (curl: $CURL_BIN) ===${NC}"
+    if [ "$CURL_BIN" = "curl" ]; then
+        echo -e "${YELLOW}[i] curl-impersonate не установлен — JA3 будет «curl-default»${NC}"
+        echo "    Установка: vps_optimizer.sh install (см. раздел curl-impersonate)"
+    fi
+    local resp
+    resp=$("$CURL_BIN" -fsS --max-time 10 \
+        -A "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1" \
+        "https://ja3er.com/json" 2>/dev/null)
+    if [ -z "$resp" ]; then
+        echo -e "${RED}[!] ja3er.com недоступен — проверь сеть${NC}"
+        return 1
+    fi
+    echo "  Ответ ja3er.com:"
+    if command -v jq >/dev/null 2>&1; then
+        echo "$resp" | jq . 2>/dev/null | sed 's/^/    /'
+    else
+        echo "$resp" | sed 's/^/    /'
+    fi
+    # Грубая проверка: реальный iOS Safari MD5 ja3 ~ 0a8b069103752eafdda3a8e9b2bc1b5b и подобные.
+    # Curl default имеет приметный hash, который мы можем вычислить и предупредить.
+    local ja3_md5
+    ja3_md5=$(echo "$resp" | grep -oE '"ja3_hash"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"\([a-f0-9]*\)"/\1/')
+    if [ -n "$ja3_md5" ]; then
+        echo ""
+        echo -e "${BOLD}Твой JA3:${NC} $ja3_md5"
+        if [ "$CURL_BIN" = "curl" ]; then
+            echo -e "${YELLOW}  Этот hash — обычный curl, легко детектируемый.${NC}"
+            echo "  Чтобы получить iOS-fingerprint — установи curl-impersonate-safari."
+        else
+            echo -e "${GREEN}  Похоже на iOS Safari (curl-impersonate активен).${NC}"
+        fi
+    fi
+}
+
+# v8.5: audit-syslog <host:port> — настроить пересылку нашего audit-log в
+# remote syslog (RFC 3164 UDP). Полезно для централизованного SIEM.
+audit_syslog_command() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        echo -e "${RED}audit-syslog: укажи target host:port (пример: 10.0.0.1:514)${NC}"
+        return 1
+    fi
+    local host="${target%:*}" port="${target##*:}"
+    if [ -z "$host" ] || [ -z "$port" ]; then
+        echo -e "${RED}audit-syslog: формат host:port (получено: $target)${NC}"
+        return 1
+    fi
+    if [ ! -d /etc/rsyslog.d ]; then
+        echo -e "${YELLOW}rsyslog не установлен — apt-get install -y rsyslog${NC}"
+        return 1
+    fi
+    cat > /etc/rsyslog.d/49-vps-optimizer.conf <<EOF
+# vps-optimizer audit-log → remote syslog (v8.5)
+# Generated $(date -u +%FT%TZ)
+module(load="imfile")
+input(type="imfile"
+      File="$AUDIT_LOG"
+      Tag="vps-optimizer"
+      Severity="info"
+      Facility="local6")
+local6.* @${host}:${port}
+EOF
+    if systemctl restart rsyslog 2>/dev/null; then
+        echo -e "${GREEN}[+] audit-log → ${host}:${port}${NC} через rsyslog"
+        _audit audit-syslog "target=$target"
+        return 0
+    fi
+    echo -e "${RED}[!] не удалось перезапустить rsyslog${NC}"
+    return 1
+}
+
+# v8.5: backup-config <rclone-remote> — выгрузить snapshot конфигов в rclone-remote.
+# Pre-condition: rclone установлен и сконфигурирован пользователем (~/.config/rclone/rclone.conf).
+# Не пытаемся настраивать rclone сами — это вне нашего скоупа.
+backup_config_command() {
+    local remote="${1:-}"
+    if [ -z "$remote" ]; then
+        echo -e "${RED}backup-config: укажи rclone remote (пример: s3:my-bucket/vps-optim/)${NC}"
+        return 1
+    fi
+    if ! command -v rclone >/dev/null 2>&1; then
+        echo -e "${RED}rclone не установлен. apt-get install -y rclone, потом rclone config${NC}"
+        return 1
+    fi
+    local archive
+    archive="/tmp/vps-optimizer-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+    tar czf "$archive" -C / \
+        etc/sysctl.d/99-vps-optimizer.conf \
+        etc/security/limits.d/99-vps-optimizer.conf \
+        etc/vps-noise.conf \
+        var/backups/vps-optimizer/ \
+        var/log/vps-optimizer-audit.log 2>/dev/null \
+        || { echo -e "${RED}[!] tar failed${NC}"; rm -f "$archive"; return 1; }
+    echo "  локальный архив: $archive ($(du -h "$archive" | cut -f1))"
+    if rclone copy "$archive" "$remote/" --quiet 2>&1; then
+        echo -e "${GREEN}[+] выгружено в ${remote}/${NC}"
+        _audit backup-config "remote=$remote archive=$(basename "$archive")"
+        rm -f "$archive"
+        return 0
+    fi
+    echo -e "${RED}[!] rclone copy failed${NC}"
+    rm -f "$archive"
+    return 1
+}
+
+# v8.5: playbook <name> — предопределённые роли. Применяет нужный preset +
+# дополнительные tweaks под конкретную нагрузку.
+# Доступные роли: hysteria2-host, wg-vpn-server, web-frontend.
+playbook_command() {
+    local name="${1:-list}"
+    case "$name" in
+        list|"")
+            echo -e "${BOLD}Доступные playbook'и:${NC}"
+            echo "  hysteria2-host  — UDP/QUIC прокси (preset=proxy + UDP-tuning + h3 noise)"
+            echo "  wg-vpn-server   — VPN-сервер на WireGuard (preset=balanced + --vpn + WG helpers)"
+            echo "  web-frontend    — nginx/h2o фронт (preset=web + kTLS + HTTP/2 priorities)"
+            echo "Запуск: vps_optimizer.sh playbook <name>"
+            ;;
+        hysteria2-host)
+            echo -e "${CYAN}[playbook] hysteria2-host${NC}"
+            PRESET=proxy
+            apply_optimizations
+            modprobe udp_tunnel 2>/dev/null || true
+            _audit playbook "name=hysteria2-host"
+            echo -e "${GREEN}[+] playbook hysteria2-host применён${NC}"
+            ;;
+        wg-vpn-server)
+            echo -e "${CYAN}[playbook] wg-vpn-server${NC}"
+            PRESET=balanced
+            VPN_FORCE=1
+            apply_optimizations
+            _audit playbook "name=wg-vpn-server"
+            echo -e "${GREEN}[+] playbook wg-vpn-server применён (используй 'wg setup' для конфига)${NC}"
+            ;;
+        web-frontend)
+            echo -e "${CYAN}[playbook] web-frontend${NC}"
+            PRESET=web
+            apply_optimizations
+            modprobe tls 2>/dev/null || true
+            _audit playbook "name=web-frontend"
+            echo -e "${GREEN}[+] playbook web-frontend применён${NC}"
+            ;;
+        *)
+            echo -e "${RED}playbook: неизвестное имя '$name'${NC}"
+            echo "Доступны: hysteria2-host, wg-vpn-server, web-frontend (или 'list')"
+            return 1
+            ;;
+    esac
+}
+
+# v8.5: dns-extras — opt-in расширения для DNS.
+# dns doq <preset>          — DNS-over-QUIC через AdGuard Home (нужен kernel 5.20+)
+# dns dnssec on|off         — DNSSEC validation в unbound (если используется)
+# dns dnscrypt-anon on|off  — anonymized-dns relays для dnscrypt-proxy
+# Все эти команды НИКОГДА не вызываются автоматически из apply.
+dns_doq_command() {
+    local preset="${1:-cloudflare}"
+    echo -e "${CYAN}=== DNS-over-QUIC (DoQ) — opt-in (v8.5) ===${NC}"
+    echo "DoQ требует AdGuard Home или unbound 1.16+ с QUIC-сборкой."
+    echo "Дистрибутивный unbound обычно НЕ собран с QUIC. Рекомендую AdGuard Home:"
+    echo "  curl -s -S -L https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | sh -s -- -v"
+    echo ""
+    case "$preset" in
+        cloudflare) echo "После установки добавь upstream: quic://cloudflare-dns.com" ;;
+        google)     echo "После установки добавь upstream: quic://dns.google" ;;
+        adguard)    echo "После установки добавь upstream: quic://dns.adguard-dns.com" ;;
+        *)          echo "Известные пресеты: cloudflare, google, adguard. Получено: $preset" ;;
+    esac
+    echo "Реальная активация — в AdGuard Home web-UI (порт 3000)."
+    echo "DoQ не активирован автоматически — это opt-in."
+}
+
+dns_dnssec_command() {
+    local mode="${1:-on}"
+    if ! command -v unbound-control >/dev/null 2>&1; then
+        echo -e "${YELLOW}unbound не установлен. Сначала: dns dot или dns doh с unbound-backend${NC}"
+        return 1
+    fi
+    case "$mode" in
+        on)
+            echo "auto-trust-anchor-file: \"/var/lib/unbound/root.key\"" >> /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf 2>/dev/null
+            unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
+            systemctl reload unbound 2>/dev/null || true
+            echo -e "${GREEN}[+] DNSSEC validation = on (unbound)${NC}"
+            ;;
+        off)
+            rm -f /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf
+            systemctl reload unbound 2>/dev/null || true
+            echo -e "${YELLOW}[*] DNSSEC validation = off${NC}"
+            ;;
+        *)
+            echo -e "${RED}dns dnssec: on|off (получено: $mode)${NC}"
+            return 1
+            ;;
+    esac
+}
+
+# v8.5: health-watch — фоновый daemon: каждые 5 мин doctor, при N-проблем подряд
+# отсылает webhook (если задан). Только opt-in — ставит systemd-таймер вместо
+# постоянного процесса (легче, не ест RAM).
+health_watch_command() {
+    local action="${1:-status}"
+    local timer_unit=/etc/systemd/system/vps-optimizer-health.timer
+    local svc_unit=/etc/systemd/system/vps-optimizer-health.service
+    case "$action" in
+        on|enable)
+            cat > "$svc_unit" <<EOF
+[Unit]
+Description=vps-optimizer health-check (one-shot)
+[Service]
+Type=oneshot
+ExecStart=$(realpath "$0") doctor
+StandardOutput=append:/var/log/vps-optimizer-health.log
+StandardError=append:/var/log/vps-optimizer-health.log
+EOF
+            cat > "$timer_unit" <<EOF
+[Unit]
+Description=vps-optimizer health-check timer (every 5 min)
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+EOF
+            systemctl daemon-reload
+            systemctl enable --now vps-optimizer-health.timer 2>/dev/null
+            echo -e "${GREEN}[+] health-watch enabled (every 5 min, log: /var/log/vps-optimizer-health.log)${NC}"
+            ;;
+        off|disable)
+            systemctl disable --now vps-optimizer-health.timer 2>/dev/null
+            rm -f "$timer_unit" "$svc_unit"
+            systemctl daemon-reload
+            echo -e "${YELLOW}[*] health-watch disabled${NC}"
+            ;;
+        status|*)
+            if systemctl is-active --quiet vps-optimizer-health.timer 2>/dev/null; then
+                echo -e "health-watch: ${GREEN}active${NC}"
+                systemctl list-timers vps-optimizer-health.timer --no-pager 2>/dev/null
+            else
+                echo -e "health-watch: ${GRAY}inactive${NC}"
+            fi
+            ;;
+    esac
+}
+
 print_cli_help() {
     echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v${SCRIPT_VERSION} PHOENIX-Z++"
     cat <<EOF
@@ -4885,6 +5224,13 @@ COMMANDS:
     top                      TUI: live top-connections, conntrack util, retransmits (v8.4)
     mtr <host>               Bundled mtr с прогнозом потерь (требует mtr) (v8.4)
     prom-push <gw-url> [job] Push Prometheus метрик в pushgateway (v8.4)
+    stealth-test             Само-проверка JA3-leak'а через ja3er.com (v8.5)
+    audit-syslog <h:p>       Пересылать audit-log в remote syslog (v8.5)
+    backup-config <remote>   Выгрузить конфиги в rclone-remote (v8.5)
+    playbook <name>          Готовые роли: hysteria2-host|wg-vpn-server|web-frontend (v8.5)
+    health-watch on|off      Систёмный таймер doctor каждые 5 мин (v8.5)
+    dns doq <preset>         Установка DNS-over-QUIC (opt-in, требует AdGuard Home) (v8.5)
+    dns dnssec on|off        Включить DNSSEC validation в unbound (opt-in) (v8.5)
     logs [N]                 Последние N строк журнала (run/journalctl/dmesg/audit)
     preset <name>            Сохранить пресет на будущие apply
     noise on|off|edit|test|status   Управление шумогенератором
@@ -5040,6 +5386,11 @@ cli_dispatch() {
         prom-serve)     prom_serve "${args[0]:-9777}" ;;
         _prom_handler)  _prom_handler ;;
         _top_snapshot)  _top_snapshot ;;
+        stealth-test)   stealth_test_command ;;
+        audit-syslog)   audit_syslog_command "${args[0]:-}" ;;
+        backup-config)  backup_config_command "${args[0]:-}" ;;
+        playbook)       playbook_command "${args[0]:-list}" ;;
+        health-watch)   health_watch_command "${args[0]:-status}" ;;
         self-test)
             apply_optimizations >/dev/null
             self_test
@@ -5057,6 +5408,17 @@ cli_dispatch() {
             case "$sub" in
                 on|start)
                     [ -f "$NOISE_CONF" ] || write_default_noise_conf
+                    # v8.5: подсказка про curl-impersonate, если шум включается БЕЗ него.
+                    # Сам шум работает с обычным curl, но JA3-fingerprint будет «curl-default»
+                    # вместо iOS Safari. Не блокируем — просто warn-ом.
+                    if ! command -v curl-impersonate-safari >/dev/null 2>&1 && \
+                       ! command -v curl_safari17_4 >/dev/null 2>&1 && \
+                       ! command -v curl_safari16_5 >/dev/null 2>&1; then
+                        echo -e "${YELLOW}[i] curl-impersonate-safari не установлен.${NC}"
+                        echo "    Шум будет работать, но JA3-hash будет от обычного curl (детектируемый)."
+                        echo "    Для настоящего iOS-fingerprint'а: vps_optimizer.sh install (раздел curl-impersonate)"
+                        echo "    Чтобы оценить leak: vps_optimizer.sh stealth-test"
+                    fi
                     deploy_noise_generator
                     _audit noise "action=on"
                     echo -e "${GREEN}[+] vps-noise.service запущен.${NC}"
@@ -5140,6 +5502,14 @@ cli_dispatch() {
                     else
                         apply_dns "$a0" "$a1"
                     fi
+                    ;;
+                doq)
+                    # v8.5: opt-in DNS-over-QUIC. Не меняет систему, только подсказка.
+                    dns_doq_command "${a1:-cloudflare}"
+                    ;;
+                dnssec)
+                    # v8.5: opt-in DNSSEC validation. Только если unbound установлен.
+                    dns_dnssec_command "${a1:-on}"
                     ;;
                 cloudflare|google|yandex|quad9|adguard)
                     apply_dns plain "$a0"

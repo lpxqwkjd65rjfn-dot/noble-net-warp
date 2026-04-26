@@ -1,0 +1,211 @@
+.\" vps-optimizer manpage (v8.5)
+.\" Install: cp assets/man/vps-optimizer.8 /usr/share/man/man8/ && mandb
+.TH VPS-OPTIMIZER 8 "2026-04-26" "8.5" "VPS Optimizer"
+
+.SH NAME
+vps-optimizer \- VPS sysctl/sysfs/iptables tuning, stealth noise generator, diagnostics
+
+.SH SYNOPSIS
+.B vps_optimizer.sh
+.RI [ COMMAND ]
+.RI [ OPTIONS ]
+
+.SH DESCRIPTION
+.B vps-optimizer
+applies safe, idempotent network/CPU/RAM optimizations tuned for proxy / VPN / streaming workloads,
+generates iOS-Safari-shaped white-noise traffic for traffic analysis resistance, and provides
+actionable diagnostics. All settings are probed before write and rolled back automatically if
+they break connectivity.
+
+.SH COMMANDS
+
+.SS Application
+.TP
+.BR apply " [" --preset
+.IR NAME "] [" --vpn "] [" --boot "] [" --no-rollback ]
+Apply optimizations. Presets:
+.BR balanced " (default)," " proxy" ", or " web .
+With
+.B --vpn
+adds rp_filter=2/accept_local/ip_forward (auto-detected from
+.IR tun*/wg*/ppp* "/" ipsec* " ifaces).
+.B --boot
+installs a one-shot systemd unit so apply runs on every reboot (useful on OpenVZ).
+
+.TP
+.B reset [\-\-soft]
+Roll back. Soft mode keeps DNS / noise / swap untouched.
+
+.TP
+.B uninstall
+Full removal: reset + remove the script and all artifacts.
+
+.SS Diagnostics
+.TP
+.B doctor
+Actionable diagnostics — conntrack util, retransmits, softnet drops, DNS, snapshots,
+PCIe gen, kTLS, systemd-resolved coexistence, eBPF programs, WG kernel-mode.
+
+.TP
+.B audit \fR[\fB--json\fR]
+Drift / RPS / conntrack / dnscrypt-proxy deep audit.
+
+.TP
+.B status \fR[\fB--json\fR]
+Live dashboard.
+
+.TP
+.B why \fIKEY\fR
+Explain why a sysctl was set to its current value.
+
+.TP
+.B top
+TUI: live conntrack util, TCP states, top-10 connections by retransmits.
+
+.TP
+.B mtr \fIHOST\fR
+Wrapper around \fBmtr\fR(8).
+
+.TP
+.B compare \fR[\fITARGET\fR]
+Save / show a ping baseline; default target 1.1.1.1.
+
+.TP
+.B stealth-test
+Self-check JA3 fingerprint via ja3er.com; warns if your TLS stack is detectable as
+\fBcurl\fR rather than iOS Safari (use \fBcurl-impersonate-safari\fR to fix).
+
+.SS Stealth (noise generator)
+.TP
+.B noise on \fR| \fBoff \fR| \fBedit \fR| \fBstatus \fR| \fBtest \fR| \fBhealth
+Manage the white-noise daemon. Default profile mimics iOS Safari + APNs/FCM/WNS push
+keepalive + WebRTC STUN bursts + WebSocket-style long-poll.
+
+.SS DNS
+.TP
+.B dns \fR| \fBdns local\fR | \fBdns plain\fR|\fBdot\fR|\fBdoh \fIPRESET\fR
+Configure resolver. Presets:
+.BR cloudflare ", " google ", " yandex ", " quad9 ", " adguard "."
+With
+.B custom
+you may pass IPs (plain/dot) or full URLs (doh).
+
+.TP
+.B dns doq \fR[\fIPRESET\fR]
+DNS-over-QUIC \fB(opt-in)\fR — installation pointer for AdGuard Home (kernel 5.20+ required).
+
+.TP
+.B dns dnssec \fBon\fR|\fBoff\fR
+DNSSEC validation in unbound \fB(opt-in)\fR.
+
+.SS Telemetry
+.TP
+.B prom-metrics
+Dump Prometheus-format metrics on stdout.
+
+.TP
+.B prom-serve \fR[\fIPORT\fR]
+Run Prometheus exporter (default :9777).
+
+.TP
+.B prom-push \fIGW-URL\fR \fR[\fIJOB\fR]
+Push metrics to a Prometheus Pushgateway.
+
+.TP
+.B audit-syslog \fIHOST:PORT\fR
+Forward the audit-log to a remote syslog (UDP 514).
+
+.SS Backup / playbooks / health
+.TP
+.B backup-config \fIRCLONE-REMOTE\fR
+Snapshot /etc/sysctl.d, /etc/vps-noise.conf, /var/backups/vps-optimizer/ to an rclone target.
+
+.TP
+.B playbook \fR{\fBhysteria2-host\fR | \fBwg-vpn-server\fR | \fBweb-frontend\fR}
+Apply a role-specific recipe.
+
+.TP
+.B health-watch \fR{\fBon\fR | \fBoff\fR | \fBstatus\fR}
+Enable a systemd timer that runs \fBdoctor\fR every 5 minutes.
+
+.SS Hardening
+.TP
+.B harden \fR{\fBssh\fR | \fBufw\fR | \fBupgrades\fR | \fBall\fR}
+Opt-in security hardening (does not change \fBapply\fR defaults).
+
+.SH GLOBAL FLAGS
+.TP
+.B --dry-run
+Show what would change without writing.
+
+.TP
+.BR --quiet ", " -q
+Minimal output (cron-friendly).
+
+.TP
+.B --debug
+Verbose log to /var/log/vps-optimizer-debug.log.
+
+.TP
+.B --force
+Bypass lock / confirmations.
+
+.TP
+.B --json
+Machine-readable JSON output (for status / audit).
+
+.SH EXIT CODES
+.TP
+.B 0
+ok
+.TP
+.B 10
+already-applied (idempotent)
+.TP
+.B 20
+internet-down (apply aborted)
+.TP
+.B 30
+hypervisor-blocked (everything refused)
+.TP
+.B 40
+lock-busy (another apply running)
+.TP
+.B 50
+invalid args / unknown preset
+.TP
+.B 60
+rolled-back (apply succeeded but connectivity degraded → auto-rollback)
+
+.SH FILES
+.TP
+.I /etc/sysctl.d/99-vps-optimizer.conf
+Persistent sysctl settings.
+.TP
+.I /etc/vps-noise.conf
+Noise generator configuration.
+.TP
+.I /var/backups/vps-optimizer/
+Daily and pre-apply snapshots (max 7 daily + 30 pre-apply).
+.TP
+.I /var/log/vps-optimizer-audit.log
+Audit-log of all command invocations.
+.TP
+.I /var/log/vps-optimizer-debug.log
+Debug log (when --debug is used).
+
+.SH SECURITY
+.B vps-optimizer
+never auto-installs firewall rules that could close SSH, never touches the SSH server
+configuration without explicit \fBharden ssh\fR, and rolls back on connectivity loss.
+
+.SH REPORTING BUGS
+https://github.com/lpxqwkjd65rjfn-dot/noble-net-warp/issues
+
+.SH SEE ALSO
+.BR sysctl (8),
+.BR ethtool (8),
+.BR ss (8),
+.BR mtr (8),
+.BR nft (8),
+.BR rclone (1).

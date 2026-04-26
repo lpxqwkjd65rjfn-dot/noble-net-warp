@@ -39,3 +39,20 @@ jobs:
           ./vps_optimizer.sh --help > /dev/null
           ./vps_optimizer.sh status --json | jq -e .
           ./vps_optimizer.sh prom-metrics > /dev/null
+
+      - name: install bats
+        run: sudo apt-get install -yq bats
+
+      - name: run bats unit tests
+        run: bats tests/
+
+      - name: validate manpage (groff syntax)
+        run: |
+          sudo apt-get install -yq groff
+          groff -mandoc -Tutf8 -ww -e assets/man/vps-optimizer.8 > /dev/null
+
+      - name: validate Prometheus alerts
+        run: |
+          # Just YAML-parse — promtool would need full Prometheus install.
+          python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' \
+                  assets/prometheus/vps-optimizer-alerts.yml

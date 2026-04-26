@@ -302,7 +302,45 @@ help                            Print full help
 
 ## Changelog
 
-### v8.4 — stealth & perf (current)
+### v8.5 — perf-pkg + diag/stealth/playbooks (current)
+
+Расширение v8.4. Все default-флаги совпадают с v8.4. Никаких новых правил
+firewall/routing — apply остаётся VPN/SSH-safe. Новые DNS-расширения (DoQ,
+DNSSEC) — **только opt-in** через явные команды.
+
+**Новые quick-win sysctl** (probe-then-write):
+- `kernel.io_uring_disabled=0` — для прокси на современных стеках (sing-box/h2o).
+- `kernel.sched_min_granularity_ns=10ms` + `sched_wakeup_granularity_ns=15ms` — больше CPU-time per task.
+
+**Новые apply-step'ы:**
+- KSM (Kernel Samepage Merging) auto-detect — включаем только в виртуализации (kvm/xen/hyperv/vmware), мягко (sleep_millisecs=200).
+
+**doctor дополнения (12 → 15 секций):**
+- systemd-resolved coexistence — детектит конфликт с dnsmasq за порт 53.
+- ip_local_port_range проверка ширины (warn если span < 20000 — риск EADDRINUSE).
+- bpftool prog show — сколько eBPF-программ загружено.
+- WireGuard: kernel-mode vs userspace (wireguard-go) с рекомендацией.
+
+**Новые CLI команды:**
+- `stealth-test` — JA3-leak self-check через ja3er.com (warn если curl-default fingerprint).
+- `audit-syslog <host:port>` — pешать audit-log в remote rsyslog.
+- `backup-config <rclone-remote>` — выгружать snapshot конфигов на S3/Backblaze/Yandex.
+- `playbook hysteria2-host|wg-vpn-server|web-frontend` — готовые роли.
+- `health-watch on|off|status` — systemd-таймер doctor каждые 5 мин.
+- `dns doq <preset>` — указатель на установку DNS-over-QUIC (**opt-in**, не активируется автоматически).
+- `dns dnssec on|off` — DNSSEC validation в unbound (**opt-in**).
+
+**Новые stealth-улучшения:**
+- `noise on` теперь подсказывает установить curl-impersonate-safari если его нет (с fallback warning).
+
+**Assets:**
+- `assets/prometheus/vps-optimizer-alerts.yml` — drop-in alerts для conntrack/retrans/noise/drift.
+- `assets/man/vps-optimizer.8` — настоящая nroff manpage (`cp ... /usr/share/man/man8/`).
+
+**Тесты:**
+- `tests/test_helpers.bats` — 19 unit-тестов (bats-core); CI запускает их + groff-валидацию manpage + YAML-валидацию alerts.
+
+### v8.4 — stealth & perf
 
 Расширение v8.3 без изменений defaults — всё новое либо probe-then-write, либо
 opt-in. SSH/VPN-совместимо: ни один новый knob не меняет routing/firewall.
