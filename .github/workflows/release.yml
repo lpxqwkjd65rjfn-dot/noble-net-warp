@@ -38,7 +38,8 @@ jobs:
             echo "## ${tag}"
             echo
             awk -v v="$version" '
-              $0 ~ "^### v"v {flag=1; next}
+              BEGIN { gsub(/\./, "\\.", v); pat = "^### v" v "([ (]|$)" }
+              $0 ~ pat {flag=1; next}
               flag && /^### v/ {exit}
               flag {print}
             ' README.md

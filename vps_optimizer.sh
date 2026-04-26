@@ -3622,8 +3622,7 @@ harden_ufw() {
     ssh_port=$(awk '/^Port[[:space:]]/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
     [ -z "$ssh_port" ] && ssh_port=22
     ufw allow "$ssh_port"/tcp comment 'SSH' >/dev/null 2>&1
-    # ICMP
-    sed -i '/^-A ufw-before-input -p icmp/d' /etc/ufw/before.rules 2>/dev/null || true
+    # ICMP echo-request/reply остаются в before.rules по умолчанию — не трогаем.
     ufw --force enable >/dev/null 2>&1 || true
     echo -e "${GREEN}[+] UFW активирован, разрешён SSH на порту $ssh_port.${NC}"
 }
@@ -3645,6 +3644,9 @@ ClientAliveCountMax 2
 X11Forwarding no
 Banner /etc/issue.net
 SEOF
+    if [ -s /etc/issue.net ] && ! grep -q 'Authorized access only' /etc/issue.net 2>/dev/null; then
+        cp -a /etc/issue.net "/etc/issue.net.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
     cat > /etc/issue.net <<'BEOF'
 **********************************************************************
 *  Authorized access only. All activity is logged and monitored.     *
@@ -3758,8 +3760,10 @@ prom_serve() {
     fi
     echo -e "${GREEN}[+] Prometheus exporter на :${port}${NC}"
     _audit prom_serve "port=$port"
+    local self
+    self=$(readlink -f "${BASH_SOURCE[0]:-$0}")
     while true; do
-        socat -T 5 TCP-LISTEN:"$port",reuseaddr,fork SYSTEM:"$0 _prom_handler" 2>/dev/null
+        socat -T 5 TCP-LISTEN:"$port",reuseaddr,fork SYSTEM:"$self _prom_handler" 2>/dev/null
         sleep 1
     done
 }
