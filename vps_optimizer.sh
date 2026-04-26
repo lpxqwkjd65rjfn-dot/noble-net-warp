@@ -989,7 +989,7 @@ apply_sysctls() {
     sysctl_safe net.ipv4.udp_rmem_min 131072
     sysctl_safe net.ipv4.udp_wmem_min 131072
     sysctl_safe net.ipv4.udp_mem "786432 1048576 1572864"
-    sysctl_safe net.core.optmem_max 131072
+    # NB: net.core.optmem_max уже выставлен выше в 4194304 (4MB) — не перетираем.
     # TFO black-hole defuse (v8.3): дефолт ядра — 1ч лок после первой неудачи.
     # На флапающей сети это «тихая» причина почему TFO «не работает».
     sysctl_safe net.ipv4.tcp_fastopen_blackhole_timeout_sec 0
@@ -1102,17 +1102,18 @@ apply_sysctls() {
     sysctl_safe net.ipv4.ip_default_ttl 64
 
     # Security / hygiene.
-    # rp_filter (v8.3): по умолчанию ставим loose mode (=2), а не strict (=1).
-    # Strict mode сбрасывает пакеты, пришедшие через интерфейс, отличный от того,
-    # через который ушёл бы ответ — это ломает WireGuard/OpenVPN/MPTCP/multi-NIC,
-    # где asymmetric routing нормален. Loose оставляет защиту от source-spoofing
-    # (требует, чтобы маршрут существовал хоть через какой-то iface) — этого
-    # достаточно для VPS. Если детектим VPN-iface (tun*/wg*/ppp*) или указан --vpn —
-    # дополнительно включаем accept_local и ip_forward.
+    # rp_filter (v8.3): сохраняем backward-compat дефолт =1 (strict, как было в v8.2).
+    # Loose mode (=2) включаем только под --vpn или при детекте VPN-iface, потому что
+    # strict (=1) дропает asymmetric routing, что ломает WireGuard/OpenVPN/MPTCP.
+    # Это поведение соответствует CONTRIBUTING.md: «no default change without opt-in».
     sysctl_safe net.ipv4.tcp_syncookies 1
     sysctl_safe net.ipv4.tcp_rfc1337 1
-    sysctl_safe net.ipv4.conf.all.rp_filter 2
-    sysctl_safe net.ipv4.conf.default.rp_filter 2
+    local rp_filter_target=1
+    if [ "$VPN_FORCE" = "1" ] || has_vpn_iface; then
+        rp_filter_target=2
+    fi
+    sysctl_safe net.ipv4.conf.all.rp_filter "$rp_filter_target"
+    sysctl_safe net.ipv4.conf.default.rp_filter "$rp_filter_target"
     sysctl_safe net.ipv4.conf.all.accept_redirects 0
     sysctl_safe net.ipv4.conf.default.accept_redirects 0
     sysctl_safe net.ipv4.conf.all.send_redirects 0
@@ -1147,7 +1148,9 @@ apply_sysctls() {
     # tcp_keepalive_intvl/probes уже выставлены выше (одинаково для всех пресетов).
 
     # netdev_max_backlog масштабируем под скорость линка: на 25G+ дефолт мал.
-    local link_speed_mbps backlog_target dev_weight_target
+    # ВАЖНО (v8.3 fix): берём max(preset, auto-scale), чтобы не понижать значения
+    # пресетов (например proxy=1000000) на 1G-VPS до 30000.
+    local link_speed_mbps backlog_target dev_weight_target backlog_eff dev_weight_eff
     link_speed_mbps=$(detect_link_speed_mbps)
     if [ "$link_speed_mbps" -ge 25000 ]; then
         backlog_target=300000
@@ -1159,8 +1162,13 @@ apply_sysctls() {
         backlog_target=30000
         dev_weight_target=64
     fi
-    sysctl_safe net.core.netdev_max_backlog "$backlog_target"
-    sysctl_safe net.core.dev_weight "$dev_weight_target"
+    backlog_eff="$PRESET_NETDEV_BACKLOG"
+    [ "$backlog_target" -gt "$backlog_eff" ] && backlog_eff="$backlog_target"
+    # dev_weight: уже выставлен 128 в base apply (line 965). Берём максимум.
+    dev_weight_eff=128
+    [ "$dev_weight_target" -gt "$dev_weight_eff" ] && dev_weight_eff="$dev_weight_target"
+    sysctl_safe net.core.netdev_max_backlog "$backlog_eff"
+    sysctl_safe net.core.dev_weight "$dev_weight_eff"
 
     # conntrack — критический пункт для прокси-нагрузок. Модуль может быть
     # не загружен — пробуем поднять, sysctls появятся только после этого.
@@ -3877,17 +3885,21 @@ doctor_command() {
         fi
     fi
 
-    # 2. TCP retransmits — рассчитываем delta за 1 сек
+    # 2. TCP retransmits — рассчитываем delta за 1 сек.
+    # /proc/net/snmp имеет 2 'Tcp:' строки: первая — заголовок с именами колонок,
+    # вторая — значения. Берём индексы из header'а, значения из data-строки.
     if [ -r /proc/net/snmp ]; then
         local rt1 rt2 sg1 sg2 retrans_pct=0
-        rt1=$(awk '/^Tcp:/{tcp=$0} END{n=split(tcp," ",a); for(i=1;i<=n;i++) if (a[i]=="RetransSegs") f=i+1; print a[f]+0}' /proc/net/snmp 2>/dev/null)
-        sg1=$(awk '/^Tcp:/{tcp=$0} END{n=split(tcp," ",a); for(i=1;i<=n;i++) if (a[i]=="OutSegs") f=i+1; print a[f]+0}' /proc/net/snmp 2>/dev/null)
+        # shellcheck disable=SC2016
+        local awk_pick='/^Tcp:/ && !hdr {hdr=$0; next} /^Tcp:/ {n=split(hdr,h); m=split($0,d); for(i=1;i<=n;i++) if(h[i]==key) {print d[i]+0; exit}}'
+        rt1=$(awk -v key=RetransSegs "$awk_pick" /proc/net/snmp 2>/dev/null)
+        sg1=$(awk -v key=OutSegs    "$awk_pick" /proc/net/snmp 2>/dev/null)
         sleep 1
-        rt2=$(awk '/^Tcp:/{tcp=$0} END{n=split(tcp," ",a); for(i=1;i<=n;i++) if (a[i]=="RetransSegs") f=i+1; print a[f]+0}' /proc/net/snmp 2>/dev/null)
-        sg2=$(awk '/^Tcp:/{tcp=$0} END{n=split(tcp," ",a); for(i=1;i<=n;i++) if (a[i]=="OutSegs") f=i+1; print a[f]+0}' /proc/net/snmp 2>/dev/null)
+        rt2=$(awk -v key=RetransSegs "$awk_pick" /proc/net/snmp 2>/dev/null)
+        sg2=$(awk -v key=OutSegs    "$awk_pick" /proc/net/snmp 2>/dev/null)
         local d_rt d_sg
-        d_rt=$(( rt2 - rt1 ))
-        d_sg=$(( sg2 - sg1 ))
+        d_rt=$(( ${rt2:-0} - ${rt1:-0} ))
+        d_sg=$(( ${sg2:-0} - ${sg1:-0} ))
         if [ "$d_sg" -gt 0 ]; then
             retrans_pct=$(( d_rt * 100 / d_sg ))
         fi

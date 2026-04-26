@@ -286,8 +286,7 @@ help                            Print full help
 
 **SSH/VPN safety net:**
 - **Auto-rollback** после `apply`: пробуем DNS + TCP/443; если связь упала — откатываем на pre-apply snapshot. Защита от своего же sysctl. Отключаемо: `--no-rollback`.
-- **rp_filter=2** по умолчанию (loose mode) — strict (=1) ломал WireGuard/OpenVPN/MPTCP/multi-NIC, дропая asymmetric routing. Loose оставляет защиту от source-spoofing.
-- **VPN-friendly auto-detect**: если виден `tun*`/`wg*`/`ppp*` iface, или передан `--vpn` — автоматически включаем `accept_local=1`, `ip_forward=1`, `nf_conntrack_helper=0`.
+- **VPN-friendly auto-detect** (opt-in): если виден `tun*`/`wg*`/`ppp*` iface, или передан `--vpn` — автоматически переключаем `rp_filter` со strict (=1) на loose (=2), включаем `accept_local=1`, `ip_forward=1`, `nf_conntrack_helper=0`. Без VPN остаётся прежний strict-режим (backward-compat).
 
 **UDP / QUIC / VPN скорость:**
 - **UDP-GRO/GSO** ethtool offloads: `rx-udp-gro-forwarding`, `tx-udp-segmentation` — даёт **2-3x throughput** для QUIC/Hysteria2/TUIC/WireGuard на 5.18+ ядрах.
