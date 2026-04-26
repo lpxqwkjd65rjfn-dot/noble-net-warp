@@ -2523,9 +2523,11 @@ push_keepalive() {
 # Рассылаем 1-3 STUN Binding Request'а к рандомным STUN-серверам.
 stun_burst() {
     # Сырой STUN Binding Request: 20 байт.
-    # 0x0001 (Binding Request) + 0x0000 (length=0) + 0x2112A442 (magic) + 12 random bytes
-    local stun_pkt
-    stun_pkt=$'\x00\x01\x00\x00\x21\x12\xa4\x42'
+    # 0x0001 (Binding Request) + 0x0000 (length=0) + 0x2112A442 (magic cookie) +
+    # 12-байтовый transaction ID. Собираем как `\xNN`-escape-строку (а не сырыми
+    # байтами через $'...'), потому что bash-строки не могут содержать NUL —
+    # любая `\x00` в \$'…' усекает переменную в 0 длины. printf %b развернёт.
+    local stun_pkt='\x00\x01\x00\x00\x21\x12\xa4\x42'
     local b
     for ((b=0; b<12; b++)); do
         stun_pkt+=$(printf '\\x%02x' "$(urand 0 255)")
