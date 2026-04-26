@@ -1,0 +1,90 @@
+# vps-optimizer Prometheus alerts (v8.5)
+#
+# Drop-in для Prometheus 2.x. Пути:
+#   1. Скопируй в /etc/prometheus/alerts/ (или куда смотрит prometheus.yml)
+#   2. В prometheus.yml: rule_files: ['/etc/prometheus/alerts/*.yml']
+#   3. Reload: kill -HUP $(pidof prometheus) или systemctl reload prometheus
+#
+# Метрики приходят из `vps-optimizer prom-serve` (default :9777) или `prom-push`.
+
+groups:
+  - name: vps-optimizer
+    interval: 30s
+    rules:
+      # === Conntrack === #
+      - alert: VPSConntrackHigh
+        expr: vps_conntrack_used / vps_conntrack_max > 0.80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "conntrack > 80% на {{ $labels.instance }}"
+          description: "Использовано {{ $value | humanizePercentage }} от nf_conntrack_max. Подними net.netfilter.nf_conntrack_max или включи conntrack offload."
+
+      - alert: VPSConntrackCritical
+        expr: vps_conntrack_used / vps_conntrack_max > 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "conntrack > 95% на {{ $labels.instance }}"
+          description: "Скоро начнутся drop'ы новых соединений. Срочно: vps_optimizer.sh apply --preset proxy"
+
+      # === Retransmits === #
+      - alert: VPSTCPRetransmitsHigh
+        expr: rate(vps_tcp_retrans_total[5m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TCP retransmits > 50/s на {{ $labels.instance }}"
+          description: "{{ $value }} retrans/s — проблема в сети, не в настройках. Проверь mtr до основных endpoints."
+
+      # === Noise generator === #
+      - alert: VPSNoiseDown
+        expr: vps_noise_uptime_seconds == 0 OR absent(vps_noise_uptime_seconds)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vps-noise.service не запущен на {{ $labels.instance }}"
+          description: "Шумогенератор остановлен — стелс-маскировка отключена."
+
+      - alert: VPSNoiseFailureRateHigh
+        expr: rate(vps_noise_requests_failed_total[10m]) / rate(vps_noise_requests_total[10m]) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "noise: > 50% запросов фейлятся на {{ $labels.instance }}"
+          description: "Возможно, провайдер начал блокировать выход к публичным DoH/CDN. Проверь noise-log."
+
+      # === Apply / sysctl drift === #
+      - alert: VPSSysctlDriftDetected
+        expr: vps_sysctl_drift > 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "sysctl drift на {{ $labels.instance }}: {{ $value }} ключ(ей) разъехались"
+          description: "Кто-то/что-то меняет наши sysctl. Проверь: vps_optimizer.sh audit"
+
+      # === Memory === #
+      - alert: VPSMinFreeBelowWatermark
+        expr: node_memory_MemFree_bytes < (vps_min_free_kbytes * 1024)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "free memory ниже vm.min_free_kbytes на {{ $labels.instance }}"
+          description: "Direct-reclaim неизбежен. Возможен latency-spike."
+
+      # === Apply lock stale === #
+      - alert: VPSApplyLockStale
+        expr: time() - vps_apply_lock_timestamp > 3600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "vps-optimizer apply lock висит > 1 ч на {{ $labels.instance }}"
+          description: "Процесс apply упал, не освободив /var/run/vps-optimizer.lock. Зайди руками и удали lock."
