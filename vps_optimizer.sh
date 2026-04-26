@@ -1010,9 +1010,15 @@ apply_sysctls() {
     sysctl_safe net.core.bpf_jit_harden 1
 
     # v8.5: io_uring — современный async-IO API. Default disabled на некоторых
-    # secure-конфигах (Ubuntu 22.04+ disable=2 в LSM). Включаем (=0) для прокси-
-    # стеков (sing-box/h2o умеют). Не трогаем если ядро не поддерживает.
-    sysctl_safe kernel.io_uring_disabled 0
+    # secure-конфигах (Ubuntu 22.04+ disable=2 в LSM). Включаем (=0) ТОЛЬКО для
+    # preset=proxy — потому что:
+    #   - проксы (sing-box/h2o) реально используют io_uring и получают +20-40% throughput;
+    #   - на hardened/web-серверах io_uring имеет шлейф CVE'ов, по умолчанию отключён
+    #     не зря (CONTRIBUTING rule #5: не меняем default apply без opt-in);
+    # Балансед/web preset'ы не трогают этот knob.
+    if [ "$PRESET" = "proxy" ]; then
+        sysctl_safe kernel.io_uring_disabled 0
+    fi
 
     # v8.5: scheduler tuning для CPU-bound прокси.
     # sched_min_granularity_ns=10ms (default 1.5ms) — больше CPU-time per task,
@@ -4997,7 +5003,9 @@ audit_syslog_command() {
         return 1
     fi
     local host="${target%:*}" port="${target##*:}"
-    if [ -z "$host" ] || [ -z "$port" ]; then
+    # v8.5: проверка что в target реально был ':' — иначе host==port==target и
+    # пройдёт пустая проверка, но rsyslog получит сломанный конфиг local6.* @host:host
+    if [ -z "$host" ] || [ -z "$port" ] || [ "$host" = "$target" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}audit-syslog: формат host:port (получено: $target)${NC}"
         return 1
     fi
@@ -5136,7 +5144,10 @@ dns_dnssec_command() {
         on)
             # v8.5: idempotent — truncate (>) а не append (>>), иначе при повторных
             # вызовах будут дубли auto-trust-anchor-file и unbound крашится.
-            echo "auto-trust-anchor-file: \"/var/lib/unbound/root.key\"" > /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf 2>/dev/null
+            # include-toplevel в /etc/unbound/unbound.conf требует чтобы файл-фрагмент
+            # начинался с собственного `server:` clause — иначе unbound parse error.
+            printf 'server:\n    auto-trust-anchor-file: "/var/lib/unbound/root.key"\n' \
+                > /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf 2>/dev/null
             unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
             systemctl reload unbound 2>/dev/null || true
             _audit dns-dnssec "mode=on"
