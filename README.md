@@ -280,7 +280,53 @@ help                            Print full help
 
 ## Changelog
 
-### v8.2 PHOENIX-Z++ (current)
+### v8.3 PHOENIX-Z++ — VPN-safe (current)
+
+**Главное:** apply теперь VPN/SSH-friendly по дефолту, сам себя откатывает если потерял связь.
+
+**SSH/VPN safety net:**
+- **Auto-rollback** после `apply`: пробуем DNS + TCP/443; если связь упала — откатываем на pre-apply snapshot. Защита от своего же sysctl. Отключаемо: `--no-rollback`.
+- **rp_filter=2** по умолчанию (loose mode) — strict (=1) ломал WireGuard/OpenVPN/MPTCP/multi-NIC, дропая asymmetric routing. Loose оставляет защиту от source-spoofing.
+- **VPN-friendly auto-detect**: если виден `tun*`/`wg*`/`ppp*` iface, или передан `--vpn` — автоматически включаем `accept_local=1`, `ip_forward=1`, `nf_conntrack_helper=0`.
+
+**UDP / QUIC / VPN скорость:**
+- **UDP-GRO/GSO** ethtool offloads: `rx-udp-gro-forwarding`, `tx-udp-segmentation` — даёт **2-3x throughput** для QUIC/Hysteria2/TUIC/WireGuard на 5.18+ ядрах.
+- **TCP Fast Open black-hole defuse**: `tcp_fastopen_blackhole_timeout_sec=0` — без этого после первой неудачи TFO лочился на 1 час.
+- **`net.core.optmem_max=131072`** — для SO_ZEROCOPY (sing-box / xray).
+- **gRPC keepalive sysctl**: для long-lived потоков sing-box/xray.
+- **netdev_max_backlog/dev_weight** автомасштаб: 25G+ → 300000/128, 10G+ → 100000/96, иначе 30000/64.
+
+**Новые команды:**
+- `doctor` — actionable-диагностика: проверяет conntrack, retransmits, softnet drops, /var, DNS — с подсказками как починить.
+- `why <key>` — объясняет почему конкретный sysctl такой (knowledge base ~30 ключей).
+- `audit --json` — машиночитаемый аудит для мониторинга.
+- `wg setup` — WireGuard helper (opt-in): автодетект MTU через ICMP needs-frag, генерация конфига, ip_forward.
+- `reset --soft` — откат только sysctl, оставляет DNS/noise/swap.
+- `apply --boot` — one-shot systemd unit для apply на каждом boot (для OpenVZ, где `/etc/sysctl.d/` иногда вытирается).
+- `apply --vpn` — явный VPN-режим без auto-detect.
+- PTR sanity check в `audit` (только warn).
+
+**Cron-friendly exit codes:**
+`0`=ok, `10`=already-applied, `20`=internet-down, `30`=hypervisor-blocked, `40`=lock-busy, `50`=invalid-args, `60`=rolled-back.
+
+**Daily snapshots:**
+`/var/backups/vps-optimizer/daily-YYYYMMDD.tar.gz` — 1 в сутки, держим 7 дней. Pre-apply снапшоты держим до 30 штук с авто-rotation.
+
+**Микро-фиксы (Q1-Q5,Q7,Q8):**
+- audit drift parser: `awk` вместо `IFS='='` для значений с `=`.
+- `_prom_handler` различает `/metrics`, `/`, `/healthz` (Prometheus + k8s liveness).
+- `install_curl_impersonate` тянет latest tag через GitHub API (fallback 0.6.1).
+- dmesg log filter: `out of memory|invoked oom-killer` вместо `killed` (меньше ложных).
+- `detect_provider` hostname-эвристика теперь требует доменный суффикс, не любую подстроку.
+
+**Не сделано (отложено по соображениям SSH/VPN-безопасности):**
+- Egress-firewall preset (мог закрыть SSH).
+- Disable kernel watchdog (мог скрыть реальные проблемы ядра).
+- GRUB-tweaks (требует ребут).
+- AppArmor profile noise (мог сломать на нестандартных ядрах).
+- HugePages (мог OOM на маленьких VPS).
+
+### v8.2 PHOENIX-Z++
 
 - New TCP knobs: `tcp_rto_min_us`, `tcp_comp_sack_*`, `tcp_pingpong_thresh`,
   `tcp_min_tso_segs`, `tcp_tso_win_divisor`, `tcp_no_ssthresh_metrics_save`,
