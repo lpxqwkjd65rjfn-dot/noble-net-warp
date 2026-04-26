@@ -5002,11 +5002,19 @@ stealth_test_command() {
     if [ -n "$ja3_md5" ]; then
         echo ""
         echo -e "${BOLD}Твой JA3:${NC} $ja3_md5"
+        # v8.5: список известных iOS Safari JA3 MD5 (актуально на 2024-Q4).
+        # Curl-impersonate генерирует один из этих хешей; обычный curl — что-то ещё.
+        # Мы не доверяем «curl_safari17_4 в PATH = всё ок» — реально верифицируем.
+        local ios_known_ja3=" 0a8b069103752eafdda3a8e9b2bc1b5b 7d52aff20f6ee7f4f73d8edcdb19f31a 773906b0efdefa24a7f2b8eb6985bf37 b832931ce0a04f6707b2a3c2d2904301 "
         if [ "$CURL_BIN" = "curl" ]; then
             echo -e "${YELLOW}  Этот hash — обычный curl, легко детектируемый.${NC}"
             echo "  Чтобы получить iOS-fingerprint — установи curl-impersonate-safari."
+        elif [[ "$ios_known_ja3" == *" $ja3_md5 "* ]]; then
+            echo -e "${GREEN}  iOS Safari fingerprint подтверждён (известный hash).${NC}"
         else
-            echo -e "${GREEN}  Похоже на iOS Safari (curl-impersonate активен).${NC}"
+            echo -e "${YELLOW}  curl-impersonate активен, но hash не из списка известных iOS Safari.${NC}"
+            echo "  Возможно: устаревший curl-impersonate, или Safari обновился."
+            echo "  Сравни вручную: https://tls.peet.ws/api/all"
         fi
     fi
 }
