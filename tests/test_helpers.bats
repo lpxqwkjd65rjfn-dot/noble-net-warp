@@ -374,3 +374,20 @@ setup() {
     [ "$status" -eq 0 ]
     [ "$output" -ge 2 ]   # in reset_all rm and in dns_padding rm
 }
+
+@test "v8.7 fix R10-1: no buggy udp_l3mdev_accept 0 line (was overriding our v8.7=1)" {
+    # Devin Review #10 caught a v8.6 bug: udp_l3mdev_accept=0 was set with a comment
+    # about udp_hash_entries (wrong sysctl name + wrong value). Removed in v8.7.
+    run grep -E 'sysctl_safe net\.ipv4\.udp_l3mdev_accept 0' "$SCRIPT"
+    [ "$status" -ne 0 ]   # must NOT match
+}
+
+@test "v8.7 fix R10-2: install_completion_command calls _audit (CONTRIBUTING #8)" {
+    run grep '_audit install-completion' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7 fix R10-3: bench_suite_command calls _audit (CONTRIBUTING #8)" {
+    run grep '_audit bench-suite' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}

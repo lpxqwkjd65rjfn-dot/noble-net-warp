@@ -1471,12 +1471,12 @@ apply_sysctls() {
         [ "$_node_count" = "1" ] && sysctl_safe kernel.numa_balancing 0
     fi
 
-    # v8.6: UDP-enhancements — расширяем lookup-таблицу для тысяч UDP-listeners
-    # (DNS resolver / QUIC / WireGuard fronting). Default udp_hash_entries=128
-    # часто узкое место под прокси-нагрузкой. Параметр read-only после boot
-    # на старых ядрах — sysctl_safe аккуратно skip'нёт если так.
-    sysctl_safe net.ipv4.udp_l3mdev_accept 0
-    # busy_poll/busy_read уже стоят 50 выше — синхронизировано для UDP/QUIC.
+    # v8.7 fix (Devin Review #10): v8.6 ошибочно ставил `udp_l3mdev_accept 0` с
+    # комментарием про udp_hash_entries — это два разных параметра. udp_hash_entries
+    # вообще не runtime-sysctl, а kernel boot-parameter (`udphash=N` / read-only
+    # после boot). Удалили баговую строку; правильный l3mdev_accept=1 ставится
+    # ниже в v8.7-блоке (вместе с tcp_l3mdev_accept).
+    # busy_poll/busy_read=50 уже стоят выше — синхронизировано для UDP/QUIC.
 
     # v8.6: IPv6 privacy extensions (RFC 4941) — temp-addr как primary source-addr
     # для исходящих соединений. Имитирует поведение реального iOS (anti-tracking).
@@ -6170,6 +6170,9 @@ bench_suite_command() {
         echo "$ts,$t,download,$mbps_dl,$rtt,0" >> "$csv_file"
     done
     echo ""
+    # v8.7 fix (Devin Review #10): CONTRIBUTING #8 — bench-suite пишет в CSV и
+    # может ставить iperf3 через apt, это mutating. _audit обязателен.
+    _audit bench-suite "csv=$csv_file targets=${#targets[@]}"
     echo -e "${GREEN}[+] Результаты добавлены в $csv_file${NC}"
     echo "    Тренды: tail -20 $csv_file | column -t -s,"
 }
@@ -6339,6 +6342,9 @@ _vps_optimizer() {
 _vps_optimizer "$@"
 ZSH_EOF
     chmod 644 "$zsh_dst" 2>/dev/null
+    # v8.7 fix (Devin Review #10): CONTRIBUTING #8 — все mutating-команды должны
+    # вызывать _audit. install_completion пишет файлы в /etc/, это mutating.
+    _audit install-completion "bash=$bash_dst zsh=$zsh_dst"
     echo -e "${GREEN}[+] bash completion: $bash_dst${NC}"
     echo -e "${GREEN}[+] zsh completion:  $zsh_dst${NC}"
     echo ""
