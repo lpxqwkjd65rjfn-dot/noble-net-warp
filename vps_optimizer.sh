@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.7"
+SCRIPT_VERSION="8.8"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -835,7 +835,12 @@ has_vpn_iface() {
         local name
         name=$(basename "$iface")
         case "$name" in
-            tun*|tap*|wg*|ppp*|ipsec*|gpd*|nordlynx*|vpn*|wireguard*)
+            # v8.8 (G3): расширили список — Cloudflared (cf*), Tailscale/Headscale
+            # (tailscale*, headscale*), Resilio Sync (sync*), ZeroTier (zt*),
+            # OpenVPN named iface (utun*). Все эти инструменты создают туннельные
+            # interface'ы, на которые `ip route` менять опасно (потеряются переходы).
+            tun*|tap*|wg*|ppp*|ipsec*|gpd*|nordlynx*|vpn*|wireguard*|\
+            cf*|cloudflared*|tailscale*|headscale*|sync*|zt*|utun*)
                 # Считаем только UP-iface, чтобы зомби-туннели не тянули нас в VPN-режим.
                 if [ -r "$iface/operstate" ] && grep -qE '^(up|unknown)$' "$iface/operstate" 2>/dev/null; then
                     return 0
@@ -1205,9 +1210,40 @@ apply_iface_tuning() {
                 ethtool -N "$iface" rx-flow-hash tcp6 sdfn >/dev/null 2>&1 || true
                 ethtool -K "$iface" hw-tc-offload on >/dev/null 2>&1 || true
                 ethtool -K "$iface" ntuple on >/dev/null 2>&1 || true
-                # gso-max-size требует Linux 5.18+ и драйверной поддержки
-                ip link set dev "$iface" gso_max_size 65536 >/dev/null 2>&1 || true
-                ip link set dev "$iface" gro_max_size 65536 >/dev/null 2>&1 || true
+                # gso-max-size требует Linux 5.18+ и драйверной поддержки.
+                # v8.8 (K1): BIG TCP for IPv6 — на kernel 6.3+ повышаем gso/gro_max
+                # до 196608 (192K). Это даёт +20-40% throughput на 10G+ NIC через
+                # уменьшение количества per-segment overhead. На kernel <6.3 драйвер
+                # тихо отвергнет, fallback к 65536. Безопасно: если иp link не примет,
+                # ничего не ломается.
+                local _krn_major _krn_minor _gso_target=65536
+                _krn_major=$(uname -r 2>/dev/null | awk -F. '{print $1}')
+                _krn_minor=$(uname -r 2>/dev/null | awk -F. '{print $2}')
+                if [ -n "$_krn_major" ] && [ -n "$_krn_minor" ] && \
+                   { [ "$_krn_major" -gt 6 ] 2>/dev/null || \
+                     { [ "$_krn_major" = "6" ] && [ "$_krn_minor" -ge 3 ] 2>/dev/null; }; }; then
+                    _gso_target=196608
+                fi
+                ip link set dev "$iface" gso_max_size "$_gso_target" >/dev/null 2>&1 || \
+                    ip link set dev "$iface" gso_max_size 65536 >/dev/null 2>&1 || true
+                ip link set dev "$iface" gro_max_size "$_gso_target" >/dev/null 2>&1 || \
+                    ip link set dev "$iface" gro_max_size 65536 >/dev/null 2>&1 || true
+
+                # v8.8 (N1): txqueuelen auto-tune. Default 1000 на 10G+ узкое место для
+                # bursty traffic (handshake-storm, DDoS-fronted прокси). Скейлим под
+                # link-speed: 1G→1000 (no-op), 10G→5000, 25G+→10000. Безопасно: не
+                # увеличивает memory footprint в idle, только cap на in-flight queue.
+                # detect_link_speed_mbps читает /sys/class/net/*/speed без аргументов
+                # и возвращает максимальную из активных. На VPS под виртой возвращает
+                # default 1000 если speed=-1 (virtio). Точное число сейчас не важно —
+                # нужно лишь >10000. Если функция недоступна (устаревшая версия), 0.
+                local _spd
+                _spd=$(detect_link_speed_mbps 2>/dev/null || echo 0)
+                if [ "$_spd" -ge 25000 ] 2>/dev/null; then
+                    ip link set dev "$iface" txqueuelen 10000 >/dev/null 2>&1 || true
+                elif [ "$_spd" -ge 10000 ] 2>/dev/null; then
+                    ip link set dev "$iface" txqueuelen 5000 >/dev/null 2>&1 || true
+                fi
             fi
         fi
     done
@@ -1777,6 +1813,57 @@ apply_sysctls() {
     # busy-прокси, рекомендация 512.
     sysctl_safe net.unix.max_dgram_qlen 512
 
+    # ============================================================
+    # v8.8: новый блок — kernel-стек 2024 + iOS-стелс + safety
+    # ============================================================
+
+    # v8.8 (K3): Accurate ECN (AccECN, RFC 9341) — kernel 6.0+. tcp_ecn=3 включает
+    # передовой ECN, который точнее отслеживает CE-маркировки при миксе с classic
+    # ECN-роутерами. На kernel <6.0 значение 3 трактуется как 1 (active), что всё
+    # равно лучше чем 0; sysctl_safe gracefully skip если параметр read-only.
+    # Опасности: zero — у нас уже tcp_ecn_fallback=1 страхует от ECN-blackhole'ов.
+    local _krn_maj _krn_min
+    _krn_maj=$(uname -r 2>/dev/null | awk -F. '{print $1}')
+    _krn_min=$(uname -r 2>/dev/null | awk -F. '{print $2}')
+    if [ -n "$_krn_maj" ] && [ -n "$_krn_min" ] && \
+       { [ "$_krn_maj" -gt 6 ] 2>/dev/null || \
+         { [ "$_krn_maj" = "6" ] && [ "$_krn_min" -ge 0 ] 2>/dev/null; }; }; then
+        # AccECN (3) только для kernel ≥6.0. На более старых — оставляем 2 из v8.4.
+        sysctl_safe net.ipv4.tcp_ecn 3
+    fi
+
+    # v8.8 (A2): tcp_min_rtt_wlen — окно для оценки минимального RTT. v8.4 поднял
+    # до 600s для стабильности BBR; на VPS с переменчивыми провайдерами это даёт
+    # stale-min-RTT (старые низкие значения «застревают»). 300s — компромисс между
+    # стабильностью и адаптивностью. На proxy preset оставляем 600 (стабильность
+    # важнее), на balanced/web возвращаем к 300s. CONTRIBUTING #5: gated by preset.
+    if [ "$PRESET_NAME" != "proxy" ]; then
+        sysctl_safe net.ipv4.tcp_min_rtt_wlen 300
+    fi
+
+    # v8.8 (A5): tcp_syn_linear_timeouts (kernel 6.4+) — линейный backoff для SYN
+    # retransmits на thin-streams. Дефолт 4 (kernel-default), но не везде включено.
+    # Для proxy/handshake-burst трафика ускоряет establishment на flaky-линках.
+    # На старых kernel sysctl_safe просто скипнет.
+    sysctl_safe net.ipv4.tcp_syn_linear_timeouts 4
+
+    # v8.8 (C9): tcp_timestamps=2 (kernel 4.10+, RFC 7323bis). Default 1 шлёт
+    # raw uptime-timestamps, что выдаёт boot-time машины (стелс-leak). Значение 2
+    # включает random-offset на каждое соединение — uptime скрыт, синхронизация
+    # сохранена. CONTRIBUTING #5: stealth-feature, gated to proxy preset.
+    if [ "$PRESET_NAME" = "proxy" ]; then
+        sysctl_safe net.ipv4.tcp_timestamps 2
+    fi
+
+    # v8.8 (C8): ip_local_reserved_ports — резервируем диапазон, который точно
+    # используется WireGuard/OpenVPN/IKE listener'ами. Это запрещает kernel'у
+    # выбирать эти порты в эфемерном source-port pool (ip_local_port_range).
+    # Защищает от: source-port collision с активным VPN listener (после reload),
+    # accidental leak isp-trackable-порта. Безопасно для SSH (port 22 не в pool).
+    # 51820 = WireGuard default; 1194 = OpenVPN; 500/4500 = IKEv2/IPsec; 8388 = SS;
+    # 9000-9999 = популярный xray/sing-box диапазон.
+    sysctl_safe net.ipv4.ip_local_reserved_ports "500,1194,4500,8388,9000-9999,51820"
+
     # fs limits — на случай прокси с тысячами upstream'ов.
     sysctl_safe fs.file-max 2097152
     sysctl_safe fs.nr_open 2097152
@@ -1995,8 +2082,9 @@ apply_route_initcwnd() {
     [ -z "$def_iface" ] && return 0
     # Пропускаем VPN-iface — там initcwnd не имеет смысла, а route change может
     # перетереть ту, что VPN-приложение само поставило.
+    # v8.8 (G3): расширили — Cloudflared/Tailscale/ZeroTier/utun также skip.
     case "$def_iface" in
-        tun*|tap*|wg*|ppp*|ipsec*) return 0 ;;
+        tun*|tap*|wg*|ppp*|ipsec*|cf*|cloudflared*|tailscale*|headscale*|sync*|zt*|utun*) return 0 ;;
     esac
     local change_args=(default dev "$def_iface" initcwnd 30 initrwnd 30)
     [ -n "$def_via" ] && change_args=(default via "$def_via" dev "$def_iface" initcwnd 30 initrwnd 30)
@@ -2667,6 +2755,30 @@ URLS_IOS=(
 "https://content.icloud.com/" "https://p104-content.icloud.com/"
 "https://p104-fmip.icloud.com/" "https://p104-mailws.icloud.com/"
 "https://p104-keyvalueservice.icloud.com/" "https://p104-imws.icloud.com/"
+# v8.8 (C1+C2+C3+C10+C11): iOS-stealth deep — endpoints, на которые real iOS
+# обращается постоянно. Делятся на 5 групп:
+#  C1 APNs gateway-семейство: real iOS держит постоянное TLS-соединение на
+#    gateway.push.apple.com:5223 (или :443 fallback). У нас была только
+#    /push.apple.com/ как 'noise', реальный fingerprint — это gateway.push.
+#  C2 iCloud Private Relay (Apple Network Privacy сервис) — Safari в iOS 15+
+#    маскирует часть трафика через mask.icloud.com. Безопасно noisy.
+#  C3 App Store Connect / iTunes purchase — real iPhone периодически проверяет
+#    обновления приложений через buy.itunes / appstoreconnect.
+#  C10 Apple ID auth telemetry — gsa.apple.com / idmsa.apple.com / appleid.apple.com
+#    зовутся при каждом login flow, refresh-token, 2FA-prompt.
+#  C11 MDM / Configurator endpoints — albert.apple.com при init device
+#    (DEP enrollment), configuration.apple.com.
+"https://gateway.push.apple.com/" "https://1-courier.push.apple.com/"
+"https://17-courier.push.apple.com/" "https://api-mdm.apple.com/"
+"https://mask.icloud.com/" "https://mask-h2.icloud.com/"
+"https://mask-api.icloud.com/" "https://mask.api.fastly.icloud.com/"
+"https://buy.itunes.apple.com/" "https://appstoreconnect.apple.com/"
+"https://api.appstoreconnect.apple.com/" "https://reportaproblem.apple.com/"
+"https://idmsa.apple.com/appleauth/auth/signin"
+"https://gsa.apple.com/grandslam/GsService2"
+"https://appleid.apple.com/account/manage"
+"https://albert.apple.com/deviceservices/deviceActivation"
+"https://configuration.apple.com/configurations/"
 )
 URLS_CAPTIVE=(
 "https://captive.apple.com/hotspot-detect.html"
@@ -2973,12 +3085,18 @@ http_request() {
     args+=("${referer_arg[@]}")
     args+=("${cache_args[@]}")
     if [ "$CURL_BIN" = "curl" ]; then
-        # v8.4: Safari/Chrome ходят h3 ~50% когда сервер поддерживает,
-        # а у нас было 1/3. Бампим до 1/2.
-        if (( $(urand 0 1) == 0 )) && curl --help all 2>/dev/null | grep -q -- '--http3'; then
+        # v8.8 (C5): ALPN rotation — real iOS Safari/WebKit чередует h3 / h2 /
+        # http/1.1 ~ 50/40/10. До v8.8 у нас было h3=50% / h2=50%, http/1.1=0%.
+        # Это давало weak signal для passive observers (real iOS изредка
+        # fallback'ает на http/1.1 из-за legacy CDN). Бьём 0..9 → 0-4=h3, 5-8=h2, 9=http/1.1.
+        local _alpn_pick
+        _alpn_pick=$(urand 0 9)
+        if [ "$_alpn_pick" -le 4 ] && curl --help all 2>/dev/null | grep -q -- '--http3'; then
             args+=(--http3)
-        else
+        elif [ "$_alpn_pick" -le 8 ]; then
             args+=(--http2)
+        else
+            args+=(--http1.1)
         fi
         # v8.4: TLS 1.3 0-RTT / Early Data — Safari делает на resumed sessions.
         # curl поддерживает с 7.79+. Если не поддерживается — флаг проигнорится.
@@ -4881,11 +4999,95 @@ doctor_command() {
         fi
     fi
 
+    # 17. (v8.8 K2) BBR версия — рекомендация bbr3 если доступен но не активен.
+    # bbr3 (kernel 6.4+ или google-патчи) лучше bbr/bbr2 на сильном loss и
+    # справедливее с CUBIC-соседями. Не auto-apply — только рекомендация
+    # (CONTRIBUTING #5: don't change default behaviour without opt-in).
+    local _cur_cong _avail_cong
+    _cur_cong=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    _avail_cong=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+    if [ -n "$_avail_cong" ] && [[ "$_avail_cong" == *bbr3* ]] && [ "$_cur_cong" != "bbr3" ]; then
+        echo -e "${YELLOW}[i]${NC} BBRv3 доступен но не активен (current=$_cur_cong). Активируй: sudo ./vps_optimizer.sh apply"
+    elif [ "$_cur_cong" = "bbr3" ]; then
+        echo -e "${GREEN}[ok]${NC} BBRv3 активен (kernel 6.4+ современный congestion control)"
+    elif [ "$_cur_cong" = "bbr2" ] || [ "$_cur_cong" = "bbr" ]; then
+        echo -e "${GREEN}[ok]${NC} $_cur_cong активен (bbr3 не доступен в kernel)"
+    fi
+
+    # 18. (v8.8 G1) NetworkManager coexistence — если NM управляет интерфейсом,
+    # наши `ip route` правки могут быть стёрты при reload/lease-renew. Не баг
+    # сам по себе, но критичный warning. Также ifupdown-конфликт.
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        local _nm_managed
+        _nm_managed=$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -c ':connected$' || echo 0)
+        if [ "$_nm_managed" -gt 0 ]; then
+            echo -e "${YELLOW}[i]${NC} NetworkManager активен и управляет $_nm_managed интерфейс(ами). Наши настройки RPS/IRQ persistent через systemd-unit, но routing-правки могут быть перезаписаны при NM reload."
+        fi
+    fi
+    if systemctl is-active --quiet systemd-networkd 2>/dev/null && \
+       systemctl is-active --quiet networking 2>/dev/null; then
+        echo -e "${YELLOW}[!]${NC} systemd-networkd И ifupdown(networking) одновременно активны — конфликт за управление интерфейсами. Оставь один."
+        issues=$((issues+1))
+    fi
+
+    # 19. (v8.8 E6) TCP retransmission rate из /proc/net/snmp.
+    # OutSegs vs RetransSegs — отношение даёт retrans rate. >5% — проблема
+    # с upstream (loss/congestion), >1% — заметно. На VPS обычно <0.5%.
+    if [ -r /proc/net/snmp ]; then
+        local _snmp_tcp_hdr _snmp_tcp_line _outsegs_pos _retrans_pos _outsegs _retrans
+        _snmp_tcp_hdr=$(grep '^Tcp:' /proc/net/snmp 2>/dev/null | sed -n '1p')
+        _snmp_tcp_line=$(grep '^Tcp:' /proc/net/snmp 2>/dev/null | sed -n '2p')
+        if [ -n "$_snmp_tcp_hdr" ] && [ -n "$_snmp_tcp_line" ]; then
+            _outsegs_pos=$(echo "$_snmp_tcp_hdr" | tr ' ' '\n' | grep -n '^OutSegs$' | cut -d: -f1)
+            _retrans_pos=$(echo "$_snmp_tcp_hdr" | tr ' ' '\n' | grep -n '^RetransSegs$' | cut -d: -f1)
+            if [ -n "$_outsegs_pos" ] && [ -n "$_retrans_pos" ]; then
+                _outsegs=$(echo "$_snmp_tcp_line" | awk -v p="$_outsegs_pos" '{print $p}')
+                _retrans=$(echo "$_snmp_tcp_line" | awk -v p="$_retrans_pos" '{print $p}')
+                if [ -n "$_outsegs" ] && [ "$_outsegs" -gt 1000 ] 2>/dev/null; then
+                    # rate в десятых долях процента (×1000 / OutSegs).
+                    local _rate
+                    _rate=$(awk -v r="$_retrans" -v o="$_outsegs" 'BEGIN{ if(o>0) printf "%.2f", r*100.0/o; else print "0"}')
+                    if awk -v x="$_rate" 'BEGIN{exit !(x>5.0)}'; then
+                        echo -e "${YELLOW}[!]${NC} TCP retrans rate=${_rate}% (>5%, $_retrans/$_outsegs) — серьёзный loss"
+                        issues=$((issues+1))
+                    elif awk -v x="$_rate" 'BEGIN{exit !(x>1.0)}'; then
+                        echo -e "${YELLOW}[i]${NC} TCP retrans rate=${_rate}% — заметно, обычно <1% на здоровом VPS"
+                    else
+                        echo -e "${GREEN}[ok]${NC} TCP retrans rate=${_rate}% (норма)"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # 20. (v8.8 E8) Conntrack table fill ratio. Default nf_conntrack_max
+    # обычно 65536-262144; при >70% утилизации — пакеты дропаются (logging
+    # `nf_conntrack: table full, dropping packet`). Критично для прокси.
+    if [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && \
+       [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        local _ct_cur _ct_max _ct_pct
+        _ct_cur=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+        _ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+        if [ -n "$_ct_cur" ] && [ -n "$_ct_max" ] && [ "$_ct_max" -gt 0 ] 2>/dev/null; then
+            _ct_pct=$(awk -v c="$_ct_cur" -v m="$_ct_max" 'BEGIN{printf "%.0f", c*100.0/m}')
+            if [ "$_ct_pct" -gt 70 ] 2>/dev/null; then
+                echo -e "${YELLOW}[!]${NC} Conntrack table $_ct_cur/$_ct_max (${_ct_pct}%, >70%) — повышай nf_conntrack_max"
+                issues=$((issues+1))
+            elif [ "$_ct_pct" -gt 50 ] 2>/dev/null; then
+                echo -e "${YELLOW}[i]${NC} Conntrack $_ct_cur/$_ct_max (${_ct_pct}%) — приближается к лимиту"
+            else
+                echo -e "${GREEN}[ok]${NC} Conntrack $_ct_cur/$_ct_max (${_ct_pct}%)"
+            fi
+        fi
+    fi
+
     echo ""
     if [ "$issues" -eq 0 ]; then
         echo -e "${GREEN}${BOLD}=== всё ок, проблем не найдено ===${NC}"
     else
         echo -e "${YELLOW}${BOLD}=== найдено $issues проблем(ы) — см. выше ===${NC}"
+        # v8.8 (F1): подсказываем --fix flag.
+        echo -e "${GRAY}    (попробуй ${BOLD}sudo $0 doctor --fix${NC}${GRAY} для интерактивного применения)${NC}"
     fi
 }
 
@@ -6304,7 +6506,7 @@ _vps_optimizer_complete() {
             return ;;
     esac
     if [ "$cword" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion" -- "$cur") )
+        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version" -- "$cur") )
     fi
 }
 complete -F _vps_optimizer_complete vps_optimizer.sh vps-optimizer
@@ -6333,6 +6535,11 @@ _vps_optimizer() {
         'mtr:MTR до host'
         'log-tail:Цветной tail логов'
         'bench-suite:iperf3 baseline'
+        'whoami:Текущий active config'
+        'show:Превью preset (без apply)'
+        'compare-presets:Diff двух preset'
+        'rollback:Откат к profile snapshot'
+        'version:Версия скрипта'
         'reset:Откат изменений'
         'uninstall:Полное удаление'
         'help:Справка'
@@ -6351,6 +6558,182 @@ ZSH_EOF
     echo "Активировать сейчас (для текущего shell):"
     echo "  bash: source $bash_dst"
     echo "  zsh:  fpath=($(dirname "$zsh_dst") \$fpath); autoload -U compinit && compinit"
+}
+
+# v8.8 (F4): whoami — текущий active config (preset + язык + флаги + версия).
+# Read-only, безопасно. Полезно для debug и CI: видишь что сейчас включено
+# одной командой без apply/doctor.
+whoami_command() {
+    local _preset _lang _bbr _qdisc _bbr_avail
+    _preset="balanced"
+    [ -f "$PRESET_FILE" ] && _preset=$(cat "$PRESET_FILE" 2>/dev/null)
+    _lang="$SCRIPT_LANG"
+    _bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    _qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    _bbr_avail=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+
+    if [ "${1:-}" = "--json" ]; then
+        printf '{"version":"%s","preset":"%s","lang":"%s","bbr":"%s","qdisc":"%s","bbr_available":"%s"}\n' \
+            "$SCRIPT_VERSION" "$_preset" "$_lang" "$_bbr" "$_qdisc" "$_bbr_avail"
+        return 0
+    fi
+    echo -e "${CYAN}${BOLD}=== vps-optimizer whoami ===${NC}"
+    echo "  Version:        v$SCRIPT_VERSION"
+    echo "  Preset:         $_preset (file: $PRESET_FILE)"
+    echo "  Language:       $_lang"
+    echo "  BBR:            $_bbr (available: $_bbr_avail)"
+    echo "  Qdisc:          $_qdisc"
+    echo "  Sysctl conf:    $SYSCTL_CONF"
+    echo "  Audit log:      $AUDIT_LOG"
+    if [ -d /var/lib/vps-optimizer/profiles ]; then
+        local _profiles
+        _profiles=$(find /var/lib/vps-optimizer/profiles -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l)
+        echo "  Saved profiles: $_profiles"
+    fi
+}
+
+# v8.8 (F2): show <preset> — печатает все ключевые sysctl/sysfs которые preset
+# изменит, без apply. Это превью, безопасно. Использует общие preset-функции.
+show_preset_command() {
+    local target_preset="${1:-balanced}"
+    case "$target_preset" in
+        balanced|proxy|web) ;;
+        *)
+            echo -e "${RED}show: preset должен быть balanced|proxy|web${NC}"
+            return "$EXIT_INVALID_ARGS"
+            ;;
+    esac
+    echo -e "${CYAN}${BOLD}=== Preview: --preset $target_preset ===${NC}"
+    echo "Имитируем apply через --learn (dry-run + diff). Никаких изменений на диск."
+    echo ""
+    # Re-execute self с --learn режимом и нужным preset.
+    local _self
+    _self=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [ -x "$_self" ]; then
+        "$_self" apply --learn --preset "$target_preset" 2>&1 | grep -E '(net\.|kernel\.|fs\.|vm\.|/sys/)' | head -60
+        echo ""
+        echo -e "${GRAY}    (полный вывод: sudo $0 apply --learn --preset $target_preset)${NC}"
+    fi
+}
+
+# v8.8 (F3): compare <p1> <p2> — diff двух preset'ов. Полезно понять разницу
+# proxy vs balanced vs web без apply. Read-only.
+compare_presets_command() {
+    local p1="${1:-balanced}" p2="${2:-proxy}"
+    case "$p1" in balanced|proxy|web) ;; *) echo -e "${RED}compare: preset 1 — balanced|proxy|web${NC}"; return "$EXIT_INVALID_ARGS" ;; esac
+    case "$p2" in balanced|proxy|web) ;; *) echo -e "${RED}compare: preset 2 — balanced|proxy|web${NC}"; return "$EXIT_INVALID_ARGS" ;; esac
+    if [ "$p1" = "$p2" ]; then
+        echo -e "${YELLOW}compare: оба preset одинаковые ($p1) — нечего сравнивать${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}${BOLD}=== Preset diff: $p1 vs $p2 ===${NC}"
+    local _self _t1 _t2
+    _self=$(realpath "$0" 2>/dev/null || echo "$0")
+    _t1=$(mktemp /tmp/.vps_compare_p1.XXXXXX 2>/dev/null) || return 1
+    _t2=$(mktemp /tmp/.vps_compare_p2.XXXXXX 2>/dev/null) || { rm -f "$_t1"; return 1; }
+    "$_self" apply --learn --preset "$p1" 2>&1 | grep -E '(net\.|kernel\.|fs\.|vm\.)' | sort -u > "$_t1" 2>/dev/null
+    "$_self" apply --learn --preset "$p2" 2>&1 | grep -E '(net\.|kernel\.|fs\.|vm\.)' | sort -u > "$_t2" 2>/dev/null
+    if command -v diff >/dev/null 2>&1; then
+        diff -u "$_t1" "$_t2" --label "$p1" --label "$p2" | head -100
+    else
+        echo "ONLY in $p1:"
+        comm -23 "$_t1" "$_t2"
+        echo ""
+        echo "ONLY in $p2:"
+        comm -13 "$_t1" "$_t2"
+    fi
+    rm -f "$_t1" "$_t2"
+}
+
+# v8.8 (F10): rollback --to <profile> — откат к именованному snapshot'у v8.7.
+# Использует существующий profile_command load + audit log.
+rollback_command() {
+    local profile_name="$1"
+    if [ -z "$profile_name" ]; then
+        echo -e "${RED}rollback: укажи имя профиля. Список: sudo $0 profile list${NC}"
+        return "$EXIT_INVALID_ARGS"
+    fi
+    local profiles_dir=/var/lib/vps-optimizer/profiles
+    if [ ! -f "$profiles_dir/$profile_name.tar.gz" ]; then
+        echo -e "${RED}rollback: профиль '$profile_name' не найден в $profiles_dir${NC}"
+        echo -e "${GRAY}    Список доступных: sudo $0 profile list${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}${BOLD}=== Rollback to profile: $profile_name ===${NC}"
+    echo -e "${YELLOW}Это применит сохранённый snapshot из $profiles_dir/$profile_name.tar.gz${NC}"
+    if [ "${2:-}" != "--yes" ] && [ "${FORCE:-0}" != "1" ]; then
+        printf "Продолжить? [y/N] "
+        local _yn
+        read -r _yn
+        if [ "$_yn" != "y" ] && [ "$_yn" != "Y" ]; then
+            echo "Отменено."
+            return 0
+        fi
+    fi
+    _audit rollback "profile=$profile_name"
+    profile_command load "$profile_name"
+}
+
+# v8.8 (F1): doctor --fix — интерактивно для каждого warning'а в doctor
+# предлагаем apply. CONTRIBUTING #5: opt-in (требует --fix flag).
+# Реализация простая: вызываем doctor и распознаём issue-pattern'ы; для известных
+# предлагаем команду применения. Не перезапускаем doctor, а парсим его вывод.
+doctor_fix_command() {
+    echo -e "${CYAN}${BOLD}=== doctor --fix (interactive) ===${NC}"
+    echo "Прохожу doctor; для каждого warning'а спрошу что делать."
+    echo ""
+    local _doctor_out
+    _doctor_out=$(doctor_command 2>&1)
+    echo "$_doctor_out"
+    echo ""
+    # Простой rule-based fixer. Дополнить можно по мере роста паттернов.
+    local _did_apply=0
+    if echo "$_doctor_out" | grep -q 'BBRv3 доступен но не активен'; then
+        printf "Активировать BBRv3 через apply? [y/N] "
+        local _yn; read -r _yn
+        if [ "$_yn" = "y" ] || [ "$_yn" = "Y" ]; then
+            apply_optimizations
+            _did_apply=1
+        fi
+    fi
+    if echo "$_doctor_out" | grep -q 'UDP RcvbufErrors=.* (>1000)'; then
+        printf "Поднять net.core.rmem_max до 32MB? [y/N] "
+        local _yn; read -r _yn
+        if [ "$_yn" = "y" ] || [ "$_yn" = "Y" ]; then
+            sysctl -w net.core.rmem_max=33554432 2>/dev/null && \
+                echo -e "${GREEN}[+] net.core.rmem_max=33554432 применено${NC}"
+            _audit doctor-fix "rmem_max=32M"
+        fi
+    fi
+    if echo "$_doctor_out" | grep -q 'Conntrack table .* (>70%)'; then
+        printf "Удвоить nf_conntrack_max? [y/N] "
+        local _yn; read -r _yn
+        if [ "$_yn" = "y" ] || [ "$_yn" = "Y" ]; then
+            local _cur
+            _cur=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null)
+            if [ -n "$_cur" ] && [ "$_cur" -gt 0 ] 2>/dev/null; then
+                sysctl -w "net.netfilter.nf_conntrack_max=$((_cur*2))" 2>/dev/null && \
+                    echo -e "${GREEN}[+] nf_conntrack_max=$((_cur*2)) применено${NC}"
+                _audit doctor-fix "conntrack_max_doubled=$((_cur*2))"
+            fi
+        fi
+    fi
+    if [ "$_did_apply" = "0" ]; then
+        echo -e "${GRAY}    (нет автоматически фиксимых issues — всё ok или нужно ручное вмешательство)${NC}"
+    fi
+}
+
+# v8.8 (F6): простой spinner-helper для долгих операций. Используется как:
+#   long_op &
+#   _spin $! "Описание операции"
+_spin() {
+    local pid="$1" msg="${2:-working}"
+    local i=0 chars='|/-\'
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r${CYAN}[%s]${NC} %s" "${chars:i++%${#chars}:1}" "$msg"
+        sleep 0.1
+    done
+    printf "\r"
 }
 
 print_cli_help() {
@@ -6409,9 +6792,20 @@ print_cli_help() {
     printf "    %-24s %s\n" "install-completion" "bash + zsh tab-completion"
     printf "    %-24s %s\n" "dns padding on|off" "EDNS0 padding (RFC 8467) для unbound"
     echo ""
+    echo -e "  ${BOLD}v8.8 — UX / диагностика:${NC}"
+    printf "    %-24s %s\n" "whoami [--json]" "Текущий active config (preset/lang/BBR)"
+    printf "    %-24s %s\n" "show <preset>" "Превью знаний preset без apply"
+    printf "    %-24s %s\n" "compare-presets p1 p2" "Diff двух preset (sysctl ключи)"
+    printf "    %-24s %s\n" "rollback --to <name>" "Откат к profile snapshot (v8.7)"
+    printf "    %-24s %s\n" "doctor --fix" "doctor + интерактивный apply фиксов"
+    printf "    %-24s %s\n" "version [--json]" "Версия скрипта"
+    echo ""
     echo "$(_t help_global_flags)"
     printf "    %-24s %s\n" "--dry-run" "$(_t flag_dry_run)"
     printf "    %-24s %s\n" "--quiet, -q" "$(_t flag_quiet)"
+    printf "    %-24s %s\n" "--verbose, -v" "Подробный вывод (alias --debug)"
+    printf "    %-24s %s\n" "--fix" "Для doctor: интерактивный apply фиксов"
+    printf "    %-24s %s\n" "--version, -V" "Печать версии и выход"
     printf "    %-24s %s\n" "--debug" "$(_t flag_debug "$DEBUG_LOG")"
     printf "    %-24s %s\n" "--force" "$(_t flag_force)"
     printf "    %-24s %s\n" "--preset NAME" "$(_t flag_preset)"
@@ -6514,16 +6908,31 @@ config_command() {
 
 cli_dispatch() {
     CLI_MODE=1
+    # v8.8 (F8): top-level --version handler. Поддерживает --version --json
+    # для оркестраторов.
+    if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+        if [ "${2:-}" = "--json" ]; then
+            printf '{"version":"%s","name":"vps_optimizer"}\n' "$SCRIPT_VERSION"
+        else
+            echo "vps_optimizer.sh v$SCRIPT_VERSION"
+        fi
+        exit 0
+    fi
     local cmd="$1"; shift || true
     # Парсим глобальные флаги независимо от позиции
     local args=() apply_boot_mode=0
+    # v8.8 (F1): --fix flag для doctor. Маркируем его до dispatch.
+    local doctor_fix_mode=0
+    # v8.8 (F7): --verbose флаг (--quiet уже есть). Поднимает DEBUG=1.
     while [ $# -gt 0 ]; do
         case "$1" in
             --dry-run) DRY_RUN=1 ;;
             --quiet|-q) QUIET=1 ;;
+            --verbose|-v) DEBUG=1 ;;
             --debug) DEBUG=1 ;;
             --force) FORCE=1 ;;
             --json) JSON=1 ;;
+            --fix) doctor_fix_mode=1 ;;
             --impersonate) IMPERSONATE=1 ;;
             --ecmp) ECMP=1 ;;
             --vpn) VPN_FORCE=1 ;;
@@ -6566,7 +6975,14 @@ cli_dispatch() {
                 apply_optimizations
             fi
             ;;
-        doctor)         doctor_command ;;
+        doctor)
+            # v8.8 (F1): --fix → doctor_fix_command.
+            if [ "$doctor_fix_mode" = "1" ]; then
+                doctor_fix_command
+            else
+                doctor_command
+            fi
+            ;;
         top)            top_command ;;
         mtr)
             if [ -z "${args[0]:-}" ]; then
@@ -6776,6 +7192,39 @@ cli_dispatch() {
             ;;
         install-completion|completion)
             install_completion_command
+            ;;
+        # v8.8: новые UX команды
+        whoami)
+            whoami_command "${args[0]:-}"
+            ;;
+        show)
+            show_preset_command "${args[0]:-balanced}"
+            ;;
+        compare-presets|compare-preset|preset-diff)
+            compare_presets_command "${args[0]:-balanced}" "${args[1]:-proxy}"
+            ;;
+        rollback)
+            local _rollback_target="" _rollback_yes=""
+            local _i
+            for _i in "${!args[@]}"; do
+                case "${args[$_i]}" in
+                    --to) _rollback_target="${args[$((_i+1))]:-}" ;;
+                    --yes) _rollback_yes="--yes" ;;
+                    --to=*) _rollback_target="${args[$_i]#*=}" ;;
+                esac
+            done
+            # Поддерживаем legacy форму: rollback <name> без --to.
+            if [ -z "$_rollback_target" ] && [ -n "${args[0]:-}" ] && [ "${args[0]}" != "--yes" ]; then
+                _rollback_target="${args[0]}"
+            fi
+            rollback_command "$_rollback_target" "$_rollback_yes"
+            ;;
+        version|--version|-V)
+            if [ "${args[0]:-}" = "--json" ]; then
+                printf '{"version":"%s","name":"vps_optimizer"}\n' "$SCRIPT_VERSION"
+            else
+                echo "vps_optimizer.sh v$SCRIPT_VERSION"
+            fi
             ;;
         help|-h|--help) print_cli_help ;;
         *)         echo -e "${RED}Неизвестная команда: $cmd${NC}"; print_cli_help; exit 1 ;;
@@ -7049,7 +7498,32 @@ if [ $# -gt 0 ]; then
     # help/status/version/prom-metrics — без проверки root, остальные команды требуют sudo
     case "$1" in
         help|-h|--help) print_cli_help; exit 0 ;;
-        version|--version|-V) echo "vps_optimizer.sh v$SCRIPT_VERSION"; exit 0 ;;
+        version|--version|-V)
+            # v8.8 (F8): поддержка --json для оркестраторов.
+            shift
+            if [ "${1:-}" = "--json" ]; then
+                printf '{"version":"%s","name":"vps_optimizer"}\n' "$SCRIPT_VERSION"
+            else
+                echo "vps_optimizer.sh v$SCRIPT_VERSION"
+            fi
+            exit 0
+            ;;
+        # v8.8: whoami / show / compare — read-only, без root
+        whoami)
+            shift
+            whoami_command "${1:-}"
+            exit 0
+            ;;
+        show)
+            shift
+            show_preset_command "${1:-balanced}"
+            exit 0
+            ;;
+        compare-presets|compare-preset|preset-diff)
+            shift
+            compare_presets_command "${1:-balanced}" "${2:-proxy}"
+            exit 0
+            ;;
         config)
             # v8.6: config show — без root; config lang — требует root для записи
             shift

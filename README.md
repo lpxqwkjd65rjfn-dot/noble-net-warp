@@ -302,7 +302,57 @@ help                            Print full help
 
 ## Changelog
 
-### v8.7 — UX overhaul + sysctl + iOS-stealth deepening (current)
+### v8.8 — kernel-стек 2024 + iOS-стелс 2.0 + UX-доводка (current)
+
+Несовместимых изменений нет. Все default-флаги совпадают с v8.7. Никаких новых
+правил firewall/routing. SSH/VPN не трогается ни одной командой по дефолту.
+
+**🚀 Прорывной kernel-стек 2024** (probe-then-write, gracefully skip на старых ядрах):
+- **BIG TCP for IPv6** (kernel 6.3+) — `gso_max_size` / `gro_max_size` поднимаем с 64 K до **192 K**. На 10 G+ NIC это даёт +20-40% throughput через уменьшение per-segment overhead. На kernel <6.3 fallback к 64 K автоматически.
+- **TCP BBRv3** (kernel 6.4+) — auto-detect и use если доступен в kernel; в `doctor` теперь рекомендация активировать BBRv3 если он есть, но не активен (без auto-apply на live-системе).
+- **Accurate ECN** (`tcp_ecn=3`, kernel 6.0+, RFC 9341) — точнее классического ECN на mixed-ECN-router путях. Gated на kernel ≥6.0.
+- **`txqueuelen` auto-tune** — на 10 G NIC выставляем 5000, на 25 G+ NIC — 10000 (default 1000 — узкое место для bursty traffic). Не растёт memory footprint в idle.
+- **`tcp_min_rtt_wlen`** — на balanced/web preset возвращён к 300 s (быстрее адаптация на переменчивых VPS); proxy preset сохраняет 600 s (стабильнее BBR).
+- **`tcp_syn_linear_timeouts=4`** (kernel 6.4+) — линейный backoff для thin-stream SYN retransmits.
+
+**🎭 iOS стелс 2.0** (углубление маскировки под real iOS 17/18):
+- **APNs gateway endpoints** — `gateway.push.apple.com`, `1-courier.push.apple.com`, `17-courier.push.apple.com`. Real iOS держит на них постоянное TLS-соединение.
+- **iCloud Private Relay** — `mask.icloud.com`, `mask-h2.icloud.com`. Apple Network Privacy сервис, Safari в iOS 15+ ходит туда регулярно.
+- **App Store Connect** — `appstoreconnect.apple.com`, `buy.itunes.apple.com`. Real iPhone проверяет обновления приложений.
+- **Apple ID auth telemetry** — `idmsa.apple.com`, `gsa.apple.com`, `appleid.apple.com`. Fired на каждый login flow / refresh-token / 2FA.
+- **MDM / Configurator** — `albert.apple.com`, `configuration.apple.com`. Activation-related endpoints.
+- **ALPN rotation в noise** — h3 ~50% / h2 ~40% / http/1.1 ~10% (раньше было 50/50). Real iOS периодически falls back на http/1.1.
+- **`tcp_timestamps=2`** (kernel 4.10+, gated to proxy preset) — random-offset вместо raw uptime; скрывает boot-time машины.
+- **`ip_local_reserved_ports`** — резерв портов VPN-listener'ов (500/1194/4500/8388/9000-9999/51820) от source-port pool. Защищает от collision и leak.
+
+**🎨 UX / диагностика — доводка**:
+- `vps_optimizer.sh whoami [--json]` — текущий active config (preset/lang/BBR/qdisc/profiles count). Read-only, без root.
+- `vps_optimizer.sh show <preset>` — превью того, что preset изменит, без apply.
+- `vps_optimizer.sh compare-presets <p1> <p2>` — diff sysctl-знаний двух preset'ов.
+- `vps_optimizer.sh rollback --to <name>` — откат к именованному snapshot'у v8.7. С confirmation (override через `--yes`).
+- `vps_optimizer.sh doctor --fix` — интерактивный mode: для каждого warning'а в doctor предлагает конкретный fix с Y/n prompt.
+- `vps_optimizer.sh --version [--json]` / `version --json` — для оркестраторов.
+- `--verbose` (alias `--debug`).
+
+**🩺 Diagnostics + safety**:
+- doctor проверяет **TCP retrans rate** (RetransSegs/OutSegs из /proc/net/snmp) — warn >1%, error >5%.
+- doctor проверяет **conntrack table fill ratio** — warn >50%, error >70%.
+- doctor предупреждает если **NetworkManager управляет интерфейсами** (наши routing-правки могут быть стёрты при reload).
+- doctor предупреждает если **systemd-networkd И ifupdown(networking)** одновременно активны.
+- VPN-iface skip-list расширен: **Cloudflared (`cf*`), Tailscale/Headscale (`tailscale*`/`headscale*`), Resilio Sync (`sync*`), ZeroTier (`zt*`), OpenVPN named (`utun*`)**. Раньше skip только `tun*/tap*/wg*/ppp*/ipsec*`.
+
+**Quick-start**:
+```
+sudo ./vps_optimizer.sh whoami              # текущая конфигурация
+sudo ./vps_optimizer.sh show proxy          # что preset proxy изменит, без apply
+sudo ./vps_optimizer.sh compare-presets balanced proxy   # diff между preset
+sudo ./vps_optimizer.sh apply --learn       # dry-run + diff (без записи)
+sudo ./vps_optimizer.sh apply --preset proxy
+sudo ./vps_optimizer.sh doctor --fix        # интерактивные фиксы
+sudo ./vps_optimizer.sh rollback --to before-tuning   # откат к profile snapshot
+```
+
+### v8.7 — UX overhaul + sysctl + iOS-stealth deepening
 
 Несовместимых изменений нет. Все default-флаги совпадают с v8.6. Никаких новых
 правил firewall/routing. SSH/VPN не трогается ни одной командой по дефолту.
