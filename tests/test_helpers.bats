@@ -256,8 +256,9 @@ setup() {
 # v8.7 tests
 # ============================================================================
 
-@test "v8.7: SCRIPT_VERSION is 8.7" {
-    run grep -E '^SCRIPT_VERSION="8\.7"' "$SCRIPT"
+@test "v8.7: SCRIPT_VERSION is at least 8.7" {
+    # SCRIPT_VERSION может быть 8.7+ (8.8, 8.9, ...) — bump в новых релизах ок.
+    run grep -E '^SCRIPT_VERSION="8\.[7-9]"' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
@@ -389,5 +390,171 @@ setup() {
 
 @test "v8.7 fix R10-3: bench_suite_command calls _audit (CONTRIBUTING #8)" {
     run grep '_audit bench-suite' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8: SCRIPT_VERSION is 8.8" {
+    run grep -E '^SCRIPT_VERSION="8\.8"$' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 K1: BIG TCP IPv6 — gso/gro_max=196608 on kernel 6.3+" {
+    run grep '_gso_target=196608' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'gso_max_size "?\$_gso_target' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'gro_max_size "?\$_gso_target' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 K3: Accurate ECN tcp_ecn=3 gated to kernel 6.0+" {
+    run grep -E 'sysctl_safe net\.ipv4\.tcp_ecn 3' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # AccECN must be inside a kernel-version check — line above must have _krn_maj >= 6
+    run grep -B5 'sysctl_safe net\.ipv4\.tcp_ecn 3' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'_krn_maj'* ]] || [[ "$output" == *'kernel'* ]]
+}
+
+@test "v8.8 N1: txqueuelen auto-tune for 10G+ links" {
+    run grep -E 'txqueuelen 5000' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'txqueuelen 10000' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 A2: tcp_min_rtt_wlen=300 on non-proxy preset" {
+    # Non-proxy presets get 300; proxy keeps 600 from v8.4.
+    run grep -B3 'sysctl_safe net.ipv4.tcp_min_rtt_wlen 300' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'PRESET_NAME'*'!='*'proxy'* ]]
+}
+
+@test "v8.8 A5: tcp_syn_linear_timeouts=4" {
+    run grep -E 'sysctl_safe net\.ipv4\.tcp_syn_linear_timeouts 4' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 C8: ip_local_reserved_ports for VPN listeners" {
+    run grep -E 'sysctl_safe net\.ipv4\.ip_local_reserved_ports' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '51820' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '1194' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 C9: tcp_timestamps=2 only on proxy preset" {
+    # CONTRIBUTING #5: stealth knob gated to proxy.
+    run grep -B3 'sysctl_safe net.ipv4.tcp_timestamps 2' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'PRESET_NAME'*'='*'proxy'* ]]
+}
+
+@test "v8.8 C1: APNs gateway endpoints in noise pool" {
+    run grep 'gateway.push.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'courier.push.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 C2: iCloud Private Relay endpoints" {
+    run grep 'mask.icloud.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'mask-h2.icloud.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 C3+C10+C11: App Store + Apple ID + Configurator endpoints" {
+    run grep 'appstoreconnect.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'idmsa.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'albert.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 C5: ALPN rotation distributes h3/h2/http/1.1 (50/40/10)" {
+    run grep '_alpn_pick' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '\-\-http1\.1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 G3: VPN-iface skip-list extended (cloudflared/tailscale/zerotier)" {
+    run grep -E 'cloudflared\*|tailscale\*|zt\*|utun\*' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 G1: doctor checks NetworkManager coexistence" {
+    run grep -E 'NetworkManager.*активен.*управляет|NetworkManager.*coexistence' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 E6: doctor calculates TCP retrans rate" {
+    run grep -E 'TCP retrans rate' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'RetransSegs' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 E8: doctor checks conntrack table fill ratio" {
+    run grep -E 'Conntrack.*table|nf_conntrack_max' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_ct_pct' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 K2: doctor recommends BBRv3 if available but not active" {
+    run grep -E 'BBRv3 доступен но не активен' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 F4: whoami_command exists and supports --json" {
+    run grep '^whoami_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -A20 '^whoami_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"--json"'* ]]
+}
+
+@test "v8.8 F2: show_preset_command exists" {
+    run grep '^show_preset_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 F3: compare_presets_command exists" {
+    run grep '^compare_presets_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 F10: rollback_command uses profile snapshots" {
+    run grep '^rollback_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -A30 '^rollback_command()' "$SCRIPT"
+    [[ "$output" == *'profile_command load'* ]]
+    run grep -A30 '^rollback_command()' "$SCRIPT"
+    [[ "$output" == *'_audit rollback'* ]]
+}
+
+@test "v8.8 F1: doctor_fix_command provides interactive fixes" {
+    run grep '^doctor_fix_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit doctor-fix' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 F8: --version --json supported" {
+    run grep -E '"name":"vps_optimizer"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8 F7: --verbose flag aliased to --debug" {
+    run grep -E '\-\-verbose\|-v' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.8: bash completion includes new commands" {
+    run grep -E 'whoami show compare-presets rollback version' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
