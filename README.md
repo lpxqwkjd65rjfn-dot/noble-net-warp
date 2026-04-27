@@ -319,9 +319,9 @@ vps_optimizer.sh --no-color help          # отключить ANSI (или NO_C
 ```
 
 **⚡ Quick-win sysctl** (probe-then-write):
-- `net.ipv4.tcp_reordering 6 → 10` + `tcp_max_reordering 300 → 600` — устойчивость к джиттеру (Wi-Fi / спутник / RU↔EU).
-- `net.ipv4.tcp_thin_dupack=1` — для interactive-стримов (SSH, gRPC keepalive).
-- `kernel.numa_balancing=0` — auto-disable на VPS с 1 NUMA-узлом (через `numactl --hardware` или `/sys/devices/system/node`).
+- `net.ipv4.tcp_reordering 6 → 10` + `tcp_max_reordering 300 → 600` — устойчивость к джиттеру (Wi-Fi / спутник / RU↔EU). Все пресеты.
+- `net.ipv4.tcp_thin_dupack=1` — **только `--preset proxy`** (per CONTRIBUTING #5: tcp_thin_*). Для interactive thin-streams (SSH, gRPC keepalive) ускоряет fast-retx.
+- `kernel.numa_balancing=0` — auto-disable на VPS с 1 NUMA-узлом (через `numactl --hardware` или `/sys/devices/system/node`). На multi-socket bare-metal остаётся включённым.
 - `cpufreq governor=performance` где `/sys/devices/.../scaling_governor` доступен на запись.
 
 **🎭 iOS stealth quick-wins:**

@@ -233,7 +233,21 @@ setup() {
 }
 
 # === v8.6: numa_balancing auto-detect ===
-@test "v8.6: numa_balancing only on 1-node hosts" {
-    run grep -E 'numa_balancing 0' "$SCRIPT"
+@test "v8.6: numa_balancing 0 only inside NUMA-detect blocks (no unconditional)" {
+    # Sanity: numa_balancing 0 must appear at least once
+    run grep -c 'numa_balancing 0' "$SCRIPT"
     [ "$status" -eq 0 ]
+    [ "$output" -ge 1 ]
+    # Each numa_balancing 0 line must have a NUMA-detection sentinel (numactl
+    # output OR /sys/devices/system/node) within 8 lines above.
+    while IFS= read -r line_num; do
+        [ -z "$line_num" ] && continue
+        local from=$((line_num - 8))
+        [ "$from" -lt 1 ] && from=1
+        run sed -n "${from},${line_num}p" "$SCRIPT"
+        [[ "$output" == *'numactl'* ]] || [[ "$output" == *'/sys/devices/system/node'* ]] || {
+            echo "Line $line_num has numa_balancing 0 with no NUMA detection above"
+            false
+        }
+    done < <(grep -n 'numa_balancing 0' "$SCRIPT" | cut -d: -f1)
 }

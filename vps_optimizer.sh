@@ -1750,7 +1750,9 @@ apply_sysctls() {
     # Безопасные kernel/sched доводки.
     sysctl_safe kernel.sched_migration_cost_ns 5000000
     sysctl_safe kernel.sched_autogroup_enabled 0
-    sysctl_safe kernel.numa_balancing 0
+    # v8.6: kernel.numa_balancing — больше не выставляем безусловно, теперь только
+    # на 1-NUMA-узловых VPS (auto-detect вверху, ~line 1447). На multi-socket
+    # bare-metal оставляем включённым, иначе теряем balanced placement.
     sysctl_safe kernel.timer_migration 1
     # fs limits — на случай прокси с тысячами upstream'ов.
     sysctl_safe fs.file-max 2097152
