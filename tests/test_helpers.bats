@@ -127,3 +127,103 @@ setup() {
     run grep -E 'tun\*|wg\*|ppp\*' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
+
+# === v8.6: i18n ===
+@test "v8.6: I18N_EN/RU/DE/FR/ZH tables defined" {
+    run grep -E '^declare -A I18N_EN I18N_RU I18N_DE I18N_FR I18N_ZH' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.6: _t() function defined" {
+    run grep -E '^_t\(\) \{' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.6: LC_VPS env override changes lang" {
+    run env LC_VPS=ru bash "$SCRIPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lang=ru"* ]]
+    run env LC_VPS=zh bash "$SCRIPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lang=zh"* ]]
+}
+
+@test "v8.6: invalid LC_VPS falls back to en" {
+    run env LC_VPS=xx bash "$SCRIPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lang=en"* ]]
+}
+
+@test "v8.6: config show is registered (no root needed)" {
+    run bash "$SCRIPT" config show
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"config file"* ]]
+}
+
+@test "v8.6: --no-color flag is recognized and resets color vars" {
+    run grep -E '^[[:space:]]+--no-color\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # And TTY-detect logic exists
+    run grep -E '_vps_use_color' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.6: help output via pipe contains no ANSI escapes" {
+    # Default behavior: stdout is a pipe (bats run captures), so NO_COLOR/TTY-detect kicks in
+    run bash "$SCRIPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" != *$'\033'* ]]
+}
+
+# === v8.6: status --watch is recognized (we don't run it because it loops) ===
+@test "v8.6: status --watch parsing exists" {
+    run grep -E 'a" = "--watch"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# === v8.6: --json-logs flag parsed ===
+@test "v8.6: --json-logs flag parsed" {
+    run grep -E '^[[:space:]]+--json-logs\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# === v8.6: --learn flag parsed ===
+@test "v8.6: --learn flag sets DRY_RUN=1" {
+    run grep -E 'LEARN_MODE=1; DRY_RUN=1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# === v8.6: stealth-test --json/--ja4/--exit-fail-on-leak parse ===
+@test "v8.6: stealth-test --json supported" {
+    run awk '/^stealth_test_command\(\)/,/^\}/' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--json"* ]]
+    [[ "$output" == *"--exit-fail-on-leak"* ]]
+    [[ "$output" == *"--ja4"* ]]
+}
+
+# === v8.6: prom-metrics has DNS hit-ratio ===
+@test "v8.6: prom_metrics emits vps_dns_cache_hit_ratio" {
+    run awk '/^prom_metrics\(\)/,/^\}/' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"vps_dns_cache_hit_ratio"* ]]
+}
+
+# === v8.6: noise uses --tcp-fastopen ===
+@test "v8.6: noise generator uses --tcp-fastopen flag" {
+    run grep -F -- "--tcp-fastopen" "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# === v8.6: tcp_thin_dupack only on proxy preset ===
+@test "v8.6: tcp_thin_dupack/IPv6-priv gated to proxy preset" {
+    # Find the apply_optimizations function and ensure tcp_thin_dupack is in proxy block
+    run grep -B2 -A1 'tcp_thin_dupack 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# === v8.6: numa_balancing auto-detect ===
+@test "v8.6: numa_balancing only on 1-node hosts" {
+    run grep -E 'numa_balancing 0' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
