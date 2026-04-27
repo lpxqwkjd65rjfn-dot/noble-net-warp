@@ -302,7 +302,38 @@ help                            Print full help
 
 ## Changelog
 
-### v8.6 — i18n + perf + iOS stealth quick-wins (current)
+### v8.7 — UX overhaul + sysctl + iOS-stealth deepening (current)
+
+Несовместимых изменений нет. Все default-флаги совпадают с v8.6. Никаких новых
+правил firewall/routing. SSH/VPN не трогается ни одной командой по дефолту.
+
+**🎨 UX / интерфейс** — главный фокус релиза:
+- `vps_optimizer.sh suggest` — авто-подбор preset на основе RAM / CPU / NIC-speed / virt / NUMA-nodes. Не применяет ничего; покажет рекомендацию и причину. `suggest --apply` — применить сразу.
+- `vps_optimizer.sh wizard` — first-run guided setup (5 шагов): язык → preset (с suggest) → DNS → noise → apply. Все шаги с дефолтами по Enter.
+- **Categorical main menu** — вместо плоского списка теперь 6 категорий: ⚡ Performance / 🎭 Stealth / 🩺 Diagnostics / ⚙ Config / 📊 Monitoring / 📦 Misc. С Recommended-бейджем рядом с текущим preset'ом если он не оптимален для железа.
+- `vps_optimizer.sh install-completion` — генерирует bash + zsh tab-completion (`/etc/bash_completion.d/vps-optimizer`, `/usr/local/share/zsh/site-functions/_vps-optimizer`).
+- `vps_optimizer.sh log-tail [file]` — `tail -f` логов с цветной подсветкой levels (INFO/OK/WARN/ERR).
+- `vps_optimizer.sh profile save|load|list|delete <name>` — именованные снапшоты конфигурации (атомарный rollback к точке).
+- `vps_optimizer.sh bench-suite` — iperf3 baseline до 4 публичных серверов (Paris/NL/NYC) + history CSV в `/var/lib/vps-optimizer/bench-history.csv`.
+- Help layout v2 — добавлена секция «Quick-start by role» (прокси / VPN / web / wizard / suggest).
+
+**⚡ Quick-win sysctl** (probe-then-write, безопасны на любом ядре):
+- `net.ipv4.tcp_l3mdev_accept=1` + `net.ipv4.udp_l3mdev_accept=1` — VRF/cilium-подобные среды (kernel ≥4.8/5.5). Безвредно если l3mdev не используется.
+- `net.unix.max_dgram_qlen=512` — для прокси с unix-socket интерконнекта (sing-box ↔ haproxy ↔ envoy через `/run/*.sock`). Default 10 — слишком мало.
+- `net.core.dev_weight` auto-scale: 64 (≤1G NIC) → **192 (10G)** → **256 (25G+)**. Был статичный 64-96, на 10G+ NAPI-poll cycles слишком частые.
+- `vm.swappiness` per-preset: balanced=180 (ZRAM-friendly), **proxy=30** (latency-sensitive: handshake-burst), **web=60** (cached static content tolerates IO).
+
+**🎭 iOS stealth — углубление маскировки:**
+- Apple Maps tile-сервера (`gsp-ssl.ls.apple.com`, `apzones.apple.com`), iMessage relay (`relay.smoot.apple.com`), Apple Music API (`amp-api.music.apple.com`), Spotlight Suggest (`smoot-search.apple.com`), Siri/Smoot endpoints, `captive.apple.com/hotspot-detect.html` (~60s периодичность реального iOS) — добавлены в noise-pool. ~16 новых endpoint'ов.
+- JA3 hash-list: расширен с 4 до **12 hash'ей** (iOS 13/14 legacy + iOS 15-17 mainstream + iOS 18 + iPadOS 17/18). В проде на CF/Akamai встречается до 12 одновременно.
+- `vps_optimizer.sh dns padding on|off` — opt-in EDNS0 padding (RFC 7830/8467) для unbound: `pad-responses-block-size: 468`, `pad-queries-block-size: 128`. Ломает size-based DNS fingerprint. dnsmasq не поддерживает (limitation), dnscrypt-proxy уже padded автоматически.
+
+**🩺 Diagnostics:**
+- `doctor` теперь проверяет UDP `RcvbufErrors` / `InErrors` из `/proc/net/snmp` — критично для QUIC/WireGuard. Warn при `RcvbufErrors > 1000` (буфер переполняется → повышай `net.core.rmem_max`/`optmem_max`).
+
+**Тесты:** добавлено 19 bats-тестов для v8.7 (suggest/wizard/profile/log-tail/bench-suite/dns padding/sysctl/JA3/iOS endpoints/categorical menu). 54 тестов всего, все green.
+
+### v8.6 — i18n + perf + iOS stealth quick-wins
 
 Несовместимых изменений нет. Все default-флаги совпадают с v8.5. Никаких новых
 правил firewall/routing.

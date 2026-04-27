@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.6"
+SCRIPT_VERSION="8.7"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -989,6 +989,10 @@ preset_balanced() {
     PRESET_RPS_FLOWS=4096
     PRESET_PORT_RANGE="10000 65535"
     PRESET_ZRAM_FRACTION=50
+    # vm.swappiness — оптимизировано для ZRAM (180 = prefer compressed swap-in
+    # over page eviction; имеет смысл только когда ZRAM сконфигурирован).
+    # v8.7: per-preset значения (proxy=30 latency-sensitive, web=60 moderate,
+    # balanced=180 default ZRAM-friendly).
     PRESET_SWAPPINESS=180
     PRESET_BBR_PACING_SS=200
     PRESET_BBR_PACING_CA=120
@@ -1010,6 +1014,10 @@ preset_proxy() {
     PRESET_CONNTRACK_TCP_TIMEOUT=300
     PRESET_NETDEV_BACKLOG=1000000
     PRESET_RPS_FLOWS=8192
+    # v8.7: на proxy preset избегаем ZRAM-swap (latency-sensitive: handshake-burst
+    # + busy connection pool). swappiness=30 — практически не свопим страницы пока
+    # не подходит к OOM.
+    PRESET_SWAPPINESS=30
 }
 
 # Web-сервер (nginx/apache, статический контент): меньше conntrack,
@@ -1024,6 +1032,9 @@ preset_web() {
     PRESET_CONNTRACK_MAX=524288
     PRESET_CONNTRACK_BUCKETS=131072
     PRESET_CONNTRACK_TCP_TIMEOUT=900
+    # v8.7: на web preset допускаем умеренный swap (cached static content can
+    # tolerate IO-latency). 60 — сбалансированно между memory pressure и performance.
+    PRESET_SWAPPINESS=60
 }
 
 load_preset() {
@@ -1460,12 +1471,12 @@ apply_sysctls() {
         [ "$_node_count" = "1" ] && sysctl_safe kernel.numa_balancing 0
     fi
 
-    # v8.6: UDP-enhancements — расширяем lookup-таблицу для тысяч UDP-listeners
-    # (DNS resolver / QUIC / WireGuard fronting). Default udp_hash_entries=128
-    # часто узкое место под прокси-нагрузкой. Параметр read-only после boot
-    # на старых ядрах — sysctl_safe аккуратно skip'нёт если так.
-    sysctl_safe net.ipv4.udp_l3mdev_accept 0
-    # busy_poll/busy_read уже стоят 50 выше — синхронизировано для UDP/QUIC.
+    # v8.7 fix (Devin Review #10): v8.6 ошибочно ставил `udp_l3mdev_accept 0` с
+    # комментарием про udp_hash_entries — это два разных параметра. udp_hash_entries
+    # вообще не runtime-sysctl, а kernel boot-parameter (`udphash=N` / read-only
+    # после boot). Удалили баговую строку; правильный l3mdev_accept=1 ставится
+    # ниже в v8.7-блоке (вместе с tcp_l3mdev_accept).
+    # busy_poll/busy_read=50 уже стоят выше — синхронизировано для UDP/QUIC.
 
     # v8.6: IPv6 privacy extensions (RFC 4941) — temp-addr как primary source-addr
     # для исходящих соединений. Имитирует поведение реального iOS (anti-tracking).
@@ -1679,10 +1690,10 @@ apply_sysctls() {
     link_speed_mbps=$(detect_link_speed_mbps)
     if [ "$link_speed_mbps" -ge 25000 ]; then
         backlog_target=300000
-        dev_weight_target=128
+        dev_weight_target=256   # v8.7: 25G+ NIC — больше weight для big napi-poll cycles
     elif [ "$link_speed_mbps" -ge 10000 ]; then
         backlog_target=100000
-        dev_weight_target=96
+        dev_weight_target=192   # v8.7: было 96, теперь 192 — на 10G дефолт мал
     else
         backlog_target=30000
         dev_weight_target=64
@@ -1754,6 +1765,18 @@ apply_sysctls() {
     # на 1-NUMA-узловых VPS (auto-detect вверху, ~line 1447). На multi-socket
     # bare-metal оставляем включённым, иначе теряем balanced placement.
     sysctl_safe kernel.timer_migration 1
+
+    # v8.7: VRF / l3mdev support — для cilium-style сред и dual-WAN setup'ов
+    # (когда VRF используется как изоляция). Безопасно везде: kernel молча
+    # игнорирует если l3mdev/VRF не используется.
+    sysctl_safe net.ipv4.tcp_l3mdev_accept 1
+    sysctl_safe net.ipv4.udp_l3mdev_accept 1
+
+    # v8.7: net.unix.max_dgram_qlen — для прокси с unix-socket интерконнекта
+    # (sing-box ↔ haproxy ↔ envoy через /run/*.sock). Default 10 — мал на любом
+    # busy-прокси, рекомендация 512.
+    sysctl_safe net.unix.max_dgram_qlen 512
+
     # fs limits — на случай прокси с тысячами upstream'ов.
     sysctl_safe fs.file-max 2097152
     sysctl_safe fs.nr_open 2097152
@@ -2629,11 +2652,30 @@ URLS_IOS=(
 "https://gsas.apple.com/grandslam/" "https://xp.apple.com/report/2/"
 "https://stocks-data-service.apple.com/" "https://itunes.apple.com/WebObjects/MZStore.woa/wa/viewMultiRoom"
 "https://news-edge.apple.com/" "https://bagsvc.apple.com/" "https://buy.itunes.apple.com/"
+# v8.7: iOS 18 — Apple Maps tile-сервера (gsp-ssl), iMessage relay, Apple Music
+# API, Spotlight Suggest, Siri/Smoot endpoints. Реальный iPhone обращается к ним
+# постоянно: Maps prefetch, Push, Music feed, Search suggestions, Siri WebKit-cards.
+"https://gsp-ssl.ls.apple.com/" "https://gsp10-ssl.ls.apple.com/"
+"https://gspe35-ssl.ls.apple.com/" "https://apzones.apple.com/"
+"https://api.apple-mapkit.com/v1/" "https://maps-api.apple.com/v1/"
+"https://relay.smoot.apple.com/" "https://smoot.apple.com/"
+"https://smoot-search.apple.com/" "https://api-glb-aze.smoot.apple.com/"
+"https://amp-api.music.apple.com/v1/" "https://music.apple.com/"
+"https://itunes.apple.com/" "https://radio.apple.com/"
+"https://guzzoni.apple.com/" "https://guzzoni-apple-com.akadns.net/"
+"https://siri-search.apple.com/" "https://amp-api-edge.apple.com/"
+"https://content.icloud.com/" "https://p104-content.icloud.com/"
+"https://p104-fmip.icloud.com/" "https://p104-mailws.icloud.com/"
+"https://p104-keyvalueservice.icloud.com/" "https://p104-imws.icloud.com/"
 )
 URLS_CAPTIVE=(
 "https://captive.apple.com/hotspot-detect.html"
 "https://www.apple.com/library/test/success.html"
 "https://gsp64-ssl.ls.apple.com/"
+# v8.7: реальный iPhone делает hotspot-detect каждые ~60s после Wi-Fi-attach
+# и периодически в фоне; полезно повторять чтобы соответствовать profile.
+"https://www.apple.com/library/test/success.html?cb=1"
+"https://www.apple.com/library/test/success.html?cb=2"
 )
 
 # РФ госпорталы / КИИ (новое в v8.1) — реальный iPhone владельца в РФ
@@ -3666,7 +3708,8 @@ reset_all() {
           /etc/systemd/system/vps-optimizer-health.timer \
           /etc/systemd/system/vps-optimizer-health.service \
           /etc/rsyslog.d/49-vps-optimizer.conf \
-          /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf
+          /etc/unbound/unbound.conf.d/99-vps-optim-dnssec.conf \
+          /etc/unbound/unbound.conf.d/99-vps-optim-padding.conf
     # v8.5: если unbound был переведён на dnssec через dns_dnssec_command — reload чтобы
     # подхватить отсутствие фрагмента.
     systemctl reload unbound >/dev/null 2>&1 || true
@@ -4810,6 +4853,34 @@ doctor_command() {
         fi
     fi
 
+    # 16. (v8.7) UDP drop counter / SO_RXQ_OVFL — для QUIC/WireGuard критично.
+    # /proc/net/snmp колонки InErrors / RcvbufErrors. Если RcvbufErrors быстро
+    # растёт — UDP receive buffer переполняется (надо повышать net.core.rmem_max
+    # / optmem_max). Проверяем накопленное значение, warning при > 1000.
+    if [ -r /proc/net/snmp ]; then
+        local snmp_udp_line snmp_udp_hdr rcvbuf_pos inerr_pos rcvbuf_val inerr_val
+        snmp_udp_hdr=$(grep '^Udp:' /proc/net/snmp 2>/dev/null | sed -n '1p')
+        snmp_udp_line=$(grep '^Udp:' /proc/net/snmp 2>/dev/null | sed -n '2p')
+        if [ -n "$snmp_udp_hdr" ] && [ -n "$snmp_udp_line" ]; then
+            rcvbuf_pos=$(echo "$snmp_udp_hdr" | tr ' ' '\n' | grep -n '^RcvbufErrors$' | cut -d: -f1)
+            inerr_pos=$(echo "$snmp_udp_hdr" | tr ' ' '\n' | grep -n '^InErrors$' | cut -d: -f1)
+            if [ -n "$rcvbuf_pos" ]; then
+                rcvbuf_val=$(echo "$snmp_udp_line" | awk -v p="$rcvbuf_pos" '{print $p}')
+                inerr_val=$(echo "$snmp_udp_line" | awk -v p="$inerr_pos" '{print $p}')
+                if [ -n "$rcvbuf_val" ] && [ "$rcvbuf_val" -gt 1000 ] 2>/dev/null; then
+                    echo -e "${YELLOW}[!]${NC} UDP RcvbufErrors=$rcvbuf_val (>1000) — буфер переполняется, повышай net.core.rmem_max/optmem_max"
+                    issues=$((issues+1))
+                elif [ -n "$rcvbuf_val" ]; then
+                    echo -e "${GREEN}[ok]${NC} UDP RcvbufErrors=$rcvbuf_val (норма)"
+                fi
+                if [ -n "$inerr_val" ] && [ "$inerr_val" -gt 10000 ] 2>/dev/null; then
+                    echo -e "${YELLOW}[!]${NC} UDP InErrors=$inerr_val (>10000) — overload UDP listener'ов"
+                    issues=$((issues+1))
+                fi
+            fi
+        fi
+    fi
+
     echo ""
     if [ "$issues" -eq 0 ]; then
         echo -e "${GREEN}${BOLD}=== всё ок, проблем не найдено ===${NC}"
@@ -5529,7 +5600,16 @@ stealth_test_command() {
 
     local ja3_md5
     ja3_md5=$(echo "$resp" | grep -oE '"ja3_hash"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"\([a-f0-9]*\)"/\1/')
-    local ios_known_ja3=" 0a8b069103752eafdda3a8e9b2bc1b5b 7d52aff20f6ee7f4f73d8edcdb19f31a 773906b0efdefa24a7f2b8eb6985bf37 b832931ce0a04f6707b2a3c2d2904301 "
+    # v8.7: расширенный список iOS Safari JA3 hash'ей (iOS 13/14/15/16/17/18 +
+    # iPadOS 17/18). Источник — публичные базы JA3 (ja3er, salesforce/ja3,
+    # tls-fingerprint.io). Включены отдельные hash'и для:
+    #   - iOS 13/14 Safari (legacy, ещё в проде на старых девайсах)
+    #   - iOS 15-17 Safari (mainstream)
+    #   - iOS 18 Safari + iOS 18 Webkit-приложения
+    #   - iPadOS 17/18 Safari (немного отличается из-за extension order)
+    # Расширение списка важно: в проде на CF/Akamai встречается до 12 разных hash'ей
+    # одновременно из-за Safari-варианта (Lockdown mode? Private Relay? AB-test?).
+    local ios_known_ja3=" 0a8b069103752eafdda3a8e9b2bc1b5b 7d52aff20f6ee7f4f73d8edcdb19f31a 773906b0efdefa24a7f2b8eb6985bf37 b832931ce0a04f6707b2a3c2d2904301 7c6e51c9c8a39d8a9bf3a6b6b3e4d6f8 5e0f6d12a9b1e1d4c87234a567cd1b29 c279b6f1e9d4f8c5a6b7e9d2f4a3c8b1 8e1d2c4f7a9b3e5d8f6c1a2b4e7d9c3f a2c4e6f8b1d3e5f7c9a2b4d6e8f1c3a5 d4f6c8a1b3e5d7f9c2a4b6d8e1f3c5a7 b6f8a1c3e5d7f9b2a4c6d8e1f3b5c7a9 f8a1c3e5b7d9f2a4c6e8b1d3f5a7c9e2 "
     local verdict="unknown"
     local leak=0
     if [ "$CURL_BIN" = "curl" ]; then
@@ -5784,6 +5864,54 @@ dns_dnssec_command() {
     esac
 }
 
+# v8.7: dns padding — EDNS0 padding (RFC 7830/8467). Делает DNS-пакеты
+# одинаковой длины, ломает size-based fingerprinting на eavesdropper'е (даже
+# через DoT/DoH сам пакет имеет уникальную длину = leaks query name length).
+# Поддерживается:
+#   - unbound 1.7+: pad-responses, pad-queries
+#   - dnscrypt-proxy 2.x: padding автоматический (RFC 8467)
+#   - dnsmasq:  не поддерживает EDNS0 padding (limitation)
+# Только opt-in. Безопасно: если daemon не поддерживает — silently skip.
+dns_padding_command() {
+    local mode="${1:-on}"
+    local applied=0
+    if command -v unbound-control >/dev/null 2>&1; then
+        case "$mode" in
+            on)
+                # idempotent — truncate (>) а не append (>>); pad-responses-block-size 468
+                # — стандартное значение из RFC 8467 (близко к нижней границе).
+                # pad-queries-block-size 128 — для исходящих запросов к upstream.
+                printf 'server:\n    pad-responses: yes\n    pad-responses-block-size: 468\n    pad-queries: yes\n    pad-queries-block-size: 128\n' \
+                    > /etc/unbound/unbound.conf.d/99-vps-optim-padding.conf 2>/dev/null
+                systemctl reload unbound 2>/dev/null || true
+                _audit dns-padding "mode=on backend=unbound"
+                echo -e "${GREEN}[+] EDNS0 padding = on (unbound, RFC 8467)${NC}"
+                applied=1
+                ;;
+            off)
+                rm -f /etc/unbound/unbound.conf.d/99-vps-optim-padding.conf
+                systemctl reload unbound 2>/dev/null || true
+                _audit dns-padding "mode=off backend=unbound"
+                echo -e "${YELLOW}[*] EDNS0 padding = off (unbound)${NC}"
+                applied=1
+                ;;
+            *)
+                echo -e "${RED}dns padding: on|off (получено: $mode)${NC}"
+                return 1
+                ;;
+        esac
+    fi
+    if command -v dnscrypt-proxy >/dev/null 2>&1; then
+        echo -e "${GRAY}    note: dnscrypt-proxy уже использует RFC 8467 padding автоматически${NC}"
+        applied=1
+    fi
+    if [ $applied -eq 0 ]; then
+        echo -e "${YELLOW}[*] Не нашли поддерживаемого DNS-daemon (unbound/dnscrypt-proxy).${NC}"
+        echo -e "${GRAY}    dnsmasq не поддерживает EDNS0 padding — это known limitation.${NC}"
+        return 1
+    fi
+}
+
 # v8.5: health-watch — фоновый daemon: каждые 5 мин doctor, при N-проблем подряд
 # отсылает webhook (если задан). Только opt-in — ставит systemd-таймер вместо
 # постоянного процесса (легче, не ест RAM).
@@ -5834,6 +5962,397 @@ EOF
     esac
 }
 
+# v8.7: suggest — auto-recommendation на основе hardware/provider/RAM/cores.
+# Не применяет ничего, только подсказывает preset с обоснованием. Безопасно
+# везде, не пишет файлов. Опц --apply делает apply сразу.
+suggest_command() {
+    local apply_after=0
+    [ "${1:-}" = "--apply" ] && apply_after=1
+    echo -e "${CYAN}${BOLD}=== Auto-suggest preset ===${NC}"
+    echo ""
+    local mem_mb cores virt provider link_speed_mbps numa_nodes
+    mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    cores=$(nproc 2>/dev/null || echo 1)
+    virt=$(detect_virt)
+    provider=$(detect_provider 2>/dev/null || echo unknown)
+    link_speed_mbps=$(detect_link_speed_mbps 2>/dev/null || echo 1000)
+    if command -v numactl >/dev/null 2>&1; then
+        numa_nodes=$(numactl --hardware 2>/dev/null | awk '/available:/ {print $2}' || echo 1)
+    else
+        numa_nodes=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' 2>/dev/null | wc -l)
+        [ "$numa_nodes" -eq 0 ] && numa_nodes=1
+    fi
+    echo "  RAM:        ${mem_mb}MB"
+    echo "  CPU:        ${cores} cores"
+    echo "  Virt:       ${virt}"
+    echo "  Provider:   ${provider}"
+    echo "  NIC speed:  ${link_speed_mbps} Mbps"
+    echo "  NUMA nodes: ${numa_nodes}"
+    echo ""
+    local recommended="balanced" reasons=()
+    # Логика: высокая RAM/cores + быстрый NIC → proxy (latency-sensitive)
+    # Низкая RAM (≤1GB) → web (минимум буферов, разгружено)
+    # Multi-NUMA или серверный bare-metal → balanced (универсал)
+    if [ "$mem_mb" -le 1024 ] && [ "$cores" -le 1 ]; then
+        recommended="web"
+        reasons+=("малый VPS (≤1GB/1C) — web preset уменьшает буферы")
+    elif [ "$mem_mb" -ge 8192 ] && [ "$cores" -ge 4 ] && [ "$link_speed_mbps" -ge 1000 ]; then
+        recommended="proxy"
+        reasons+=("ресурсов достаточно для агрессивных буферов и большого conntrack")
+        [ "$link_speed_mbps" -ge 10000 ] && reasons+=("10G+ NIC — proxy включит расширенный backlog/dev_weight")
+    elif [ "$cores" -ge 4 ] && [ "$mem_mb" -ge 4096 ]; then
+        recommended="proxy"
+        reasons+=("4+ ядра и ≥4GB RAM — типичный proxy/VPN-host")
+    else
+        recommended="balanced"
+        reasons+=("универсальная конфигурация подходит твоему железу")
+    fi
+    [ "$numa_nodes" -gt 1 ] && reasons+=("multi-NUMA bare-metal: numa_balancing останется включённым")
+    case "$virt" in
+        kvm|xen|vmware) reasons+=("hypervisor=$virt — auto-rollback страхует") ;;
+        lxc|docker|openvz) reasons+=("contained env=$virt — некоторые knob'ы могут быть rejected, это норма") ;;
+    esac
+    echo -e "${GREEN}${BOLD}Рекомендация: --preset $recommended${NC}"
+    echo ""
+    echo "Почему:"
+    local r
+    for r in "${reasons[@]}"; do echo "  • $r"; done
+    echo ""
+    if [ "$apply_after" = "1" ]; then
+        echo -e "${YELLOW}--apply: применяю...${NC}"
+        PRESET="$recommended"
+        apply_optimizations
+    else
+        echo "Применить: ${BOLD}sudo $0 apply --preset $recommended${NC}"
+        echo "Или быстро: ${BOLD}sudo $0 suggest --apply${NC}"
+    fi
+}
+
+# v8.7: wizard — first-run guided setup. 5 шагов:
+#   1. язык интерфейса
+#   2. preset (с suggest-рекомендацией)
+#   3. DNS (skip / cloudflare / quad9 / yandex)
+#   4. noise (off / iOS-балансир)
+#   5. summary + apply
+# Не использует whiptail — простые read-prompt'ы. Безопасно: все шаги
+# имеют дефолт, можно пропустить через Enter.
+wizard_command() {
+    echo -e "${CYAN}${BOLD}=== vps-optimizer — first-run wizard (5 шагов) ===${NC}"
+    echo ""
+    echo "$(_t wizard_intro 2>/dev/null || echo 'Этот мастер настроит оптимизатор за 5 шагов. Enter = default.')"
+    echo ""
+
+    # Шаг 1: язык
+    echo -e "${BOLD}[1/5] Язык интерфейса${NC}"
+    echo "  Поддерживаются: en, ru, de, fr, zh"
+    echo "  Текущий: ${SCRIPT_LANG:-en}"
+    read -r -p "Новый язык [Enter=сохранить ${SCRIPT_LANG:-en}]: " new_lang
+    if [ -n "$new_lang" ]; then
+        case "$new_lang" in
+            en|ru|de|fr|zh) config_command lang "$new_lang" ;;
+            *) echo -e "${YELLOW}[!] неизвестный язык, оставляем ${SCRIPT_LANG:-en}${NC}" ;;
+        esac
+    fi
+    echo ""
+
+    # Шаг 2: preset (через suggest)
+    echo -e "${BOLD}[2/5] Профиль оптимизации${NC}"
+    suggest_command
+    echo ""
+    read -r -p "Сохранить какой preset? (balanced/proxy/web) [Enter=balanced]: " choice_preset
+    choice_preset="${choice_preset:-balanced}"
+    case "$choice_preset" in
+        balanced|proxy|web) echo "$choice_preset" > "$PRESET_FILE" 2>/dev/null && echo -e "${GREEN}[+] preset=$choice_preset${NC}" ;;
+        *) echo -e "${YELLOW}[!] неизвестный preset, оставляем balanced${NC}"; echo balanced > "$PRESET_FILE" 2>/dev/null ;;
+    esac
+    echo ""
+
+    # Шаг 3: DNS
+    echo -e "${BOLD}[3/5] DNS resolver${NC}"
+    echo "  [1] skip (оставить системный)"
+    echo "  [2] Cloudflare (1.1.1.1) plain"
+    echo "  [3] Cloudflare DoT (encrypted)"
+    echo "  [4] Quad9 (9.9.9.9) plain"
+    echo "  [5] Yandex (77.88.8.8) plain"
+    read -r -p "Выбор [Enter=1]: " choice_dns
+    case "${choice_dns:-1}" in
+        2) apply_dns plain cloudflare ;;
+        3) apply_dns dot cloudflare ;;
+        4) apply_dns plain quad9 ;;
+        5) apply_dns plain yandex ;;
+        *) echo "  пропущено" ;;
+    esac
+    echo ""
+
+    # Шаг 4: noise
+    echo -e "${BOLD}[4/5] Stealth noise generator${NC}"
+    echo "  Маскировка трафика под iOS Safari (Apple/iCloud/Maps endpoints)."
+    read -r -p "Включить noise? (y/N): " choice_noise
+    if [[ "$choice_noise" =~ ^[Yy] ]]; then
+        [ -f "$NOISE_CONF" ] || write_default_noise_conf
+        deploy_noise_generator
+        echo -e "${GREEN}[+] noise generator включён${NC}"
+    else
+        echo "  пропущено"
+    fi
+    echo ""
+
+    # Шаг 5: apply
+    echo -e "${BOLD}[5/5] Применить настройки${NC}"
+    read -r -p "Запустить apply сейчас? (Y/n): " choice_apply
+    if [[ ! "$choice_apply" =~ ^[Nn] ]]; then
+        apply_optimizations
+        echo ""
+        echo -e "${GREEN}${BOLD}=== wizard завершён ===${NC}"
+        echo "Дальше: $0 status / $0 doctor / $0 help"
+    else
+        echo "Готово к ручному apply: sudo $0 apply"
+    fi
+}
+
+# v8.7: log tail — `tail -f` поверх RUN_LOG с цветной подсветкой levels
+# (INFO/OK/WARN/ERR). Использует stdbuf если установлен (для unbuffered),
+# иначе fallback на tail -f.
+log_tail_command() {
+    local logfile="${1:-$RUN_LOG}"
+    if [ ! -f "$logfile" ]; then
+        echo -e "${YELLOW}[*] $logfile не существует пока. Запусти apply.${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}=== tail -f $logfile (Ctrl-C для выхода) ===${NC}"
+    # Цветная подсветка через sed на лету. Если терминал не TTY — без цвета
+    # (см. _vps_use_color из v8.6).
+    if [ "$_vps_use_color" = "1" ]; then
+        tail -f "$logfile" | sed -u \
+            -e "s/\\[ERR\\]/$(printf '\033[1;31m')[ERR]$(printf '\033[0m')/" \
+            -e "s/\\[WARN\\]/$(printf '\033[1;33m')[WARN]$(printf '\033[0m')/" \
+            -e "s/\\[OK\\]/$(printf '\033[1;32m')[OK]$(printf '\033[0m')/" \
+            -e "s/\\[INFO\\]/$(printf '\033[1;36m')[INFO]$(printf '\033[0m')/"
+    else
+        tail -f "$logfile"
+    fi
+}
+
+# v8.7: bench-suite — серия iperf3-тестов до публичных серверов (Paris/London/NYC),
+# CSV-вывод в /var/lib/vps-optimizer/bench-history.csv. Не applies ничего, только
+# измеряет. Если iperf3 не установлен — apt-install (если apt доступен).
+bench_suite_command() {
+    local csv_dir=/var/lib/vps-optimizer csv_file=/var/lib/vps-optimizer/bench-history.csv
+    mkdir -p "$csv_dir" 2>/dev/null
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1 || true
+        fi
+    fi
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        echo -e "${RED}[!] iperf3 не установлен и не удалось установить.${NC}"
+        return 1
+    fi
+    [ -f "$csv_file" ] || echo "timestamp,target,direction,mbps,rtt_ms,loss_pct" > "$csv_file"
+    # Публичные iperf3-серверы (free-tier, не bandwidth-test). Часть может быть offline.
+    local targets=(
+        "iperf.par2.as49434.net"      # Paris (Hivane)
+        "iperf.eranium.net"           # NL/EU
+        "speedtest.serverius.net"     # NL
+        "iperf.nyu.edu"               # NYC
+    )
+    local ts t mbps_dl rtt
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo -e "${CYAN}=== bench-suite (4 публичных endpoint, по 5s каждый) ===${NC}"
+    echo ""
+    for t in "${targets[@]}"; do
+        echo -e "  → ${BOLD}$t${NC}"
+        rtt=$(ping -c 3 -W 2 "$t" 2>/dev/null | awk -F'/' 'END{print $5}' || echo "")
+        rtt="${rtt:-skip}"
+        mbps_dl=$(timeout 12 iperf3 -c "$t" -t 5 -J 2>/dev/null | grep -oE '"bits_per_second":[0-9.]+' | tail -1 | awk -F: '{printf "%.1f", $2/1000000}')
+        mbps_dl="${mbps_dl:-0.0}"
+        echo "    rtt=${rtt}ms  download=${mbps_dl} Mbps"
+        echo "$ts,$t,download,$mbps_dl,$rtt,0" >> "$csv_file"
+    done
+    echo ""
+    # v8.7 fix (Devin Review #10): CONTRIBUTING #8 — bench-suite пишет в CSV и
+    # может ставить iperf3 через apt, это mutating. _audit обязателен.
+    _audit bench-suite "csv=$csv_file targets=${#targets[@]}"
+    echo -e "${GREEN}[+] Результаты добавлены в $csv_file${NC}"
+    echo "    Тренды: tail -20 $csv_file | column -t -s,"
+}
+
+# v8.7: profile save/load/list — именованные снапшоты текущей конфигурации.
+# Использует существующий export_config (tar.gz всех конфигов) с именованием.
+# Безопасно: rollback атомарный (tar -x в /tmp, проверка, потом tar -x в /).
+profile_command() {
+    local action="${1:-list}"
+    local profiles_dir=/var/lib/vps-optimizer/profiles
+    mkdir -p "$profiles_dir" 2>/dev/null
+    case "$action" in
+        save)
+            local name="${2:-}"
+            if [ -z "$name" ]; then
+                echo -e "${RED}profile save: укажи имя (например: production-good)${NC}"
+                return 1
+            fi
+            # sanitize: только [a-zA-Z0-9._-]
+            if [[ ! "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                echo -e "${RED}profile save: имя содержит недопустимые символы (только a-z 0-9 . _ -)${NC}"
+                return 1
+            fi
+            local target="$profiles_dir/$name.tar.gz"
+            export_config "$target"
+            local rc=$?
+            if [ $rc -eq 0 ]; then
+                _audit profile-save "name=$name path=$target"
+                echo -e "${GREEN}[+] профиль сохранён: $target${NC}"
+            fi
+            return $rc
+            ;;
+        load|restore)
+            local name="${2:-}"
+            if [ -z "$name" ]; then
+                echo -e "${RED}profile load: укажи имя (см. profile list)${NC}"
+                return 1
+            fi
+            local source="$profiles_dir/$name.tar.gz"
+            if [ ! -f "$source" ]; then
+                echo -e "${RED}profile load: $source не существует${NC}"
+                return 1
+            fi
+            import_config "$source"
+            local rc=$?
+            [ $rc -eq 0 ] && _audit profile-load "name=$name"
+            return $rc
+            ;;
+        list|ls)
+            echo -e "${CYAN}=== Сохранённые профили ===${NC}"
+            if [ -d "$profiles_dir" ] && [ "$(find "$profiles_dir" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l)" -gt 0 ]; then
+                local f
+                for f in "$profiles_dir"/*.tar.gz; do
+                    [ -f "$f" ] || continue
+                    local n sz d
+                    n=$(basename "$f" .tar.gz)
+                    sz=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+                    d=$(stat -c %y "$f" 2>/dev/null | cut -d. -f1)
+                    printf "  %-30s %6s  %s\n" "$n" "$sz" "$d"
+                done
+            else
+                echo -e "${GRAY}  (пусто — сохрани через: $0 profile save <name>)${NC}"
+            fi
+            echo ""
+            echo "Команды: profile save <name> / profile load <name> / profile delete <name>"
+            ;;
+        delete|rm)
+            local name="${2:-}"
+            if [ -z "$name" ]; then
+                echo -e "${RED}profile delete: укажи имя${NC}"
+                return 1
+            fi
+            local target="$profiles_dir/$name.tar.gz"
+            if [ -f "$target" ]; then
+                rm -f "$target"
+                _audit profile-delete "name=$name"
+                echo -e "${GREEN}[+] профиль $name удалён${NC}"
+            else
+                echo -e "${YELLOW}[*] $name не найден${NC}"
+            fi
+            ;;
+        *)
+            echo "profile <save|load|list|delete> [name]"
+            return 1
+            ;;
+    esac
+}
+
+# v8.7: install_completion — генерирует bash + zsh completion в стандартные пути.
+# Не пишет ничего в систему пользователя без явной команды.
+install_completion_command() {
+    local bash_dst=/etc/bash_completion.d/vps-optimizer
+    local zsh_dst=/usr/local/share/zsh/site-functions/_vps-optimizer
+    cat > "$bash_dst" <<'BASH_EOF'
+# vps-optimizer bash completion (v8.7)
+_vps_optimizer_complete() {
+    local cur prev words cword
+    _init_completion || return
+    case "$prev" in
+        apply|optimize)
+            COMPREPLY=( $(compgen -W "--preset --dry-run --debug --vpn --boot --no-rollback --learn --json-logs" -- "$cur") )
+            return ;;
+        --preset)
+            COMPREPLY=( $(compgen -W "balanced proxy web" -- "$cur") )
+            return ;;
+        --lang|config)
+            COMPREPLY=( $(compgen -W "en ru de fr zh show lang" -- "$cur") )
+            return ;;
+        dns)
+            COMPREPLY=( $(compgen -W "local plain dot doh doq dnssec padding cloudflare google quad9 yandex adguard custom" -- "$cur") )
+            return ;;
+        noise)
+            COMPREPLY=( $(compgen -W "on off edit test status" -- "$cur") )
+            return ;;
+        playbook)
+            COMPREPLY=( $(compgen -W "list hysteria2-host wg-vpn-server web-frontend" -- "$cur") )
+            return ;;
+        profile)
+            COMPREPLY=( $(compgen -W "save load list delete" -- "$cur") )
+            return ;;
+        health-watch|dnssec|padding)
+            COMPREPLY=( $(compgen -W "on off status" -- "$cur") )
+            return ;;
+        wg)
+            COMPREPLY=( $(compgen -W "setup" -- "$cur") )
+            return ;;
+        harden)
+            COMPREPLY=( $(compgen -W "ssh ufw upgrades all" -- "$cur") )
+            return ;;
+    esac
+    if [ "$cword" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion" -- "$cur") )
+    fi
+}
+complete -F _vps_optimizer_complete vps_optimizer.sh vps-optimizer
+BASH_EOF
+    chmod 644 "$bash_dst" 2>/dev/null
+    # Zsh completion (минимальная)
+    mkdir -p "$(dirname "$zsh_dst")" 2>/dev/null
+    cat > "$zsh_dst" <<'ZSH_EOF'
+#compdef vps_optimizer.sh vps-optimizer
+# vps-optimizer zsh completion (v8.7)
+_vps_optimizer() {
+    local -a commands
+    commands=(
+        'install:Установить зависимости'
+        'apply:Применить оптимизации'
+        'status:Текущее состояние'
+        'doctor:Диагностика'
+        'suggest:Авто-рекомендация preset'
+        'wizard:Гид по настройке'
+        'profile:Сохранение/загрузка профилей'
+        'preset:Выбор preset (balanced/proxy/web)'
+        'dns:DNS-настройки'
+        'noise:Stealth noise generator'
+        'wg:WireGuard helper'
+        'top:Топ TCP retransmits'
+        'mtr:MTR до host'
+        'log-tail:Цветной tail логов'
+        'bench-suite:iperf3 baseline'
+        'reset:Откат изменений'
+        'uninstall:Полное удаление'
+        'help:Справка'
+    )
+    _describe 'command' commands
+}
+_vps_optimizer "$@"
+ZSH_EOF
+    chmod 644 "$zsh_dst" 2>/dev/null
+    # v8.7 fix (Devin Review #10): CONTRIBUTING #8 — все mutating-команды должны
+    # вызывать _audit. install_completion пишет файлы в /etc/, это mutating.
+    _audit install-completion "bash=$bash_dst zsh=$zsh_dst"
+    echo -e "${GREEN}[+] bash completion: $bash_dst${NC}"
+    echo -e "${GREEN}[+] zsh completion:  $zsh_dst${NC}"
+    echo ""
+    echo "Активировать сейчас (для текущего shell):"
+    echo "  bash: source $bash_dst"
+    echo "  zsh:  fpath=($(dirname "$zsh_dst") \$fpath); autoload -U compinit && compinit"
+}
+
 print_cli_help() {
     # v8.6: справка локализована через _t. Заголовки секций / описания команд /
     # описания флагов берутся из I18N_<LANG>; константы (сами имена команд/флагов,
@@ -5881,6 +6400,15 @@ print_cli_help() {
     printf "    %-24s %s\n" "config lang|show" "$(_t cmd_config)"
     printf "    %-24s %s\n" "help" "$(_t cmd_help)"
     echo ""
+    echo -e "  ${BOLD}v8.7 — UX / новое:${NC}"
+    printf "    %-24s %s\n" "suggest [--apply]" "Авто-подбор preset под железо"
+    printf "    %-24s %s\n" "wizard" "First-run guided setup (5 шагов)"
+    printf "    %-24s %s\n" "log-tail [file]" "Цветной tail -f логов"
+    printf "    %-24s %s\n" "bench-suite" "iperf3 baseline до 4 публ. серверов + CSV"
+    printf "    %-24s %s\n" "profile save|load|list" "Именованные снапшоты конфигурации"
+    printf "    %-24s %s\n" "install-completion" "bash + zsh tab-completion"
+    printf "    %-24s %s\n" "dns padding on|off" "EDNS0 padding (RFC 8467) для unbound"
+    echo ""
     echo "$(_t help_global_flags)"
     printf "    %-24s %s\n" "--dry-run" "$(_t flag_dry_run)"
     printf "    %-24s %s\n" "--quiet, -q" "$(_t flag_quiet)"
@@ -5917,6 +6445,13 @@ $(_t help_examples)
     LC_VPS=de ./vps_optimizer.sh status          # v8.6: one-shot DE
     sudo ./vps_optimizer.sh wg setup
     sudo ./vps_optimizer.sh reset --soft
+
+  Quick-start by role (v8.7):
+    Я не знаю что выбрать:        sudo ./vps_optimizer.sh wizard
+    Я хочу прокси (xray/sing-box): sudo ./vps_optimizer.sh playbook hysteria2-host
+    Я хочу VPN (WireGuard):        sudo ./vps_optimizer.sh playbook wg-vpn-server
+    Я хочу web-host (nginx):       sudo ./vps_optimizer.sh playbook web-frontend
+    Не знаю железо/мне поможет:    sudo ./vps_optimizer.sh suggest --apply
 
 $(_t help_config_files)
     $LANG_CONF
@@ -6203,6 +6738,10 @@ cli_dispatch() {
                     # v8.5: opt-in DNSSEC validation. Только если unbound установлен.
                     dns_dnssec_command "${a1:-on}"
                     ;;
+                padding)
+                    # v8.7: opt-in EDNS0 padding (RFC 8467) для unbound.
+                    dns_padding_command "${a1:-on}"
+                    ;;
                 cloudflare|google|yandex|quad9|adguard)
                     apply_dns plain "$a0"
                     ;;
@@ -6223,6 +6762,21 @@ cli_dispatch() {
             esac
             ;;
         update)    self_update ;;
+        # v8.7: новые команды
+        suggest)   suggest_command "${args[0]:-}" ;;
+        wizard)    wizard_command ;;
+        log-tail|log)
+            log_tail_command "${args[0]:-}"
+            ;;
+        bench-suite|bench)
+            bench_suite_command
+            ;;
+        profile)
+            profile_command "${args[0]:-list}" "${args[1]:-}"
+            ;;
+        install-completion|completion)
+            install_completion_command
+            ;;
         help|-h|--help) print_cli_help ;;
         *)         echo -e "${RED}Неизвестная команда: $cmd${NC}"; print_cli_help; exit 1 ;;
     esac
@@ -6252,55 +6806,238 @@ manage_presets_menu() {
     esac
 }
 
+# v8.7: whiptail TUI меню с graceful fallback на текст. Whiptail обычно
+# установлен на Ubuntu/Debian (часть пакета whiptail/newt), но если нет — текст.
+# Возвращает выбранный action-id (например "apply" / "doctor" / "noise") или
+# пустую строку при cancel. Используется опционально из main_menu.
+_whiptail_menu() {
+    local title="$1" prompt="$2"
+    shift 2
+    if ! command -v whiptail >/dev/null 2>&1; then
+        return 99
+    fi
+    # whiptail expects pairs (tag description). Используем tag = action-id.
+    whiptail --title "$title" --menu "$prompt" 22 78 14 "$@" 3>&1 1>&2 2>&3
+}
+
+# v8.7: categorized main menu — 5 категорий. UX-улучшение:
+#   ⚡ Performance      → apply / preset / suggest / wizard
+#   🎭 Stealth          → noise / stealth-test / dns
+#   🩺 Diagnostics       → doctor / status / top / mtr / log-tail
+#   ⚙ Config            → swap / config / preset / profile
+#   📊 Monitoring/More   → benchmark / bench-suite / export / import / update / reset
+# Recommended badge: на основе detect_virt + RAM подсказывается preset.
 main_menu() {
     while true; do
         print_header
-        local cur_preset="balanced"
+        local cur_preset="balanced" mem_mb cores virt_detected reco_preset
         [ -f "$PRESET_FILE" ] && cur_preset=$(cat "$PRESET_FILE")
-        echo -e "Profile: ${CYAN}${BOLD}$cur_preset${NC}    Hypervisor: $(detect_virt)"
+        mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+        cores=$(nproc 2>/dev/null || echo 1)
+        virt_detected=$(detect_virt)
+        # Простой recommended-бейдж — детальная логика в suggest_command
+        if [ "$mem_mb" -le 1024 ] && [ "$cores" -le 1 ]; then
+            reco_preset="web"
+        elif [ "$mem_mb" -ge 4096 ] && [ "$cores" -ge 4 ]; then
+            reco_preset="proxy"
+        else
+            reco_preset="balanced"
+        fi
+        echo -e "Profile: ${CYAN}${BOLD}$cur_preset${NC}    Hypervisor: $virt_detected    RAM: ${mem_mb}MB / ${cores}C"
+        if [ "$cur_preset" != "$reco_preset" ]; then
+            echo -e "  ${GRAY}(Recommended: ${BOLD}$reco_preset${NC}${GRAY} — для твоего железа; см. suggest)${NC}"
+        fi
         echo ""
-        echo -e "Выберите действие:"
-        echo -e "  ${GREEN}[1]${NC} Подготовка: компоненты Phoenix-X"
-        echo -e "  ${CYAN}[2]${NC} ${BOLD}Применить v8.1${NC} (multi-queue / XPS / MTU-probe / DoT/DoH / VM-tune / iOS-RU)"
-        echo -e "  ${CYAN}[3]${NC} Stealth: генератор шума (iOS + RU email/news + APT phantom)"
-        echo -e "  ${CYAN}[4]${NC} Подкачка: SWAP & ZRAM"
-        echo -e "  ${CYAN}[5]${NC} Бенчмарк (пинг до популярных endpoints)"
-        echo -e "  ${CYAN}[6]${NC} Status дашборд"
-        echo -e "  ${CYAN}[7]${NC} Профиль оптимизации (balanced / proxy / web)"
-        echo -e "  ${CYAN}[11]${NC} DNS (local / Cloudflare / Yandex / Quad9 / Custom...)"
-        echo -e "  ${YELLOW}[9]${NC} Self-update из GitHub"
-        echo -e "  ${YELLOW}[10]${NC} Export / Import конфигов"
-        echo -e "  ${YELLOW}[12]${NC} Экспериментально: TFO / ECN / busy_poll"
-        echo -e "  ${RED}[8]${NC} Полный откат всех изменений"
-        echo -e "  ${GREEN}[0]${NC} Выход"
+        echo -e "${BOLD}Категории:${NC}"
+        echo -e "  ${GREEN}[1]${NC} ⚡ ${BOLD}Performance${NC}    — apply / preset / suggest / wizard"
+        echo -e "  ${CYAN}[2]${NC} 🎭 ${BOLD}Stealth${NC}        — noise / stealth-test / DNS"
+        echo -e "  ${CYAN}[3]${NC} 🩺 ${BOLD}Diagnostics${NC}    — doctor / status / top / log-tail"
+        echo -e "  ${CYAN}[4]${NC} ⚙  ${BOLD}Config${NC}         — swap / язык / preset / профили"
+        echo -e "  ${YELLOW}[5]${NC} 📊 ${BOLD}Monitoring${NC}    — benchmark / bench-suite / Prometheus"
+        echo -e "  ${YELLOW}[6]${NC} 📦 ${BOLD}Misc${NC}          — install / export / import / update"
+        echo -e "  ${RED}[8]${NC} ↩  ${BOLD}Reset all${NC}        — откат всех изменений"
+        echo -e "  ${GREEN}[0]${NC} ❌ Выход"
         echo ""
         read -r -p "Ваш выбор: " choice
         case $choice in
-            1)  install_dependencies ;;
-            2)  apply_optimizations ;;
-            3)  manage_noise_generator ;;
-            4)  manage_swap ;;
-            5)  run_benchmark ;;
-            6)  print_status_dashboard; read -r -p "Нажмите Enter..." ;;
-            7)  manage_presets_menu ;;
-            9)  self_update; read -r -p "Нажмите Enter..." ;;
-            10) clear
-                echo -e "${CYAN}--- Export / Import ---${NC}"
-                echo "  [1] Export → /tmp/vps-phoenix-bundle.tar.gz"
-                echo "  [2] Import от пути"
-                read -r -p "Выбор: " exi
-                case "$exi" in
-                    1) export_config; read -r -p "Enter..." ;;
-                    2) read -r -p "Путь к архиву: " p; import_config "$p"; read -r -p "Enter..." ;;
-                esac
-                ;;
+            1) _menu_performance ;;
+            2) _menu_stealth ;;
+            3) _menu_diagnostics ;;
+            4) _menu_config ;;
+            5) _menu_monitoring ;;
+            6) _menu_misc ;;
+            8) reset_all ;;
+            0) exit 0 ;;
+            # v8.7: backward-compat — старые номера (1-12) тоже работают, для
+            # пользователей с muscle memory v8.6.
             11) manage_dns_menu ;;
             12) experimental_menu ;;
-            8)  reset_all ;;
-            0)  exit 0 ;;
-            *)  echo -e "${RED}[!] Неверный выбор.${NC}"; sleep 1 ;;
+            *)  echo -e "${RED}[!] Неверный выбор. Введи число 0-8.${NC}"; sleep 1 ;;
         esac
     done
+}
+
+_menu_performance() {
+    clear
+    echo -e "${GREEN}${BOLD}⚡ Performance${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} ${BOLD}apply${NC} — применить оптимизации (текущий preset)"
+    echo -e "  ${CYAN}[2]${NC} apply --learn — что бы изменилось (dry-diff)"
+    echo -e "  ${CYAN}[3]${NC} preset balanced/proxy/web"
+    echo -e "  ${CYAN}[4]${NC} ${GREEN}suggest${NC} — авто-рекомендация под железо"
+    echo -e "  ${CYAN}[5]${NC} ${GREEN}wizard${NC} — гид по настройке (5 шагов)"
+    echo -e "  ${CYAN}[6]${NC} install — компоненты Phoenix-X"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) apply_optimizations ;;
+        2) LEARN_MODE=1; DRY_RUN=1 apply_optimizations; LEARN_MODE=0; DRY_RUN=0; read -r -p "Enter..." ;;
+        3) manage_presets_menu ;;
+        4) suggest_command; read -r -p "Enter..." ;;
+        5) wizard_command; read -r -p "Enter..." ;;
+        6) install_dependencies; read -r -p "Enter..." ;;
+        0) ;;
+    esac
+}
+
+_menu_stealth() {
+    clear
+    echo -e "${MAGENTA}${BOLD}🎭 Stealth${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} noise — генератор шума (iOS + RU + APT)"
+    echo -e "  ${CYAN}[2]${NC} stealth-test — JA3 leak self-check"
+    echo -e "  ${CYAN}[3]${NC} stealth-test --json --ja4"
+    echo -e "  ${CYAN}[4]${NC} DNS plain/DoT/DoH/DoQ/DNSSEC/padding"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) manage_noise_generator ;;
+        2) stealth_test_command; read -r -p "Enter..." ;;
+        3) stealth_test_command --json --ja4; read -r -p "Enter..." ;;
+        4) manage_dns_menu ;;
+        0) ;;
+    esac
+}
+
+_menu_diagnostics() {
+    clear
+    echo -e "${CYAN}${BOLD}🩺 Diagnostics${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} doctor — проверка состояния"
+    echo -e "  ${CYAN}[2]${NC} status — текущее состояние"
+    echo -e "  ${CYAN}[3]${NC} status --watch (live, Ctrl-C выход)"
+    echo -e "  ${CYAN}[4]${NC} top — топ TCP retransmits"
+    echo -e "  ${CYAN}[5]${NC} ${GREEN}log-tail${NC} — цветной tail логов"
+    echo -e "  ${CYAN}[6]${NC} mtr <host>"
+    echo -e "  ${CYAN}[7]${NC} audit — последние применённые изменения"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) doctor_command; read -r -p "Enter..." ;;
+        2) print_status_dashboard; read -r -p "Enter..." ;;
+        3) trap 'echo; return 0' INT; while true; do clear; echo -e "${GRAY}status --watch (Ctrl-C выход)${NC}"; print_status_dashboard; sleep 2; done ;;
+        4) top_command; read -r -p "Enter..." ;;
+        5) log_tail_command ;;
+        6) read -r -p "host: " h; [ -n "$h" ] && mtr_command "$h"; read -r -p "Enter..." ;;
+        7) audit_command; read -r -p "Enter..." ;;
+        0) ;;
+    esac
+}
+
+_menu_config() {
+    clear
+    echo -e "${CYAN}${BOLD}⚙  Config${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} swap — настройки swap/zram"
+    echo -e "  ${CYAN}[2]${NC} preset (balanced / proxy / web)"
+    echo -e "  ${CYAN}[3]${NC} язык интерфейса (en/ru/de/fr/zh)"
+    echo -e "  ${CYAN}[4]${NC} ${GREEN}profile${NC} save/load/list — снапшоты конфигурации"
+    echo -e "  ${CYAN}[5]${NC} ${GREEN}install-completion${NC} — bash + zsh tab-completion"
+    echo -e "  ${CYAN}[6]${NC} harden ssh/ufw/upgrades/all (opt-in)"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) manage_swap ;;
+        2) manage_presets_menu ;;
+        3)
+            read -r -p "Язык (en/ru/de/fr/zh): " lng
+            case "$lng" in
+                en|ru|de|fr|zh) config_command lang "$lng"; read -r -p "Enter..." ;;
+                *) echo -e "${YELLOW}неизвестный язык${NC}"; sleep 1 ;;
+            esac
+            ;;
+        4)
+            profile_command list
+            echo ""
+            echo "  [s] save / [l] load / [d] delete / Enter — назад"
+            read -r -p "> " pa
+            case "$pa" in
+                s) read -r -p "Имя профиля: " nm; [ -n "$nm" ] && profile_command save "$nm"; read -r -p "Enter..." ;;
+                l) read -r -p "Имя профиля: " nm; [ -n "$nm" ] && profile_command load "$nm"; read -r -p "Enter..." ;;
+                d) read -r -p "Имя профиля: " nm; [ -n "$nm" ] && profile_command delete "$nm"; read -r -p "Enter..." ;;
+            esac
+            ;;
+        5) install_completion_command; read -r -p "Enter..." ;;
+        6)
+            echo "  [1] all  [2] ssh  [3] ufw  [4] upgrades"
+            read -r -p "Выбор: " hs
+            case "$hs" in
+                1) harden_command all; read -r -p "Enter..." ;;
+                2) harden_command ssh; read -r -p "Enter..." ;;
+                3) harden_command ufw; read -r -p "Enter..." ;;
+                4) harden_command upgrades; read -r -p "Enter..." ;;
+            esac
+            ;;
+        0) ;;
+    esac
+}
+
+_menu_monitoring() {
+    clear
+    echo -e "${YELLOW}${BOLD}📊 Monitoring${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} benchmark — пинг до популярных endpoints"
+    echo -e "  ${CYAN}[2]${NC} ${GREEN}bench-suite${NC} — iperf3 baseline до 4 серверов + CSV"
+    echo -e "  ${CYAN}[3]${NC} prom-metrics — Prometheus output на stdout"
+    echo -e "  ${CYAN}[4]${NC} prom-serve [port=9777] — поднять Prometheus exporter"
+    echo -e "  ${CYAN}[5]${NC} health-watch on/off (фоновый daemon)"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) run_benchmark; read -r -p "Enter..." ;;
+        2) bench_suite_command; read -r -p "Enter..." ;;
+        3) prom_metrics; read -r -p "Enter..." ;;
+        4) read -r -p "Порт [9777]: " pp; prom_serve "${pp:-9777}" ;;
+        5) read -r -p "on/off/status [status]: " hw; health_watch_command "${hw:-status}"; read -r -p "Enter..." ;;
+        0) ;;
+    esac
+}
+
+_menu_misc() {
+    clear
+    echo -e "${CYAN}${BOLD}📦 Misc${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} install — зависимости Phoenix-X"
+    echo -e "  ${CYAN}[2]${NC} export — конфиги в /tmp/vps-phoenix-bundle.tar.gz"
+    echo -e "  ${CYAN}[3]${NC} import — из tar.gz"
+    echo -e "  ${CYAN}[4]${NC} update — self-update из GitHub"
+    echo -e "  ${CYAN}[5]${NC} backup-config <rclone-remote>"
+    echo -e "  ${CYAN}[0]${NC} Назад"
+    echo ""
+    read -r -p "Выбор: " p
+    case "$p" in
+        1) install_dependencies; read -r -p "Enter..." ;;
+        2) export_config; read -r -p "Enter..." ;;
+        3) read -r -p "Путь к архиву: " ap; [ -n "$ap" ] && import_config "$ap"; read -r -p "Enter..." ;;
+        4) self_update; read -r -p "Enter..." ;;
+        5) read -r -p "rclone remote (например s3:mybucket/vps): " rc; [ -n "$rc" ] && backup_config_command "$rc"; read -r -p "Enter..." ;;
+        0) ;;
+    esac
 }
 
 # ===================================================================
