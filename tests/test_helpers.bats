@@ -251,3 +251,126 @@ setup() {
         }
     done < <(grep -n 'numa_balancing 0' "$SCRIPT" | cut -d: -f1)
 }
+
+# ============================================================================
+# v8.7 tests
+# ============================================================================
+
+@test "v8.7: SCRIPT_VERSION is 8.7" {
+    run grep -E '^SCRIPT_VERSION="8\.7"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: suggest command is registered" {
+    run grep -E 'suggest\)\s*suggest_command' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: wizard command is registered" {
+    run grep -E 'wizard\)\s*wizard_command' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: profile command is registered" {
+    run grep -E 'profile\)$' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'profile_command' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: log-tail and bench-suite registered" {
+    run grep 'log-tail|log)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'bench-suite|bench)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: install-completion command is registered" {
+    run grep 'install-completion|completion)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: dns padding command is registered" {
+    run grep -E 'padding\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'dns_padding_command' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: tcp_l3mdev_accept and udp_l3mdev_accept are set" {
+    run grep 'sysctl_safe net.ipv4.tcp_l3mdev_accept 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'sysctl_safe net.ipv4.udp_l3mdev_accept 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: net.unix.max_dgram_qlen is set" {
+    run grep 'sysctl_safe net.unix.max_dgram_qlen 512' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: vm.swappiness is preset-specific (proxy=30, web=60)" {
+    run grep -E 'PRESET_SWAPPINESS=30' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'PRESET_SWAPPINESS=60' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: dev_weight on 10G+ NIC is at least 192" {
+    # dev_weight_target=192 (10G) and 256 (25G+)
+    run grep 'dev_weight_target=192' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'dev_weight_target=256' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: iOS 18 noise pool includes Apple Maps/iMessage/captive endpoints" {
+    run grep 'gsp-ssl.ls.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'amp-api.music.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'p104-imws.icloud.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: JA3 known list is at least 8 hashes (was 4)" {
+    # Count tokens between quotes in ios_known_ja3 line
+    run bash -c "grep 'ios_known_ja3=' '$SCRIPT' | grep -oE '[a-f0-9]{32}' | wc -l"
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 8 ]
+}
+
+@test "v8.7: doctor includes UDP RcvbufErrors check" {
+    run grep 'RcvbufErrors' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: main_menu uses categorical _menu_* sub-functions" {
+    run grep -E '_menu_performance|_menu_stealth|_menu_diagnostics|_menu_config|_menu_monitoring|_menu_misc' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+}
+
+@test "v8.7: bash completion is generated to /etc/bash_completion.d/" {
+    run grep '/etc/bash_completion.d/vps-optimizer' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: profile snapshot dir is /var/lib/vps-optimizer/profiles" {
+    run grep 'profiles_dir=/var/lib/vps-optimizer/profiles' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: noise EDNS padding skips dnsmasq (known limitation)" {
+    run grep 'dnsmasq не поддерживает EDNS0 padding' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.7: reset_all cleans up unbound padding conf" {
+    run grep '99-vps-optim-padding.conf' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Must appear in reset_all (between rm -f and matching block before sysctl --system)
+    run grep -c '99-vps-optim-padding.conf' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 2 ]   # in reset_all rm and in dns_padding rm
+}
