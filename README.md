@@ -302,7 +302,42 @@ help                            Print full help
 
 ## Changelog
 
-### v8.5 — perf-pkg + diag/stealth/playbooks (current)
+### v8.6 — i18n + perf + iOS stealth quick-wins (current)
+
+Несовместимых изменений нет. Все default-флаги совпадают с v8.5. Никаких новых
+правил firewall/routing.
+
+**🌐 i18n (выбор языка)** — 5 языков: `en` / `ru` / `de` / `fr` / `zh`.
+Native: `en` / `ru`. Machine-translated baseline (community-perfectible):
+`de` / `fr` / `zh` — PR-ы с правками приветствуются.
+
+```bash
+vps_optimizer.sh config show              # текущий язык + где сохранён
+sudo vps_optimizer.sh config lang ru      # сохранить в /etc/vps-optimizer.lang
+LC_VPS=de vps_optimizer.sh help           # one-shot env-override
+vps_optimizer.sh --no-color help          # отключить ANSI (или NO_COLOR=1, или TTY-detect — auto в pipe)
+```
+
+**⚡ Quick-win sysctl** (probe-then-write):
+- `net.ipv4.tcp_reordering 6 → 10` + `tcp_max_reordering 300 → 600` — устойчивость к джиттеру (Wi-Fi / спутник / RU↔EU). Все пресеты.
+- `net.ipv4.tcp_thin_dupack=1` — **только `--preset proxy`** (per CONTRIBUTING #5: tcp_thin_*). Для interactive thin-streams (SSH, gRPC keepalive) ускоряет fast-retx.
+- `kernel.numa_balancing=0` — auto-disable на VPS с 1 NUMA-узлом (через `numactl --hardware` или `/sys/devices/system/node`). На multi-socket bare-metal остаётся включённым.
+- `cpufreq governor=performance` где `/sys/devices/.../scaling_governor` доступен на запись.
+
+**🎭 iOS stealth quick-wins:**
+- IPv6 privacy extensions (`use_tempaddr=2 + regen_max_retry=3 + max_desync_factor=60`) — только под `--preset proxy`. RFC 4941, активно использует Apple.
+- `curl --tcp-fastopen` 50% запросов в noise-генераторе (curl 7.49+).
+- `stealth-test --json` (machine-readable) + `--exit-fail-on-leak` (CI-friendly, exit=2 если JA3 leak) + `--ja4` (опц., если curl-impersonate-chrome 0.6+ установлен).
+
+**🛠 UX / observability:**
+- `status --watch` — live-update каждые 2 сек (Ctrl-C для выхода).
+- `--json-logs` — глобальный флаг, переключает `RUN_LOG` в structured JSON-line формат для ELK/Loki/Vector.
+- DNS cache hit-ratio в `prom-metrics` (через `unbound-control stats_noreset`): новые метрики `vps_dns_cache_hits`, `vps_dns_cache_misses`, `vps_dns_cache_hit_ratio`.
+- `--learn` — dry-run с явным diff'ом «current → desired» по каждому sysctl/sysfs (не пишет на диск).
+
+**Новые тесты:** добавлено 15 unit-тестов в `tests/test_helpers.bats` (i18n / config / --no-color / --json-logs / --learn / stealth-test флаги / DNS hit-ratio / TFO в noise / numa_balancing).
+
+### v8.5 — perf-pkg + diag/stealth/playbooks
 
 Расширение v8.4. Все default-флаги совпадают с v8.4. Никаких новых правил
 firewall/routing — apply остаётся VPN/SSH-safe. Новые DNS-расширения (DoQ,

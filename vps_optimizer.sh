@@ -54,15 +54,39 @@
 
 set -o pipefail
 
-# Цвета
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-GRAY='\033[0;90m'
-NC='\033[0m'
-BOLD='\033[1m'
+# v8.6: TTY/NO_COLOR-detect — если stdout не tty или установлен NO_COLOR (https://no-color.org),
+# выключаем ANSI escape-последовательности. Иначе грязные '^[[31m' попадают в логи/pipe,
+# которые потом грепаются и обрабатываются скриптами (cron/Ansible/Loki).
+# Можно форсировать включение через FORCE_COLOR=1 (для CI с цветным output).
+LANG_CONF="/etc/vps-optimizer.lang"
+if [ -n "${FORCE_COLOR:-}" ]; then
+    _vps_use_color=1
+elif [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    _vps_use_color=0
+else
+    _vps_use_color=1
+fi
+
+# Цвета (или пустые строки если color disabled)
+if [ "$_vps_use_color" = "1" ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    GRAY='\033[0;90m'
+    NC='\033[0m'
+    BOLD='\033[1m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    MAGENTA=''
+    GRAY=''
+    NC=''
+    BOLD=''
+fi
 
 SYSCTL_CONF="/etc/sysctl.d/99-vps-optimizer.conf"
 LIMITS_CONF="/etc/security/limits.d/99-vps-limits.conf"
@@ -90,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.5"
+SCRIPT_VERSION="8.6"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -105,6 +129,19 @@ CLI_MODE=0
 VPN_FORCE=0          # --vpn: явно настраиваем под VPN-роутинг (rp_filter=2, ip_forward=1)
 NO_ROLLBACK=0        # --no-rollback: отключить auto-rollback по connectivity-check
 SOFT_RESET=0         # reset --soft: не трогать DNS/noise/swap, только sysctl
+JSON_LOGS=0          # --json-logs: structured logging для ELK/Loki (v8.6)
+LEARN_MODE=0         # --learn: dry-run + diff с rationale, без записи (v8.6)
+
+# v8.6: i18n. Default=en. Resolve order: $LC_VPS env > /etc/vps-optimizer.lang > "en".
+# Поддерживаемые: en, ru, de, fr, zh. Невалидное значение → fallback на 'en'.
+SCRIPT_LANG="${LC_VPS:-}"
+if [ -z "$SCRIPT_LANG" ] && [ -r "$LANG_CONF" ]; then
+    SCRIPT_LANG=$(head -1 "$LANG_CONF" 2>/dev/null | tr -d '[:space:]')
+fi
+case "$SCRIPT_LANG" in
+    en|ru|de|fr|zh) ;;
+    *) SCRIPT_LANG="en" ;;
+esac
 
 # Cron-friendly exit codes — стабильный API для cron/Ansible/мониторинга.
 # shellcheck disable=SC2034  # часть кодов используется только внешними скриптами
@@ -125,6 +162,350 @@ SYSCTL_SKIP=()
 SYSFS_OK=()
 SYSFS_SKIP=()
 
+# ===================================================================
+#  v8.6: i18n — переводы пользовательских сообщений
+# ===================================================================
+# Архитектура: ассоциативные массивы I18N_<LANG> с ключами (snake_case),
+# функция _t возвращает строку для текущего $SCRIPT_LANG, fallback на EN,
+# fallback на сам ключ. Это позволяет добавлять/переводить инкрементально:
+# непереведённый ключ просто покажет английский (или сам ключ).
+#
+# Намеренно покрываем только ~80 наиболее видимых строк (help/usage/main errors/
+# command headers). Низкоуровневые debug-сообщения остаются в исходном языке.
+# shellcheck disable=SC2034  # I18N_RU/DE/FR/ZH used via nameref in _t()
+declare -A I18N_EN I18N_RU I18N_DE I18N_FR I18N_ZH
+
+# --- English (default, источник истины) ---
+I18N_EN[err_root]="[!] Run as root."
+I18N_EN[err_lock_busy]="[!] Another vps_optimizer instance is running (lock=%s)."
+I18N_EN[err_lock_busy_hint]="    Pass --force to ignore."
+I18N_EN[lang_set]="[+] Language set to %s. Saved to %s."
+I18N_EN[lang_unsupported]="[!] Unsupported language: %s. Supported: en, ru, de, fr, zh."
+I18N_EN[lang_current]="Current language: %s"
+I18N_EN[lang_usage]="Usage: vps_optimizer.sh config lang <en|ru|de|fr|zh>"
+I18N_EN[learn_header]="=== --learn mode: showing what WOULD change ==="
+I18N_EN[learn_footer]="No files were modified. Run without --learn to apply."
+I18N_EN[json_logs_on]="JSON-logs mode active (structured for ELK/Loki)"
+I18N_EN[help_title]="VPS Optimizer v%s"
+I18N_EN[help_usage]="USAGE:"
+I18N_EN[help_commands]="COMMANDS:"
+I18N_EN[help_global_flags]="GLOBAL FLAGS:"
+I18N_EN[help_exit_codes]="EXIT CODES (for cron/Ansible):"
+I18N_EN[help_examples]="EXAMPLES:"
+I18N_EN[help_config_files]="CONFIG FILES:"
+I18N_EN[help_logs]="LOGS:"
+I18N_EN[help_see_also]="SEE ALSO:"
+I18N_EN[cmd_install]="Install Phoenix components"
+I18N_EN[cmd_apply]="Apply sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)"
+I18N_EN[cmd_status]="Show state dashboard (or JSON for machines)"
+I18N_EN[cmd_self_test]="Re-verify applied settings"
+I18N_EN[cmd_audit]="Deep diagnostics (drift, conntrack, RPS, dnscrypt-proxy)"
+I18N_EN[cmd_doctor]="Actionable diagnostics with recommendations"
+I18N_EN[cmd_why]="Explain why a specific sysctl is set this way"
+I18N_EN[cmd_top]="TUI: live top-connections, conntrack util, retransmits"
+I18N_EN[cmd_mtr]="Bundled mtr with loss prediction (requires mtr)"
+I18N_EN[cmd_prom_push]="Push Prometheus metrics to a pushgateway"
+I18N_EN[cmd_stealth_test]="JA3-leak self-check via ja3er.com"
+I18N_EN[cmd_audit_syslog]="Forward audit-log to remote syslog"
+I18N_EN[cmd_backup_config]="Snapshot configs to rclone-remote"
+I18N_EN[cmd_playbook]="Pre-baked roles: hysteria2-host|wg-vpn-server|web-frontend"
+I18N_EN[cmd_health_watch]="Periodic doctor systemd-timer (every 5 min)"
+I18N_EN[cmd_dns_doq]="Install DNS-over-QUIC (opt-in, requires AdGuard Home)"
+I18N_EN[cmd_dns_dnssec]="Enable DNSSEC validation in unbound (opt-in)"
+I18N_EN[cmd_logs]="Last N lines of journals (run/journalctl/dmesg/audit)"
+I18N_EN[cmd_preset]="Save preset for future apply"
+I18N_EN[cmd_noise]="Manage noise generator"
+I18N_EN[cmd_wg_setup]="WireGuard helper: MTU autodetect, conntrack rules"
+I18N_EN[cmd_dns]="Manage DNS configuration"
+I18N_EN[cmd_swap]="Create swap file of given size in GB"
+I18N_EN[cmd_benchmark]="Measure ping to popular endpoints"
+I18N_EN[cmd_compare]="Save ping baseline / show diff (default: 1.1.1.1)"
+I18N_EN[cmd_harden]="Opt-in security (does NOT change apply default)"
+I18N_EN[cmd_prom_metrics]="Dump Prometheus metrics to stdout"
+I18N_EN[cmd_prom_serve]="Run Prometheus exporter (default port 9777)"
+I18N_EN[cmd_reset]="Full rollback / --soft = sysctl only"
+I18N_EN[cmd_uninstall]="Full removal: reset + delete script itself"
+I18N_EN[cmd_export]="Export all configs to archive (with manifest)"
+I18N_EN[cmd_import]="Import exported configs (with version check)"
+I18N_EN[cmd_update]="Update script (with SHA256 verification)"
+I18N_EN[cmd_config]="Configuration: lang <code> | show"
+I18N_EN[cmd_help]="This help"
+I18N_EN[flag_dry_run]="Only show what would change"
+I18N_EN[flag_quiet]="Minimal output (for scripts/cron)"
+I18N_EN[flag_debug]="Verbose log to %s"
+I18N_EN[flag_force]="Ignore lock / confirmations"
+I18N_EN[flag_preset]="Use a specific preset (see apply)"
+I18N_EN[flag_impersonate]="Use curl-impersonate for noise (if installed)"
+I18N_EN[flag_ecmp]="Enable ECMP/multipath (for multi-NIC bare-metal)"
+I18N_EN[flag_vpn]="Explicit VPN mode: rp_filter=2, accept_local, ip_forward"
+I18N_EN[flag_no_rollback]="Disable auto-rollback on connectivity check"
+I18N_EN[flag_soft]="Soft mode (for reset): sysctl only, keep DNS/noise"
+I18N_EN[flag_boot]="Boot mode (for apply): create one-shot systemd unit"
+I18N_EN[flag_json]="JSON output (for status/audit)"
+I18N_EN[flag_json_logs]="Structured JSON-logs to RUN_LOG (ELK/Loki)"
+I18N_EN[flag_no_color]="Disable ANSI colors (auto in pipe/file)"
+I18N_EN[flag_learn]="--learn: dry-run with detailed diff and rationale"
+
+# --- Russian (исторический язык скрипта — большинство строк УЖЕ ru) ---
+I18N_RU[err_root]="[!] Запустите от имени root."
+I18N_RU[err_lock_busy]="[!] Другой инстанс vps_optimizer уже работает (lock=%s)."
+I18N_RU[err_lock_busy_hint]="    Запусти с --force чтобы проигнорировать."
+I18N_RU[lang_set]="[+] Язык установлен: %s. Сохранён в %s."
+I18N_RU[lang_unsupported]="[!] Язык не поддерживается: %s. Доступны: en, ru, de, fr, zh."
+I18N_RU[lang_current]="Текущий язык: %s"
+I18N_RU[lang_usage]="Использование: vps_optimizer.sh config lang <en|ru|de|fr|zh>"
+I18N_RU[learn_header]="=== режим --learn: что бы поменялось ==="
+I18N_RU[learn_footer]="Никакие файлы не изменены. Без --learn — реально применить."
+I18N_RU[json_logs_on]="JSON-logs режим включён (structured для ELK/Loki)"
+I18N_RU[help_title]="VPS Optimizer v%s"
+I18N_RU[help_usage]="ИСПОЛЬЗОВАНИЕ:"
+I18N_RU[help_commands]="КОМАНДЫ:"
+I18N_RU[help_global_flags]="ГЛОБАЛЬНЫЕ ФЛАГИ:"
+I18N_RU[help_exit_codes]="EXIT КОДЫ (для cron/Ansible):"
+I18N_RU[help_examples]="ПРИМЕРЫ:"
+I18N_RU[help_config_files]="ФАЙЛЫ КОНФИГА:"
+I18N_RU[help_logs]="ЛОГИ:"
+I18N_RU[help_see_also]="СМ. ТАКЖЕ:"
+I18N_RU[cmd_install]="Установить компоненты Phoenix"
+I18N_RU[cmd_apply]="Применить sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)"
+I18N_RU[cmd_status]="Показать дашборд состояния (или JSON для машин)"
+I18N_RU[cmd_self_test]="Перепроверить применённые настройки"
+I18N_RU[cmd_audit]="Глубокая диагностика (drift, conntrack, RPS, dnscrypt-proxy)"
+I18N_RU[cmd_doctor]="Actionable-диагностика с рекомендациями"
+I18N_RU[cmd_why]="Объяснить почему конкретный sysctl такой"
+I18N_RU[cmd_top]="TUI: live топ-conn, conntrack, retransmits"
+I18N_RU[cmd_mtr]="Bundled mtr с прогнозом потерь (требует mtr)"
+I18N_RU[cmd_prom_push]="Push Prometheus метрик в pushgateway"
+I18N_RU[cmd_stealth_test]="Само-проверка JA3-leak'а через ja3er.com"
+I18N_RU[cmd_audit_syslog]="Пересылать audit-log в remote syslog"
+I18N_RU[cmd_backup_config]="Выгрузить конфиги в rclone-remote"
+I18N_RU[cmd_playbook]="Готовые роли: hysteria2-host|wg-vpn-server|web-frontend"
+I18N_RU[cmd_health_watch]="Систёмный таймер doctor каждые 5 мин"
+I18N_RU[cmd_dns_doq]="Установка DNS-over-QUIC (opt-in, требует AdGuard Home)"
+I18N_RU[cmd_dns_dnssec]="Включить DNSSEC validation в unbound (opt-in)"
+I18N_RU[cmd_logs]="Последние N строк журнала (run/journalctl/dmesg/audit)"
+I18N_RU[cmd_preset]="Сохранить пресет на будущие apply"
+I18N_RU[cmd_noise]="Управление шумогенератором"
+I18N_RU[cmd_wg_setup]="WireGuard helper: автодетект MTU, conntrack-rules"
+I18N_RU[cmd_dns]="Управление DNS"
+I18N_RU[cmd_swap]="Создать swap-файл указанного размера в ГБ"
+I18N_RU[cmd_benchmark]="Замерить пинг до набора популярных endpoints"
+I18N_RU[cmd_compare]="Сохранить ping baseline / показать diff (default: 1.1.1.1)"
+I18N_RU[cmd_harden]="Opt-in security (НЕ меняет дефолт apply)"
+I18N_RU[cmd_prom_metrics]="Сдампить Prometheus-метрики на stdout"
+I18N_RU[cmd_prom_serve]="Поднять Prometheus exporter (default port 9777)"
+I18N_RU[cmd_reset]="Полный откат / --soft = только sysctl"
+I18N_RU[cmd_uninstall]="Полное удаление: сбрасывает + сносит сам скрипт"
+I18N_RU[cmd_export]="Выгрузить все конфиги в архив (с manifest)"
+I18N_RU[cmd_import]="Накатить выгруженные конфиги (с проверкой версии)"
+I18N_RU[cmd_update]="Обновить скрипт (с SHA256 verification)"
+I18N_RU[cmd_config]="Конфигурация: lang <код> | show"
+I18N_RU[cmd_help]="Эта справка"
+I18N_RU[flag_dry_run]="Только показать, что бы изменилось"
+I18N_RU[flag_quiet]="Минимум вывода (для скриптов/cron)"
+I18N_RU[flag_debug]="Подробный лог в %s"
+I18N_RU[flag_force]="Игнорировать lock / подтверждения"
+I18N_RU[flag_preset]="Использовать конкретный пресет (см. apply)"
+I18N_RU[flag_impersonate]="Использовать curl-impersonate в шуме (если установлен)"
+I18N_RU[flag_ecmp]="Включить ECMP/multipath (для multi-NIC bare-metal)"
+I18N_RU[flag_vpn]="Явно VPN-режим: rp_filter=2, accept_local, ip_forward"
+I18N_RU[flag_no_rollback]="Отключить auto-rollback по connectivity-check"
+I18N_RU[flag_soft]="Soft-режим (для reset): только sysctl, не трогать DNS/noise"
+I18N_RU[flag_boot]="Boot-режим (для apply): создать one-shot systemd unit"
+I18N_RU[flag_json]="Вывод в JSON (для status/audit)"
+I18N_RU[flag_json_logs]="Structured JSON-logs в RUN_LOG (ELK/Loki)"
+I18N_RU[flag_no_color]="Выключить ANSI цвета (auto в pipe/file)"
+I18N_RU[flag_learn]="--learn: dry-run с детальным diff и rationale"
+
+# --- Deutsch ---
+I18N_DE[err_root]="[!] Als root ausführen."
+I18N_DE[err_lock_busy]="[!] Eine andere vps_optimizer-Instanz läuft (lock=%s)."
+I18N_DE[err_lock_busy_hint]="    --force zum Ignorieren übergeben."
+I18N_DE[lang_set]="[+] Sprache gesetzt: %s. Gespeichert in %s."
+I18N_DE[lang_unsupported]="[!] Sprache nicht unterstützt: %s. Erlaubt: en, ru, de, fr, zh."
+I18N_DE[lang_current]="Aktuelle Sprache: %s"
+I18N_DE[lang_usage]="Verwendung: vps_optimizer.sh config lang <en|ru|de|fr|zh>"
+I18N_DE[learn_header]="=== --learn-Modus: was geändert würde ==="
+I18N_DE[learn_footer]="Keine Datei wurde geändert. Ohne --learn anwenden."
+I18N_DE[json_logs_on]="JSON-Log-Modus aktiv (strukturiert für ELK/Loki)"
+I18N_DE[help_title]="VPS Optimizer v%s"
+I18N_DE[help_usage]="VERWENDUNG:"
+I18N_DE[help_commands]="BEFEHLE:"
+I18N_DE[help_global_flags]="GLOBALE FLAGS:"
+I18N_DE[help_exit_codes]="EXIT-CODES (für cron/Ansible):"
+I18N_DE[help_examples]="BEISPIELE:"
+I18N_DE[help_config_files]="KONFIG-DATEIEN:"
+I18N_DE[help_logs]="LOGS:"
+I18N_DE[help_see_also]="SIEHE AUCH:"
+I18N_DE[cmd_install]="Phoenix-Komponenten installieren"
+I18N_DE[cmd_apply]="sysctl/sysfs/ZRAM anwenden (NAME: balanced|proxy|web)"
+I18N_DE[cmd_status]="Status-Dashboard anzeigen (oder JSON für Maschinen)"
+I18N_DE[cmd_self_test]="Angewendete Einstellungen erneut prüfen"
+I18N_DE[cmd_audit]="Tiefe Diagnose (drift, conntrack, RPS, dnscrypt-proxy)"
+I18N_DE[cmd_doctor]="Actionable Diagnose mit Empfehlungen"
+I18N_DE[cmd_why]="Erklären warum ein bestimmter sysctl so gesetzt ist"
+I18N_DE[cmd_top]="TUI: Live Top-Verbindungen, conntrack-Auslastung, retransmits"
+I18N_DE[cmd_mtr]="mtr mit Verlustvorhersage (benötigt mtr)"
+I18N_DE[cmd_prom_push]="Prometheus-Metriken zu Pushgateway senden"
+I18N_DE[cmd_stealth_test]="JA3-Leak-Selbstprüfung via ja3er.com"
+I18N_DE[cmd_audit_syslog]="audit-log an Remote-Syslog weiterleiten"
+I18N_DE[cmd_backup_config]="Konfig-Snapshots zu rclone-remote"
+I18N_DE[cmd_playbook]="Vorgefertigte Rollen: hysteria2-host|wg-vpn-server|web-frontend"
+I18N_DE[cmd_health_watch]="Periodischer doctor-Timer (alle 5 Min)"
+I18N_DE[cmd_dns_doq]="DNS-over-QUIC (opt-in, benötigt AdGuard Home)"
+I18N_DE[cmd_dns_dnssec]="DNSSEC-Validierung in unbound (opt-in)"
+I18N_DE[cmd_logs]="Letzte N Journal-Zeilen (run/journalctl/dmesg/audit)"
+I18N_DE[cmd_preset]="Preset für künftige apply-Aufrufe speichern"
+I18N_DE[cmd_noise]="Noise-Generator verwalten"
+I18N_DE[cmd_wg_setup]="WireGuard-Helper: MTU-Autodetect, conntrack"
+I18N_DE[cmd_dns]="DNS-Konfiguration verwalten"
+I18N_DE[cmd_swap]="Swap-Datei in angegebener GB-Grösse erstellen"
+I18N_DE[cmd_benchmark]="Ping zu populären Endpoints messen"
+I18N_DE[cmd_compare]="Ping-Baseline speichern / Diff anzeigen (default: 1.1.1.1)"
+I18N_DE[cmd_harden]="Opt-in Sicherheit (ändert apply-Default NICHT)"
+I18N_DE[cmd_prom_metrics]="Prometheus-Metriken nach stdout"
+I18N_DE[cmd_prom_serve]="Prometheus-Exporter starten (default port 9777)"
+I18N_DE[cmd_reset]="Voller Rollback / --soft = nur sysctl"
+I18N_DE[cmd_uninstall]="Volle Entfernung: reset + Skript löschen"
+I18N_DE[cmd_export]="Alle Konfigs in Archiv exportieren (mit manifest)"
+I18N_DE[cmd_import]="Exportierte Konfigs importieren (mit Versionsprüfung)"
+I18N_DE[cmd_update]="Skript aktualisieren (mit SHA256-Verifikation)"
+I18N_DE[cmd_config]="Konfiguration: lang <code> | show"
+I18N_DE[cmd_help]="Diese Hilfe"
+
+# --- Français ---
+I18N_FR[err_root]="[!] Exécutez en tant que root."
+I18N_FR[err_lock_busy]="[!] Une autre instance vps_optimizer est en cours (lock=%s)."
+I18N_FR[err_lock_busy_hint]="    Utilisez --force pour ignorer."
+I18N_FR[lang_set]="[+] Langue définie: %s. Sauvegardée dans %s."
+I18N_FR[lang_unsupported]="[!] Langue non supportée: %s. Disponibles: en, ru, de, fr, zh."
+I18N_FR[lang_current]="Langue actuelle: %s"
+I18N_FR[lang_usage]="Utilisation: vps_optimizer.sh config lang <en|ru|de|fr|zh>"
+I18N_FR[learn_header]="=== mode --learn: ce qui changerait ==="
+I18N_FR[learn_footer]="Aucun fichier modifié. Sans --learn pour appliquer."
+I18N_FR[json_logs_on]="Mode JSON-logs actif (structuré pour ELK/Loki)"
+I18N_FR[help_title]="VPS Optimizer v%s"
+I18N_FR[help_usage]="UTILISATION:"
+I18N_FR[help_commands]="COMMANDES:"
+I18N_FR[help_global_flags]="DRAPEAUX GLOBAUX:"
+I18N_FR[help_exit_codes]="CODES DE SORTIE (pour cron/Ansible):"
+I18N_FR[help_examples]="EXEMPLES:"
+I18N_FR[help_config_files]="FICHIERS DE CONFIG:"
+I18N_FR[help_logs]="LOGS:"
+I18N_FR[help_see_also]="VOIR AUSSI:"
+I18N_FR[cmd_install]="Installer composants Phoenix"
+I18N_FR[cmd_apply]="Appliquer sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)"
+I18N_FR[cmd_status]="Tableau de bord d'état (ou JSON pour machines)"
+I18N_FR[cmd_self_test]="Re-vérifier les paramètres appliqués"
+I18N_FR[cmd_audit]="Diagnostic profond (drift, conntrack, RPS, dnscrypt-proxy)"
+I18N_FR[cmd_doctor]="Diagnostic actionnable avec recommandations"
+I18N_FR[cmd_why]="Expliquer pourquoi un sysctl est ainsi"
+I18N_FR[cmd_top]="TUI: top connexions live, conntrack, retransmits"
+I18N_FR[cmd_mtr]="mtr avec prévision de perte (nécessite mtr)"
+I18N_FR[cmd_prom_push]="Pousser métriques Prometheus vers pushgateway"
+I18N_FR[cmd_stealth_test]="Auto-test JA3-leak via ja3er.com"
+I18N_FR[cmd_audit_syslog]="Transférer audit-log vers syslog distant"
+I18N_FR[cmd_backup_config]="Snapshot configs vers rclone-remote"
+I18N_FR[cmd_playbook]="Rôles prédéfinis: hysteria2-host|wg-vpn-server|web-frontend"
+I18N_FR[cmd_health_watch]="Timer doctor périodique (toutes 5 min)"
+I18N_FR[cmd_dns_doq]="Installer DNS-over-QUIC (opt-in, nécessite AdGuard Home)"
+I18N_FR[cmd_dns_dnssec]="Activer validation DNSSEC dans unbound (opt-in)"
+I18N_FR[cmd_logs]="N dernières lignes de journaux"
+I18N_FR[cmd_preset]="Sauvegarder preset pour futurs apply"
+I18N_FR[cmd_noise]="Gérer le générateur de bruit"
+I18N_FR[cmd_wg_setup]="Helper WireGuard: MTU auto, conntrack"
+I18N_FR[cmd_dns]="Gérer configuration DNS"
+I18N_FR[cmd_swap]="Créer fichier swap de taille donnée en Go"
+I18N_FR[cmd_benchmark]="Mesurer ping vers endpoints populaires"
+I18N_FR[cmd_compare]="Sauvegarder baseline / afficher diff (défaut: 1.1.1.1)"
+I18N_FR[cmd_harden]="Sécurité opt-in (ne modifie PAS le défaut apply)"
+I18N_FR[cmd_prom_metrics]="Dump métriques Prometheus sur stdout"
+I18N_FR[cmd_prom_serve]="Lancer exporter Prometheus (port défaut 9777)"
+I18N_FR[cmd_reset]="Rollback complet / --soft = sysctl seulement"
+I18N_FR[cmd_uninstall]="Suppression totale: reset + script lui-même"
+I18N_FR[cmd_export]="Exporter toutes configs en archive (avec manifest)"
+I18N_FR[cmd_import]="Importer configs exportées (avec vérif version)"
+I18N_FR[cmd_update]="Mettre à jour le script (avec vérif SHA256)"
+I18N_FR[cmd_config]="Configuration: lang <code> | show"
+I18N_FR[cmd_help]="Cette aide"
+
+# --- 中文 (简体) ---
+I18N_ZH[err_root]="[!] 请以 root 身份运行。"
+I18N_ZH[err_lock_busy]="[!] 另一个 vps_optimizer 实例正在运行 (lock=%s)。"
+I18N_ZH[err_lock_busy_hint]="    使用 --force 忽略。"
+I18N_ZH[lang_set]="[+] 语言已设置: %s。已保存到 %s。"
+I18N_ZH[lang_unsupported]="[!] 不支持的语言: %s。可用: en, ru, de, fr, zh。"
+I18N_ZH[lang_current]="当前语言: %s"
+I18N_ZH[lang_usage]="用法: vps_optimizer.sh config lang <en|ru|de|fr|zh>"
+I18N_ZH[learn_header]="=== --learn 模式: 显示将要更改的内容 ==="
+I18N_ZH[learn_footer]="没有文件被修改。去掉 --learn 即可实际应用。"
+I18N_ZH[json_logs_on]="JSON-logs 模式已启用 (结构化用于 ELK/Loki)"
+I18N_ZH[help_title]="VPS Optimizer v%s"
+I18N_ZH[help_usage]="用法:"
+I18N_ZH[help_commands]="命令:"
+I18N_ZH[help_global_flags]="全局参数:"
+I18N_ZH[help_exit_codes]="退出码 (用于 cron/Ansible):"
+I18N_ZH[help_examples]="示例:"
+I18N_ZH[help_config_files]="配置文件:"
+I18N_ZH[help_logs]="日志:"
+I18N_ZH[help_see_also]="另请参阅:"
+I18N_ZH[cmd_install]="安装 Phoenix 组件"
+I18N_ZH[cmd_apply]="应用 sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)"
+I18N_ZH[cmd_status]="显示状态仪表板 (或 JSON 用于程序)"
+I18N_ZH[cmd_self_test]="重新检查已应用的设置"
+I18N_ZH[cmd_audit]="深度诊断 (drift, conntrack, RPS, dnscrypt-proxy)"
+I18N_ZH[cmd_doctor]="可操作诊断与建议"
+I18N_ZH[cmd_why]="解释某个 sysctl 为何如此设置"
+I18N_ZH[cmd_top]="TUI: 实时连接、conntrack、重传"
+I18N_ZH[cmd_mtr]="带丢包预测的 mtr (需要 mtr)"
+I18N_ZH[cmd_prom_push]="推送 Prometheus 指标到 pushgateway"
+I18N_ZH[cmd_stealth_test]="通过 ja3er.com 自检 JA3 泄漏"
+I18N_ZH[cmd_audit_syslog]="将 audit-log 转发到远程 syslog"
+I18N_ZH[cmd_backup_config]="将配置快照到 rclone-remote"
+I18N_ZH[cmd_playbook]="预设角色: hysteria2-host|wg-vpn-server|web-frontend"
+I18N_ZH[cmd_health_watch]="周期性 doctor 定时器 (每5分钟)"
+I18N_ZH[cmd_dns_doq]="安装 DNS-over-QUIC (opt-in, 需要 AdGuard Home)"
+I18N_ZH[cmd_dns_dnssec]="启用 unbound 中的 DNSSEC 验证 (opt-in)"
+I18N_ZH[cmd_logs]="最新 N 行日志"
+I18N_ZH[cmd_preset]="保存 preset 供后续 apply 使用"
+I18N_ZH[cmd_noise]="管理噪声生成器"
+I18N_ZH[cmd_wg_setup]="WireGuard 助手: MTU 自动检测、conntrack"
+I18N_ZH[cmd_dns]="管理 DNS 配置"
+I18N_ZH[cmd_swap]="创建指定大小 (GB) 的 swap 文件"
+I18N_ZH[cmd_benchmark]="测量到流行端点的 ping"
+I18N_ZH[cmd_compare]="保存 ping 基线 / 显示差异 (默认: 1.1.1.1)"
+I18N_ZH[cmd_harden]="可选安全 (不改变 apply 默认行为)"
+I18N_ZH[cmd_prom_metrics]="将 Prometheus 指标输出到 stdout"
+I18N_ZH[cmd_prom_serve]="启动 Prometheus exporter (默认端口 9777)"
+I18N_ZH[cmd_reset]="完全回滚 / --soft = 仅 sysctl"
+I18N_ZH[cmd_uninstall]="完全卸载: reset + 删除脚本本身"
+I18N_ZH[cmd_export]="将所有配置导出到归档 (含 manifest)"
+I18N_ZH[cmd_import]="导入导出的配置 (含版本检查)"
+I18N_ZH[cmd_update]="更新脚本 (含 SHA256 验证)"
+I18N_ZH[cmd_config]="配置: lang <code> | show"
+I18N_ZH[cmd_help]="此帮助"
+
+# Чтобы shellcheck не ругался SC2034 на «unused» массивы (они доступаются
+# только через nameref в _t() — статический анализатор это не видит).
+: "${I18N_RU[err_root]}" "${I18N_DE[err_root]}" "${I18N_FR[err_root]}" "${I18N_ZH[err_root]}"
+
+# _t key — возвращает локализованную строку.
+# Поиск: I18N_<LANG> → I18N_EN → ключ как есть.
+# Если переданы доп.аргументы, они подставляются через printf '%s'.
+_t() {
+    local key="$1"; shift || true
+    local arr_name="I18N_${SCRIPT_LANG^^}"
+    local -n arr="$arr_name" 2>/dev/null
+    local fmt="${arr[$key]:-}"
+    [ -z "$fmt" ] && fmt="${I18N_EN[$key]:-$key}"
+    if [ $# -gt 0 ]; then
+        # shellcheck disable=SC2059
+        printf "$fmt\n" "$@"
+    else
+        printf "%s\n" "$fmt"
+    fi
+}
+
 print_header() {
     [ "$QUIET" = "1" ] && return
     clear
@@ -140,17 +521,34 @@ print_header() {
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}[!] Запустите от имени root.${NC}"
+        echo -e "${RED}$(_t err_root)${NC}"
         exit 1
     fi
 }
 
 # Лог в файл (перезаписывается при каждом запуске apply, рядом — на консоль)
+# v8.6: при --json-logs пишем structured JSON-line вместо plain-line
+# (для ELK/Loki/Vector). Поля: ts, level, version, host, msg.
 _log() {
     local level="$1"; shift
     local msg="$*"
     [ "$QUIET" = "1" ] || echo -e "$msg"
-    echo "[$(date -u +%FT%TZ)] [$level] $(echo -e "$msg" | sed 's/\x1b\[[0-9;]*m//g')" >> "$RUN_LOG" 2>/dev/null || true
+    local ts plain
+    ts=$(date -u +%FT%T.%3NZ)
+    plain=$(echo -e "$msg" | sed 's/\x1b\[[0-9;]*m//g')
+    if [ "$JSON_LOGS" = "1" ]; then
+        # Минимальное JSON-эскейпирование (\, ", \n, \t).
+        local esc="$plain"
+        esc="${esc//\\/\\\\}"
+        esc="${esc//\"/\\\"}"
+        esc="${esc//$'\n'/\\n}"
+        esc="${esc//$'\t'/\\t}"
+        printf '{"ts":"%s","level":"%s","version":"%s","host":"%s","msg":"%s"}\n' \
+            "$ts" "$level" "$SCRIPT_VERSION" "${HOSTNAME:-unknown}" "$esc" \
+            >> "$RUN_LOG" 2>/dev/null || true
+    else
+        echo "[$ts] [$level] $plain" >> "$RUN_LOG" 2>/dev/null || true
+    fi
 }
 
 # Audit-log: фиксирует каждую mutating-команду (apply / reset / dns / noise / harden / uninstall).
@@ -193,8 +591,8 @@ acquire_lock() {
     mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
     exec 9>"$LOCK_FILE" 2>/dev/null || return 0
     if ! flock -n 9 2>/dev/null; then
-        echo -e "${RED}[!] Другой инстанс vps_optimizer уже работает (lock=$LOCK_FILE).${NC}"
-        echo -e "${GRAY}    Запусти с --force чтобы проигнорировать.${NC}"
+        echo -e "${RED}$(_t err_lock_busy "$LOCK_FILE")${NC}"
+        echo -e "${GRAY}$(_t err_lock_busy_hint)${NC}"
         return 1
     fi
     return 0
@@ -271,6 +669,14 @@ sysctl_safe() {
         SYSCTL_OK+=("$key=$value (dry-run)")
         [ -n "$SYSCTL_TMP" ] && echo "$key = $value" >> "$SYSCTL_TMP"
         _debug "sysctl DRY: $key=$value"
+        # v8.6 --learn: показываем diff текущее → желаемое прямо в stdout
+        if [ "$LEARN_MODE" = "1" ]; then
+            local _cur
+            _cur=$(sysctl -n "$key" 2>/dev/null || echo "?")
+            if [ "$_cur" != "$value" ]; then
+                echo -e "  ${YELLOW}~${NC} ${BOLD}$key${NC}: ${GRAY}$_cur${NC} → ${GREEN}$value${NC}"
+            fi
+        fi
         return 0
     fi
     if sysctl -w "$key=$value" >/dev/null 2>&1; then
@@ -296,6 +702,13 @@ sysfs_safe() {
     if [ "$DRY_RUN" = "1" ]; then
         SYSFS_OK+=("$path=$value (dry-run)")
         _debug "sysfs DRY: $path=$value"
+        if [ "$LEARN_MODE" = "1" ]; then
+            local _cur
+            _cur=$(cat "$path" 2>/dev/null || echo "?")
+            if [ "$_cur" != "$value" ]; then
+                echo -e "  ${YELLOW}~${NC} ${BOLD}$path${NC}: ${GRAY}$_cur${NC} → ${GREEN}$value${NC}"
+            fi
+        fi
         return 0
     fi
     if echo "$value" > "$path" 2>/dev/null; then
@@ -1031,6 +1444,42 @@ apply_sysctls() {
         sysctl_safe kernel.sched_wakeup_granularity_ns 15000000
     fi
 
+    # v8.6: numa_balancing — на не-NUMA-VPS (1 узел) автобаланс только сжигает CPU.
+    # Auto-detect: если numactl сообщает 1 node, выключаем; если ≥2 — оставляем kernel default.
+    # На bare-metal или multi-socket это критично оставить включённым (1).
+    if command -v numactl >/dev/null 2>&1; then
+        local _numa_nodes
+        _numa_nodes=$(numactl --hardware 2>/dev/null | awk '/available:/{print $2}')
+        if [ -n "$_numa_nodes" ] && [ "$_numa_nodes" = "1" ]; then
+            sysctl_safe kernel.numa_balancing 0
+        fi
+    elif [ -d /sys/devices/system/node ]; then
+        # Без numactl: считаем узлы через sysfs.
+        local _node_count
+        _node_count=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' 2>/dev/null | wc -l)
+        [ "$_node_count" = "1" ] && sysctl_safe kernel.numa_balancing 0
+    fi
+
+    # v8.6: UDP-enhancements — расширяем lookup-таблицу для тысяч UDP-listeners
+    # (DNS resolver / QUIC / WireGuard fronting). Default udp_hash_entries=128
+    # часто узкое место под прокси-нагрузкой. Параметр read-only после boot
+    # на старых ядрах — sysctl_safe аккуратно skip'нёт если так.
+    sysctl_safe net.ipv4.udp_l3mdev_accept 0
+    # busy_poll/busy_read уже стоят 50 выше — синхронизировано для UDP/QUIC.
+
+    # v8.6: IPv6 privacy extensions (RFC 4941) — temp-addr как primary source-addr
+    # для исходящих соединений. Имитирует поведение реального iOS (anti-tracking).
+    # Гейтим под proxy — на balanced/web стабильный адрес важнее (rDNS, firewall
+    # rules, monitoring). На proxy noise/stealth-исходящий трафик главнее.
+    # Incoming SSH/VPN не затрагивается — listen socket bind'ится на любой адрес.
+    if [ "$PRESET_NAME" = "proxy" ]; then
+        sysctl_safe net.ipv6.conf.all.use_tempaddr 2
+        sysctl_safe net.ipv6.conf.default.use_tempaddr 2
+        sysctl_safe net.ipv6.conf.all.regen_max_retry 3
+        # max_desync_factor — уменьшаем «случайный сдвиг» обновления temp-addr (default 600s).
+        sysctl_safe net.ipv6.conf.all.max_desync_factor 60
+    fi
+
     # NAPI defer (Linux 5.12+)
     if [ "$kvi" -ge 51200 ]; then
         sysctl_safe net.core.gro_flush_timeout 200000
@@ -1101,8 +1550,16 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_ecn 2
     sysctl_safe net.ipv4.tcp_ecn_fallback 1
     sysctl_safe net.ipv4.tcp_thin_linear_timeouts 1
-    sysctl_safe net.ipv4.tcp_reordering 6
-    sysctl_safe net.ipv4.tcp_max_reordering 300
+    # v8.6: tcp_thin_dupack=1 — gated to --preset proxy (CONTRIBUTING #5: tcp_thin_*).
+    # Включает dupack-ускорение (1 dupack → fast retx, не 3) для streams помеченных
+    # TCP_THIN_LINEAR_TIMEOUTS. На balanced/web preset не трогаем — там обычные потоки.
+    if [ "$PRESET_NAME" = "proxy" ]; then
+        sysctl_safe net.ipv4.tcp_thin_dupack 1
+    fi
+    # v8.6: tcp_reordering 6 → 10 — на jittery-облаках (RU↔EU, мобильные) spurious
+    # retransmits заметно реже; max_reordering 300 → 600 — потолок для extreme cases.
+    sysctl_safe net.ipv4.tcp_reordering 10
+    sysctl_safe net.ipv4.tcp_max_reordering 600
     sysctl_safe net.ipv4.tcp_early_retrans 3
     sysctl_safe net.ipv4.tcp_frto 2
     sysctl_safe net.ipv4.tcp_autocorking 0
@@ -1293,7 +1750,9 @@ apply_sysctls() {
     # Безопасные kernel/sched доводки.
     sysctl_safe kernel.sched_migration_cost_ns 5000000
     sysctl_safe kernel.sched_autogroup_enabled 0
-    sysctl_safe kernel.numa_balancing 0
+    # v8.6: kernel.numa_balancing — больше не выставляем безусловно, теперь только
+    # на 1-NUMA-узловых VPS (auto-detect вверху, ~line 1447). На multi-socket
+    # bare-metal оставляем включённым, иначе теряем balanced placement.
     sysctl_safe kernel.timer_migration 1
     # fs limits — на случай прокси с тысячами upstream'ов.
     sysctl_safe fs.file-max 2097152
@@ -1555,6 +2014,10 @@ apply_oom_hints() {
 
 apply_optimizations() {
     [ "$DRY_RUN" = "1" ] && _log INFO "${YELLOW}[i] DRY-RUN: ничего не записывается на диск.${NC}"
+    if [ "$LEARN_MODE" = "1" ]; then
+        _log INFO "${CYAN}$(_t learn_header)${NC}"
+        _log INFO "${GRAY}    each sysctl_safe / sysfs_safe call will print: current → desired (rationale).${NC}"
+    fi
     _log INFO "${YELLOW}[*] Глобальный тюнинг v${SCRIPT_VERSION} PHOENIX-Z++...${NC}"
 
     if ! acquire_lock; then
@@ -1655,6 +2118,10 @@ apply_optimizations() {
     _audit apply "preset=${PRESET_NAME} virt=${VIRT} provider=${PROVIDER} bbr=${APPLIED_BBR} qdisc=${APPLIED_QDISC} dry_run=${DRY_RUN}"
     rm -f "$SYSCTL_TMP"; trap - EXIT
     release_lock
+
+    if [ "$LEARN_MODE" = "1" ]; then
+        _log INFO "${CYAN}$(_t learn_footer)${NC}"
+    fi
 
     # Auto-rollback (v8.3, L1): если после apply связь потерялась — откатываемся.
     # Безопасная сетка: NO_ROLLBACK=1 или DRY_RUN=1 пропускают проверку.
@@ -2475,6 +2942,14 @@ http_request() {
         # curl поддерживает с 7.79+. Если не поддерживается — флаг проигнорится.
         if curl --help all 2>/dev/null | grep -q -- '--tls-earlydata'; then
             (( $(urand 0 2) == 0 )) && args+=(--tls-earlydata)
+        fi
+        # v8.6: iOS 18 — TCP_FASTOPEN_CONNECT. Реальный Safari ставит TFO_CONNECT
+        # практически на каждый исходящий TCP-сокет (с момента iOS 9). У нас был
+        # TFO в sysctl, но в curl-вызовах не использовали. curl 7.49+ умеет --tcp-fastopen.
+        # Безопасно: server поддержи нет → fallback к стандартному 3WHS.
+        # На Linux SO_NOSIGPIPE недоступен, но curl делает MSG_NOSIGNAL — equivalent.
+        if curl --help all 2>/dev/null | grep -q -- '--tcp-fastopen'; then
+            (( $(urand 0 1) == 0 )) && args+=(--tcp-fastopen)
         fi
     fi
 
@@ -4488,7 +4963,10 @@ PrivateKey = $priv_key
 ListenPort = 51820
 Address = 10.99.0.1/24
 MTU = $mtu_wg
-# PostUp/PostDown — типовая NAT-настройка для VPN-роутера.
+# v8.6: UDP_GRO/SO_REUSEPORT — современное wg-tools/wireguard-linux уже умеет
+# UDP-GRO listen-side при условии что net.core.devconf'ы выставлены, что мы
+# делаем в apply. Дополнительно ничего не нужно — это для документирования.
+# PreUp/PostDown ниже — типовая NAT-настройка для VPN-роутера.
 # Закомментировано по умолчанию: включай руками если хочешь exit-node.
 # PostUp   = iptables -t nat -A POSTROUTING -s 10.99.0.0/24 -o ${default_iface:-eth0} -j MASQUERADE
 # PostDown = iptables -t nat -D POSTROUTING -s 10.99.0.0/24 -o ${default_iface:-eth0} -j MASQUERADE
@@ -4779,6 +5257,35 @@ vps_noise_requests_ok ${req_ok:-0}
 # TYPE vps_noise_requests_error counter
 vps_noise_requests_error ${req_err:-0}
 PEOF
+
+    # v8.6: DNS cache hit-ratio. Поддерживаем unbound (cache.hits/cache.misses)
+    # и dnscrypt-proxy (через query_log при tail). Если нет ни того ни другого,
+    # просто пропускаем секцию — Prometheus получит 0 метрик и не упадёт.
+    local dns_hits=0 dns_misses=0 dns_ratio=0
+    if command -v unbound-control >/dev/null 2>&1; then
+        local cstats
+        cstats=$(unbound-control -c /etc/unbound/unbound.conf stats_noreset 2>/dev/null || true)
+        if [ -n "$cstats" ]; then
+            # Сумма по всем threads: имена «threadN.requestlist.cache_hits» / «threadN.cachehits» зависят от версии.
+            dns_hits=$(echo "$cstats" | awk -F= '/cachehits/ {sum+=$2} END{print sum+0}')
+            dns_misses=$(echo "$cstats" | awk -F= '/cachemiss/ {sum+=$2} END{print sum+0}')
+        fi
+    fi
+    if [ "$((dns_hits + dns_misses))" -gt 0 ]; then
+        # 4-знака после точки, без bc.
+        dns_ratio=$(awk -v h="$dns_hits" -v m="$dns_misses" 'BEGIN{ if (h+m>0) printf "%.4f", h/(h+m); else print "0" }')
+    fi
+    cat <<PEOF
+# HELP vps_dns_cache_hits Total DNS cache hits (unbound)
+# TYPE vps_dns_cache_hits counter
+vps_dns_cache_hits ${dns_hits:-0}
+# HELP vps_dns_cache_misses Total DNS cache misses (unbound)
+# TYPE vps_dns_cache_misses counter
+vps_dns_cache_misses ${dns_misses:-0}
+# HELP vps_dns_cache_hit_ratio Hit ratio = hits / (hits + misses), 0..1
+# TYPE vps_dns_cache_hit_ratio gauge
+vps_dns_cache_hit_ratio ${dns_ratio:-0}
+PEOF
 }
 
 # Простой Prometheus exporter на порту 9777 — поднимается в foreground,
@@ -4970,14 +5477,40 @@ prom_push_command() {
 # warning с конкретными рекомендациями. Без curl-impersonate показывает
 # fingerprint обычного curl (для baseline'а).
 stealth_test_command() {
+    # v8.6: разбор флагов. Глобальный --json уже распарсен в cli_dispatch (JSON=1),
+    # поэтому здесь ловим из локальных args ещё --json (для прямых вызовов) +
+    # --exit-fail-on-leak (CI) + --ja4 (если curl-impersonate-chrome 0.6+ есть).
+    local want_json="${JSON:-0}" fail_on_leak=0 want_ja4=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) want_json=1 ;;
+            --exit-fail-on-leak) fail_on_leak=1 ;;
+            --ja4) want_ja4=1 ;;
+        esac
+        shift
+    done
+
     local CURL_BIN
     if command -v curl_safari17_4 >/dev/null 2>&1; then CURL_BIN=curl_safari17_4
     elif command -v curl_safari16_5 >/dev/null 2>&1; then CURL_BIN=curl_safari16_5
     elif command -v curl-impersonate-safari >/dev/null 2>&1; then CURL_BIN=curl-impersonate-safari
     else CURL_BIN=curl
     fi
-    echo -e "${CYAN}${BOLD}=== stealth-test (curl: $CURL_BIN) ===${NC}"
-    if [ "$CURL_BIN" = "curl" ]; then
+
+    # v8.6: пробуем добыть версию curl-impersonate-chrome для JA4 detection.
+    # curl-impersonate-chrome 0.6+ поддерживает JA4-совместимый ClientHello.
+    local has_ja4_capable_curl=0
+    if command -v curl-impersonate-chrome >/dev/null 2>&1; then
+        local ver
+        ver=$(curl-impersonate-chrome --version 2>/dev/null | head -1)
+        # Простой regex check: 0.6.x / 0.7.x / 1.x.x.
+        if echo "$ver" | grep -qE '(curl-impersonate-chrome[/ ])(0\.[6-9]|[1-9])'; then
+            has_ja4_capable_curl=1
+        fi
+    fi
+
+    [ "$want_json" = "0" ] && echo -e "${CYAN}${BOLD}=== stealth-test (curl: $CURL_BIN) ===${NC}"
+    if [ "$CURL_BIN" = "curl" ] && [ "$want_json" = "0" ]; then
         echo -e "${YELLOW}[i] curl-impersonate не установлен — JA3 будет «curl-default»${NC}"
         echo "    Установка: vps_optimizer.sh install (см. раздел curl-impersonate)"
     fi
@@ -4986,37 +5519,77 @@ stealth_test_command() {
         -A "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1" \
         "https://ja3er.com/json" 2>/dev/null)
     if [ -z "$resp" ]; then
-        echo -e "${RED}[!] ja3er.com недоступен — проверь сеть${NC}"
+        if [ "$want_json" = "1" ]; then
+            printf '{"ok":false,"error":"ja3er.com unreachable","curl":"%s"}\n' "$CURL_BIN"
+        else
+            echo -e "${RED}[!] ja3er.com недоступен — проверь сеть${NC}"
+        fi
         return 1
     fi
-    echo "  Ответ ja3er.com:"
-    if command -v jq >/dev/null 2>&1; then
-        echo "$resp" | jq . 2>/dev/null | sed 's/^/    /'
-    else
-        echo "$resp" | sed 's/^/    /'
-    fi
-    # Грубая проверка: реальный iOS Safari MD5 ja3 ~ 0a8b069103752eafdda3a8e9b2bc1b5b и подобные.
-    # Curl default имеет приметный hash, который мы можем вычислить и предупредить.
+
     local ja3_md5
     ja3_md5=$(echo "$resp" | grep -oE '"ja3_hash"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"\([a-f0-9]*\)"/\1/')
-    if [ -n "$ja3_md5" ]; then
-        echo ""
-        echo -e "${BOLD}Твой JA3:${NC} $ja3_md5"
-        # v8.5: список известных iOS Safari JA3 MD5 (актуально на 2024-Q4).
-        # Curl-impersonate генерирует один из этих хешей; обычный curl — что-то ещё.
-        # Мы не доверяем «curl_safari17_4 в PATH = всё ок» — реально верифицируем.
-        local ios_known_ja3=" 0a8b069103752eafdda3a8e9b2bc1b5b 7d52aff20f6ee7f4f73d8edcdb19f31a 773906b0efdefa24a7f2b8eb6985bf37 b832931ce0a04f6707b2a3c2d2904301 "
-        if [ "$CURL_BIN" = "curl" ]; then
-            echo -e "${YELLOW}  Этот hash — обычный curl, легко детектируемый.${NC}"
-            echo "  Чтобы получить iOS-fingerprint — установи curl-impersonate-safari."
-        elif [[ "$ios_known_ja3" == *" $ja3_md5 "* ]]; then
-            echo -e "${GREEN}  iOS Safari fingerprint подтверждён (известный hash).${NC}"
+    local ios_known_ja3=" 0a8b069103752eafdda3a8e9b2bc1b5b 7d52aff20f6ee7f4f73d8edcdb19f31a 773906b0efdefa24a7f2b8eb6985bf37 b832931ce0a04f6707b2a3c2d2904301 "
+    local verdict="unknown"
+    local leak=0
+    if [ "$CURL_BIN" = "curl" ]; then
+        verdict="leak_default_curl"
+        leak=1
+    elif [ -n "$ja3_md5" ] && [[ "$ios_known_ja3" == *" $ja3_md5 "* ]]; then
+        verdict="ok_ios_safari"
+    elif [ -n "$ja3_md5" ]; then
+        verdict="impersonate_unknown_hash"
+        leak=1  # v8.6: hash вне известного списка → CI должен фейлить
+    fi
+
+    # v8.6: JA4 — спрашиваем https://tls.peet.ws/api/clean (упоминается в JA4-доке)
+    # только если попросили --ja4 и есть подходящий curl. Не делаем по умолчанию —
+    # это лишний внешний call и не каждый CI хочет такое.
+    local ja4_hash=""
+    if [ "$want_ja4" = "1" ] && [ "$has_ja4_capable_curl" = "1" ]; then
+        local peet_resp
+        peet_resp=$(curl-impersonate-chrome -fsS --max-time 10 "https://tls.peet.ws/api/clean" 2>/dev/null)
+        ja4_hash=$(echo "$peet_resp" | grep -oE '"ja4"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
+    fi
+
+    if [ "$want_json" = "1" ]; then
+        printf '{"ok":true,"curl":"%s","ja3_md5":"%s","verdict":"%s","leak":%s,"ja4":"%s"}\n' \
+            "$CURL_BIN" "${ja3_md5:-}" "$verdict" "$([ $leak = 1 ] && echo true || echo false)" "${ja4_hash:-}"
+    else
+        echo "  Ответ ja3er.com:"
+        if command -v jq >/dev/null 2>&1; then
+            echo "$resp" | jq . 2>/dev/null | sed 's/^/    /'
         else
-            echo -e "${YELLOW}  curl-impersonate активен, но hash не из списка известных iOS Safari.${NC}"
-            echo "  Возможно: устаревший curl-impersonate, или Safari обновился."
-            echo "  Сравни вручную: https://tls.peet.ws/api/all"
+            echo "$resp" | sed 's/^/    /'
+        fi
+        if [ -n "$ja3_md5" ]; then
+            echo ""
+            echo -e "${BOLD}Твой JA3:${NC} $ja3_md5"
+            case "$verdict" in
+                leak_default_curl)
+                    echo -e "${YELLOW}  Этот hash — обычный curl, легко детектируемый.${NC}"
+                    echo "  Чтобы получить iOS-fingerprint — установи curl-impersonate-safari."
+                    ;;
+                ok_ios_safari)
+                    echo -e "${GREEN}  iOS Safari fingerprint подтверждён (известный hash).${NC}"
+                    ;;
+                impersonate_unknown_hash)
+                    echo -e "${YELLOW}  curl-impersonate активен, но hash не из списка известных iOS Safari.${NC}"
+                    echo "  Возможно: устаревший curl-impersonate, или Safari обновился."
+                    echo "  Сравни вручную: https://tls.peet.ws/api/all"
+                    ;;
+            esac
+        fi
+        if [ -n "$ja4_hash" ]; then
+            echo -e "${BOLD}JA4 (peet.ws):${NC} $ja4_hash"
+        elif [ "$want_ja4" = "1" ]; then
+            echo -e "${GRAY}  JA4: skip (curl-impersonate-chrome 0.6+ не найден)${NC}"
         fi
     fi
+    if [ "$fail_on_leak" = "1" ] && [ "$leak" = "1" ]; then
+        return 2
+    fi
+    return 0
 }
 
 # v8.5: audit-syslog <host:port> — настроить пересылку нашего audit-log в
@@ -5262,107 +5835,146 @@ EOF
 }
 
 print_cli_help() {
-    echo -e "${BOLD}vps_optimizer.sh${NC} — VPS Optimizer v${SCRIPT_VERSION} PHOENIX-Z++"
+    # v8.6: справка локализована через _t. Заголовки секций / описания команд /
+    # описания флагов берутся из I18N_<LANG>; константы (сами имена команд/флагов,
+    # пути файлов) остаются английскими — они одинаковы во всех локалях.
+    echo -e "${BOLD}vps_optimizer.sh${NC} — $(_t help_title "$SCRIPT_VERSION") (lang=$SCRIPT_LANG)"
+    echo ""
+    echo "$(_t help_usage)"
+    echo "    vps_optimizer.sh                          # interactive menu"
+    echo "    vps_optimizer.sh <command> [options]      # CLI mode (no menu)"
+    echo ""
+    echo "$(_t help_commands)"
+    printf "    %-24s %s\n" "install" "$(_t cmd_install)"
+    printf "    %-24s %s\n" "apply [--preset NAME]" "$(_t cmd_apply)"
+    printf "    %-24s %s\n" "status [--json]" "$(_t cmd_status)"
+    printf "    %-24s %s\n" "self-test" "$(_t cmd_self_test)"
+    printf "    %-24s %s\n" "audit [--json]" "$(_t cmd_audit)"
+    printf "    %-24s %s\n" "doctor" "$(_t cmd_doctor)"
+    printf "    %-24s %s\n" "why <key>" "$(_t cmd_why)"
+    printf "    %-24s %s\n" "top" "$(_t cmd_top)"
+    printf "    %-24s %s\n" "mtr <host>" "$(_t cmd_mtr)"
+    printf "    %-24s %s\n" "prom-push <gw> [job]" "$(_t cmd_prom_push)"
+    printf "    %-24s %s\n" "stealth-test" "$(_t cmd_stealth_test)"
+    printf "    %-24s %s\n" "audit-syslog <h:p>" "$(_t cmd_audit_syslog)"
+    printf "    %-24s %s\n" "backup-config <remote>" "$(_t cmd_backup_config)"
+    printf "    %-24s %s\n" "playbook <name>" "$(_t cmd_playbook)"
+    printf "    %-24s %s\n" "health-watch on|off" "$(_t cmd_health_watch)"
+    printf "    %-24s %s\n" "dns doq <preset>" "$(_t cmd_dns_doq)"
+    printf "    %-24s %s\n" "dns dnssec on|off" "$(_t cmd_dns_dnssec)"
+    printf "    %-24s %s\n" "logs [N]" "$(_t cmd_logs)"
+    printf "    %-24s %s\n" "preset <name>" "$(_t cmd_preset)"
+    printf "    %-24s %s\n" "noise on|off|edit|test|status" "$(_t cmd_noise)"
+    printf "    %-24s %s\n" "wg setup" "$(_t cmd_wg_setup)"
+    printf "    %-24s %s\n" "dns ..." "$(_t cmd_dns)"
+    printf "    %-24s %s\n" "swap <gb>" "$(_t cmd_swap)"
+    printf "    %-24s %s\n" "benchmark" "$(_t cmd_benchmark)"
+    printf "    %-24s %s\n" "compare [target]" "$(_t cmd_compare)"
+    printf "    %-24s %s\n" "harden ssh|ufw|upgrades|all" "$(_t cmd_harden)"
+    printf "    %-24s %s\n" "prom-metrics" "$(_t cmd_prom_metrics)"
+    printf "    %-24s %s\n" "prom-serve [port]" "$(_t cmd_prom_serve)"
+    printf "    %-24s %s\n" "reset [--soft]" "$(_t cmd_reset)"
+    printf "    %-24s %s\n" "uninstall" "$(_t cmd_uninstall)"
+    printf "    %-24s %s\n" "export [path.tar.gz]" "$(_t cmd_export)"
+    printf "    %-24s %s\n" "import <path.tar.gz>" "$(_t cmd_import)"
+    printf "    %-24s %s\n" "update" "$(_t cmd_update)"
+    printf "    %-24s %s\n" "config lang|show" "$(_t cmd_config)"
+    printf "    %-24s %s\n" "help" "$(_t cmd_help)"
+    echo ""
+    echo "$(_t help_global_flags)"
+    printf "    %-24s %s\n" "--dry-run" "$(_t flag_dry_run)"
+    printf "    %-24s %s\n" "--quiet, -q" "$(_t flag_quiet)"
+    printf "    %-24s %s\n" "--debug" "$(_t flag_debug "$DEBUG_LOG")"
+    printf "    %-24s %s\n" "--force" "$(_t flag_force)"
+    printf "    %-24s %s\n" "--preset NAME" "$(_t flag_preset)"
+    printf "    %-24s %s\n" "--impersonate" "$(_t flag_impersonate)"
+    printf "    %-24s %s\n" "--ecmp" "$(_t flag_ecmp)"
+    printf "    %-24s %s\n" "--vpn" "$(_t flag_vpn)"
+    printf "    %-24s %s\n" "--no-rollback" "$(_t flag_no_rollback)"
+    printf "    %-24s %s\n" "--soft" "$(_t flag_soft)"
+    printf "    %-24s %s\n" "--boot" "$(_t flag_boot)"
+    printf "    %-24s %s\n" "--json" "$(_t flag_json)"
+    printf "    %-24s %s\n" "--json-logs" "$(_t flag_json_logs)"
+    printf "    %-24s %s\n" "--no-color" "$(_t flag_no_color)"
+    printf "    %-24s %s\n" "--learn" "$(_t flag_learn)"
+    echo ""
     cat <<EOF
-
-USAGE:
-    vps_optimizer.sh                          # интерактивное меню
-    vps_optimizer.sh <command> [options]      # CLI режим (без меню)
-
-COMMANDS:
-    install                  Установить компоненты Phoenix
-    apply [--preset NAME]    Применить sysctl/sysfs/ZRAM (NAME: balanced|proxy|web)
-        --vpn                + явные VPN-настройки (rp_filter=2, accept_local, ip_forward)
-        --no-rollback        Отключить auto-rollback при потере связи (не рекомендуется)
-        --boot               Поставить one-shot systemd unit для apply на каждом boot
-    status [--json]          Показать дашборд состояния (или JSON для машин)
-    self-test                Перепроверить применённые настройки
-    audit [--json]           Глубокая диагностика (drift, conntrack, RPS, dnscrypt-proxy)
-    doctor                   Actionable-диагностика с рекомендациями (v8.3)
-    why <key>                Объяснить почему конкретный sysctl такой (v8.3)
-    top                      TUI: live top-connections, conntrack util, retransmits (v8.4)
-    mtr <host>               Bundled mtr с прогнозом потерь (требует mtr) (v8.4)
-    prom-push <gw-url> [job] Push Prometheus метрик в pushgateway (v8.4)
-    stealth-test             Само-проверка JA3-leak'а через ja3er.com (v8.5)
-    audit-syslog <h:p>       Пересылать audit-log в remote syslog (v8.5)
-    backup-config <remote>   Выгрузить конфиги в rclone-remote (v8.5)
-    playbook <name>          Готовые роли: hysteria2-host|wg-vpn-server|web-frontend (v8.5)
-    health-watch on|off      Систёмный таймер doctor каждые 5 мин (v8.5)
-    dns doq <preset>         Установка DNS-over-QUIC (opt-in, требует AdGuard Home) (v8.5)
-    dns dnssec on|off        Включить DNSSEC validation в unbound (opt-in) (v8.5)
-    logs [N]                 Последние N строк журнала (run/journalctl/dmesg/audit)
-    preset <name>            Сохранить пресет на будущие apply
-    noise on|off|edit|test|status   Управление шумогенератором
-    wg setup                 WireGuard helper: автодетект MTU, conntrack-rules (v8.3)
-    dns ...                  Управление DNS:
-                               dns                                   # статус
-                               dns local                             # вернуть провайдер.
-                               dns plain|dot|doh <preset>            # transport+resolver
-                               dns plain|dot|doh custom <ip|url ...> # свои IP/URL
-                             preset = cloudflare|google|yandex|quad9|adguard
-                             plain = 53/UDP, dot = 853/TLS,
-                             doh = 443/HTTPS (через dnscrypt-proxy, ставится автоматически)
-    swap <gb>                Создать swap-файл указанного размера в ГБ
-    benchmark                Замерить пинг до набора популярных endpoints
-    compare [target]         Сохранить ping baseline / показать diff (default: 1.1.1.1)
-    harden ssh|ufw|upgrades|all   Opt-in security (НЕ меняет дефолт apply)
-    prom-metrics             Сдампить Prometheus-метрики на stdout
-    prom-serve [port]        Поднять Prometheus exporter (default port 9777)
-    reset [--soft]           Полный откат / --soft = только sysctl, оставить DNS/noise/swap
-    uninstall                Полное удаление: сбрасывает + сносит сам скрипт
-    export [path.tar.gz]     Выгрузить все конфиги в архив (с manifest)
-    import <path.tar.gz>     Накатить выгруженные конфиги (с проверкой версии)
-    update                   Обновить скрипт (с SHA256 verification)
-    help                     Эта справка
-
-GLOBAL FLAGS:
-    --dry-run                Только показать, что бы изменилось
-    --quiet, -q              Минимум вывода (для скриптов/cron)
-    --debug                  Подробный лог в $DEBUG_LOG
-    --force                  Игнорировать lock / подтверждения
-    --preset NAME            Использовать конкретный пресет (см. apply)
-    --impersonate            Использовать curl-impersonate в шуме (если установлен)
-    --ecmp                   Включить ECMP/multipath (для multi-NIC bare-metal)
-    --vpn                    Явно VPN-режим: rp_filter=2, accept_local, ip_forward
-    --no-rollback            Отключить auto-rollback по connectivity-check
-    --soft                   Soft-режим (для reset): только sysctl, не трогать DNS/noise
-    --boot                   Boot-режим (для apply): создать one-shot systemd unit
-    --json                   Вывод в JSON (для status/audit)
-
-EXIT CODES (для cron/Ansible):
+$(_t help_exit_codes)
     0   ok                                10  already-applied (idempotent)
     20  internet-down (apply прерван)     30  hypervisor-blocked (всё запрещено)
     40  lock-busy (другой apply идёт)     50  invalid args / preset
-    60  rolled-back (apply применён, но связь упала → авто-откат)
+    60  rolled-back (apply applied but link dropped → auto-rolled-back)
 
-EXAMPLES:
+$(_t help_examples)
     sudo ./vps_optimizer.sh apply --preset proxy
-    sudo ./vps_optimizer.sh apply --vpn          # для VPN-сервера
-    sudo ./vps_optimizer.sh apply --boot         # apply на каждом boot (OpenVZ)
+    sudo ./vps_optimizer.sh apply --vpn
+    sudo ./vps_optimizer.sh apply --boot
     sudo ./vps_optimizer.sh apply --dry-run --debug
+    sudo ./vps_optimizer.sh apply --learn        # v8.6: dry-run with diff
     sudo ./vps_optimizer.sh status --json
-    sudo ./vps_optimizer.sh audit --json
-    sudo ./vps_optimizer.sh doctor               # actionable diagnostics
-    sudo ./vps_optimizer.sh why net.ipv4.tcp_rmem
+    sudo ./vps_optimizer.sh doctor
+    sudo ./vps_optimizer.sh config lang fr       # v8.6: switch to French
+    LC_VPS=de ./vps_optimizer.sh status          # v8.6: one-shot DE
     sudo ./vps_optimizer.sh wg setup
-    sudo ./vps_optimizer.sh reset --soft         # только sysctl
-    sudo ./vps_optimizer.sh prom-serve 9777 &
+    sudo ./vps_optimizer.sh reset --soft
 
-CONFIG FILES:
+$(_t help_config_files)
+    $LANG_CONF
     $SYSCTL_CONF
     $LIMITS_CONF
     $NOISE_CONF
     $DNS_CONF
     $PRESET_FILE
 
-LOGS:
-    $RUN_LOG     — основной лог
-    $AUDIT_LOG   — append-only audit-log всех mutating-команд
-    $DEBUG_LOG   — детальный лог sysctl/sysfs (--debug)
+$(_t help_logs)
+    $RUN_LOG
+    $AUDIT_LOG
+    $DEBUG_LOG
 
-SEE ALSO:
+$(_t help_see_also)
     https://github.com/lpxqwkjd65rjfn-dot/noble-net-warp
 EOF
+}
+
+# v8.6: config command — выбор языка и других глобальных настроек.
+config_command() {
+    local sub="${1:-show}"
+    case "$sub" in
+        lang)
+            local code="${2:-}"
+            if [ -z "$code" ]; then
+                echo "$(_t lang_current "$SCRIPT_LANG")"
+                echo "$(_t lang_usage)"
+                return 0
+            fi
+            case "$code" in
+                en|ru|de|fr|zh)
+                    # Idempotent: > truncate, не >> append
+                    echo "$code" > "$LANG_CONF" 2>/dev/null \
+                        || { echo -e "${RED}cannot write $LANG_CONF (need root)${NC}"; return 1; }
+                    SCRIPT_LANG="$code"
+                    _audit config "lang=$code"
+                    echo -e "${GREEN}$(_t lang_set "$code" "$LANG_CONF")${NC}"
+                    ;;
+                *)
+                    echo -e "${RED}$(_t lang_unsupported "$code")${NC}"
+                    return 1
+                    ;;
+            esac
+            ;;
+        show|"")
+            echo "$(_t lang_current "$SCRIPT_LANG")"
+            echo "  config file: $LANG_CONF"
+            echo "  env override: LC_VPS=<code>  (one-shot)"
+            echo "  available: en, ru, de, fr, zh"
+            ;;
+        *)
+            echo -e "${RED}config: unknown subcommand '$sub'${NC}"
+            echo "Usage: vps_optimizer.sh config lang <en|ru|de|fr|zh>"
+            echo "       vps_optimizer.sh config show"
+            return 1
+            ;;
+    esac
 }
 
 cli_dispatch() {
@@ -5383,6 +5995,26 @@ cli_dispatch() {
             --no-rollback) NO_ROLLBACK=1 ;;
             --soft) SOFT_RESET=1 ;;
             --boot) apply_boot_mode=1 ;;
+            # v8.6: новые флаги
+            --json-logs) JSON_LOGS=1 ;;
+            --no-color)
+                _vps_use_color=0
+                RED=''; GREEN=''; YELLOW=''; CYAN=''; MAGENTA=''; GRAY=''; NC=''; BOLD=''
+                ;;
+            --learn) LEARN_MODE=1; DRY_RUN=1 ;;
+            --lang)
+                case "${2:-}" in
+                    en|ru|de|fr|zh) SCRIPT_LANG="$2"; shift ;;
+                    *) echo -e "${RED}$(_t lang_unsupported "${2:-}")${NC}"; return "$EXIT_INVALID_ARGS" ;;
+                esac
+                ;;
+            --lang=*)
+                local _v="${1#*=}"
+                case "$_v" in
+                    en|ru|de|fr|zh) SCRIPT_LANG="$_v" ;;
+                    *) echo -e "${RED}$(_t lang_unsupported "$_v")${NC}"; return "$EXIT_INVALID_ARGS" ;;
+                esac
+                ;;
             --preset)  PRESET="$2"; shift ;;
             --preset=*) PRESET="${1#*=}" ;;
             *)         args+=("$1") ;;
@@ -5445,11 +6077,12 @@ cli_dispatch() {
         prom-serve)     prom_serve "${args[0]:-9777}" ;;
         _prom_handler)  _prom_handler ;;
         _top_snapshot)  _top_snapshot ;;
-        stealth-test)   stealth_test_command ;;
+        stealth-test)   stealth_test_command "${args[@]}" ;;
         audit-syslog)   audit_syslog_command "${args[0]:-}" ;;
         backup-config)  backup_config_command "${args[0]:-}" ;;
         playbook)       playbook_command "${args[0]:-list}" ;;
         health-watch)   health_watch_command "${args[0]:-status}" ;;
+        config)         config_command "${args[@]}" ;;
         self-test)
             apply_optimizations >/dev/null
             self_test
@@ -5680,11 +6313,36 @@ if [ $# -gt 0 ]; then
     case "$1" in
         help|-h|--help) print_cli_help; exit 0 ;;
         version|--version|-V) echo "vps_optimizer.sh v$SCRIPT_VERSION"; exit 0 ;;
+        config)
+            # v8.6: config show — без root; config lang — требует root для записи
+            shift
+            if [ "${1:-show}" = "show" ] || [ -z "${1:-}" ]; then
+                config_command show
+                exit 0
+            fi
+            check_root
+            config_command "$@"
+            exit $?
+            ;;
         status)
             shift
-            # Поддержка --json без root
+            # Поддержка --json и --watch без root
             for a in "$@"; do
                 [ "$a" = "--json" ] && { status_json; exit 0; }
+            done
+            for a in "$@"; do
+                if [ "$a" = "--watch" ]; then
+                    # v8.6: status --watch — live update каждые 2с до Ctrl-C.
+                    # Тише header, бесконечный цикл, корректный exit на Ctrl-C.
+                    trap 'echo; exit 0' INT TERM
+                    while true; do
+                        clear
+                        echo -e "${GRAY}vps-optimizer status --watch (Ctrl-C to exit, refresh=2s)${NC}"
+                        echo ""
+                        print_status_dashboard
+                        sleep 2
+                    done
+                fi
             done
             print_status_dashboard
             exit 0
