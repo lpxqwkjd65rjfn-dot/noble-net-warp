@@ -216,10 +216,20 @@ setup() {
 }
 
 # === v8.6: tcp_thin_dupack only on proxy preset ===
-@test "v8.6: tcp_thin_dupack/IPv6-priv gated to proxy preset" {
-    # Find the apply_optimizations function and ensure tcp_thin_dupack is in proxy block
-    run grep -B2 -A1 'tcp_thin_dupack 1' "$SCRIPT"
+@test "v8.6: tcp_thin_dupack is preset-gated to proxy (CONTRIBUTING #5)" {
+    # Verify the line right above 'sysctl_safe net.ipv4.tcp_thin_dupack 1' is
+    # an `if [ "$PRESET_NAME" = "proxy" ]; then` block opener.
+    # We check 4 lines of context before the dupack line and assert that
+    # the proxy-preset gate appears in those 4 lines.
+    run grep -B4 'sysctl_safe net.ipv4.tcp_thin_dupack 1' "$SCRIPT"
     [ "$status" -eq 0 ]
+    [[ "$output" == *'PRESET_NAME" = "proxy"'* ]]
+}
+
+@test "v8.6: IPv6 privacy ext is preset-gated to proxy" {
+    run grep -B4 'use_tempaddr 2' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'PRESET_NAME" = "proxy"'* ]]
 }
 
 # === v8.6: numa_balancing auto-detect ===

@@ -1550,10 +1550,12 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_ecn 2
     sysctl_safe net.ipv4.tcp_ecn_fallback 1
     sysctl_safe net.ipv4.tcp_thin_linear_timeouts 1
-    # v8.6: tcp_thin_dupack=1 — для thin-streams (interactive/SSH/gRPC keepalive)
-    # включаем dupack-ускорение (1 dupack → fast retx, не 3). Безопасно везде —
-    # work только на streams помеченных TCP_THIN_LINEAR_TIMEOUTS, остальные не трогает.
-    sysctl_safe net.ipv4.tcp_thin_dupack 1
+    # v8.6: tcp_thin_dupack=1 — gated to --preset proxy (CONTRIBUTING #5: tcp_thin_*).
+    # Включает dupack-ускорение (1 dupack → fast retx, не 3) для streams помеченных
+    # TCP_THIN_LINEAR_TIMEOUTS. На balanced/web preset не трогаем — там обычные потоки.
+    if [ "$PRESET_NAME" = "proxy" ]; then
+        sysctl_safe net.ipv4.tcp_thin_dupack 1
+    fi
     # v8.6: tcp_reordering 6 → 10 — на jittery-облаках (RU↔EU, мобильные) spurious
     # retransmits заметно реже; max_reordering 300 → 600 — потолок для extreme cases.
     sysctl_safe net.ipv4.tcp_reordering 10
