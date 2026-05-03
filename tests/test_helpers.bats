@@ -712,6 +712,9 @@ setup() {
     [ "$status" -eq 0 ]
     run grep '/etc/logrotate.d/vps-optimizer' "$SCRIPT"
     [ "$status" -eq 0 ]
+    # CONTRIBUTING #8: mutating command must call _audit.
+    run grep '_audit logrotate' "$SCRIPT"
+    [ "$status" -eq 0 ]
 }
 
 @test "v8.9 G1: doctor checks TLS cert expiry" {
