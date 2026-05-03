@@ -394,8 +394,8 @@ setup() {
 }
 
 @test "v8.x: SCRIPT_VERSION present and current" {
-    # Test renamed: catches both 8.8 (during v8.8 cycle) and 8.9+ going forward.
-    run grep -E '^SCRIPT_VERSION="8\.(8|9)"$' "$SCRIPT"
+    # Catches 8.8+ going forward including multi-digit minors (8.10, 8.11, ...).
+    run grep -E '^SCRIPT_VERSION="8\.([89]|[1-9][0-9]+)"$' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
