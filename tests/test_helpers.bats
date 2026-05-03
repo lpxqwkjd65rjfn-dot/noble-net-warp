@@ -393,8 +393,9 @@ setup() {
     [ "$status" -eq 0 ]
 }
 
-@test "v8.8: SCRIPT_VERSION is 8.8" {
-    run grep -E '^SCRIPT_VERSION="8\.8"$' "$SCRIPT"
+@test "v8.x: SCRIPT_VERSION present and current" {
+    # Catches 8.8+ going forward including multi-digit minors (8.10, 8.11, ...).
+    run grep -E '^SCRIPT_VERSION="8\.([89]|[1-9][0-9]+)"$' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
@@ -556,5 +557,194 @@ setup() {
 
 @test "v8.8: bash completion includes new commands" {
     run grep -E 'whoami show compare-presets rollback version' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# ---- v8.9 regression tests ----
+
+@test "v8.9: SCRIPT_VERSION bumped to 8.9" {
+    run grep '^SCRIPT_VERSION="8.9"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 K2: tcp_reflect_tos via sysctl_safe" {
+    run grep 'sysctl_safe net.ipv4.tcp_reflect_tos 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 K3: tcp_migrate_req via sysctl_safe" {
+    run grep 'sysctl_safe net.ipv4.tcp_migrate_req 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 K4: vm.compaction_proactiveness via sysctl_safe" {
+    run grep 'sysctl_safe vm.compaction_proactiveness 20' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 K8: high_order_alloc_disable via sysctl_safe" {
+    run grep 'sysctl_safe net.core.high_order_alloc_disable 0' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 G3+G4: nf_conntrack security flags via sysctl_safe" {
+    run grep 'sysctl_safe net.netfilter.nf_conntrack_helper 0' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'sysctl_safe net.netfilter.nf_conntrack_tcp_loose 0' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 N5: ring buffer auto-tune via ethtool -G" {
+    run grep -E 'ethtool -G.*rx' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'Pre-set maximums' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 N3: qdisc cake on bare-metal vs fq on virt" {
+    run grep -E 'modprobe sch_cake' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '_virt_now.*=.*detect_virt' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 N7: disk I/O scheduler nvme=none, hdd=bfq" {
+    run grep -E 'nvme.*target=.*none' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'rotational.*=.*1.*bfq' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C1: pick_curl_per_conn function exists" {
+    run grep '^pick_curl_per_conn()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C1: noise function uses pick_curl_per_conn" {
+    run grep '_conn_curl=$(pick_curl_per_conn)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C2: iOS 18 UA pinning with weighted distribution" {
+    run grep 'iPhone OS 18_3' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'iPhone OS 18_2' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C3: TLS ECH opt-in via NOISE_ECH" {
+    run grep 'NOISE_ECH' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -- '--ech' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C4: Apple AV CDN endpoints in noise pool" {
+    run grep 'audio-ssl.itunes.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'video-ssl.itunes.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C5: Spotlight Suggestions endpoints" {
+    run grep 'api-tip.cdn-apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'api.smoot.apple.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C6: iCloud Keychain endpoints" {
+    run grep 'escrowproxy.icloud.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'keyvalueservice.icloud.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 C9: --keepalive-time set in curl args" {
+    run grep -- '--keepalive-time 30' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 F1: revert_command exists" {
+    run grep '^revert_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit revert' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 F2: compare_current_command exists" {
+    run grep '^compare_current_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 F3: history_command exists" {
+    run grep '^history_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 F4: changelog_command exists" {
+    run grep '^changelog_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 F8/E6: doctor_run_command supports --watch and --json" {
+    run grep '^doctor_run_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -A30 '^doctor_run_command()' "$SCRIPT"
+    [[ "$output" == *'--watch'* ]]
+    [[ "$output" == *'--json'* ]]
+}
+
+@test "v8.9 E1: health_score_command exists" {
+    run grep '^health_score_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 F12: snapshot_before_command exists" {
+    run grep '^snapshot_before_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit snapshot-before' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 E5: install_logrotate_command exists" {
+    run grep '^install_logrotate_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '/etc/logrotate.d/vps-optimizer' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # CONTRIBUTING #8: mutating command must call _audit.
+    run grep '_audit logrotate' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 G1: doctor checks TLS cert expiry" {
+    run grep -E 'TLS cert.*истёк|TLS cert.*expiry' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 G2: doctor checks chrony/timedatectl skew" {
+    run grep -E 'chronyc tracking' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'NTPSynchronized' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9 E1+E3+E4: prom_metrics includes health_score, noise_failures_rate, profile_snapshots" {
+    run grep 'vps_health_score' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'vps_noise_failures_rate' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'vps_profile_snapshots_total' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.9: cli_dispatch routes new commands (revert, history, snapshot, etc.)" {
+    run grep -E '^[[:space:]]+revert\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+history\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+snapshot\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'compare-current' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
