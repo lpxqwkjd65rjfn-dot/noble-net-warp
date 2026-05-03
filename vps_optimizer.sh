@@ -7221,7 +7221,8 @@ snapshot_before_command() {
         echo -e "${RED}snapshot --before: нет команды для запуска${NC}"
         return "$EXIT_INVALID_ARGS"
     fi
-    local _name="auto-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+    local _name
+    _name="auto-pre-$(date -u +%Y%m%dT%H%M%SZ)"
     echo -e "${CYAN}[*] snapshot --before: создаём $_name перед '$*'${NC}"
     if ! profile_command save "$_name" >/dev/null 2>&1; then
         echo -e "${YELLOW}[!] snapshot --before: profile_save failed, но продолжаю.${NC}"
@@ -7913,7 +7914,7 @@ cli_dispatch() {
         compare-current|current-diff)
             compare_current_command "${args[0]:-}"
             ;;
-        history|audit)
+        history)
             history_command "${args[@]}"
             ;;
         changelog)

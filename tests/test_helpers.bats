@@ -738,7 +738,7 @@ setup() {
 @test "v8.9: cli_dispatch routes new commands (revert, history, snapshot, etc.)" {
     run grep -E '^[[:space:]]+revert\)' "$SCRIPT"
     [ "$status" -eq 0 ]
-    run grep -E '^[[:space:]]+history\|audit\)' "$SCRIPT"
+    run grep -E '^[[:space:]]+history\)' "$SCRIPT"
     [ "$status" -eq 0 ]
     run grep -E '^[[:space:]]+snapshot\)' "$SCRIPT"
     [ "$status" -eq 0 ]
