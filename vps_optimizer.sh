@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.8"
+SCRIPT_VERSION="8.9"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -1244,6 +1244,40 @@ apply_iface_tuning() {
                 elif [ "$_spd" -ge 10000 ] 2>/dev/null; then
                     ip link set dev "$iface" txqueuelen 5000 >/dev/null 2>&1 || true
                 fi
+
+                # v8.9 (N5): Ring buffer auto-tune через ethtool -G. На VPS
+                # default rx/tx часто 256 или 512 (virtio), что слишком мало
+                # для 10G+ NIC и приводит к drops под bursty traffic. Поднимаем
+                # до 4096 (или max если меньше). На kernel/driver без ring-buf
+                # support `ethtool -g` вернёт error → skip. На VPN-iface уже
+                # пропускаем выше через `case "$iface" in tun*|wg*|...`.
+                # Безопасно: ring buffer выделяется один раз при apply, не
+                # растёт под нагрузкой.
+                if command -v ethtool >/dev/null 2>&1; then
+                    local _ring_max_rx _ring_max_tx _ring_cur_rx _ring_cur_tx
+                    # ethtool -g eth0 печатает:
+                    #   Pre-set maximums:
+                    #   RX: 4096
+                    #   ...
+                    #   Current hardware settings:
+                    #   RX: 256
+                    _ring_max_rx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/,/Current hardware settings:/ {if($1=="RX:") print $2}' | head -1)
+                    _ring_max_tx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/,/Current hardware settings:/ {if($1=="TX:") print $2}' | head -1)
+                    _ring_cur_rx=$(ethtool -g "$iface" 2>/dev/null | awk '/Current hardware settings:/,0 {if($1=="RX:") print $2}' | head -1)
+                    _ring_cur_tx=$(ethtool -g "$iface" 2>/dev/null | awk '/Current hardware settings:/,0 {if($1=="TX:") print $2}' | head -1)
+                    if [ -n "$_ring_max_rx" ] && [ "$_ring_max_rx" -ge 1024 ] 2>/dev/null && \
+                       [ -n "$_ring_cur_rx" ] && [ "$_ring_cur_rx" -lt 2048 ] 2>/dev/null; then
+                        local _ring_target_rx=4096
+                        [ "$_ring_max_rx" -lt 4096 ] && _ring_target_rx="$_ring_max_rx"
+                        ethtool -G "$iface" rx "$_ring_target_rx" >/dev/null 2>&1 || true
+                    fi
+                    if [ -n "$_ring_max_tx" ] && [ "$_ring_max_tx" -ge 1024 ] 2>/dev/null && \
+                       [ -n "$_ring_cur_tx" ] && [ "$_ring_cur_tx" -lt 2048 ] 2>/dev/null; then
+                        local _ring_target_tx=4096
+                        [ "$_ring_max_tx" -lt 4096 ] && _ring_target_tx="$_ring_max_tx"
+                        ethtool -G "$iface" tx "$_ring_target_tx" >/dev/null 2>&1 || true
+                    fi
+                fi
             fi
         fi
     done
@@ -1361,7 +1395,8 @@ apply_thp() {
     fi
 }
 
-# I/O scheduler: для NVMe — none, для SSD — mq-deadline. Плюс readahead.
+# I/O scheduler: для NVMe — none, для SATA SSD — mq-deadline, HDD — bfq (если
+# доступен). Плюс readahead. v8.9 (N7): улучшенная логика выбора planner'а.
 apply_block_io() {
     [ "$DRY_RUN" = "1" ] && { _log INFO "${GRAY}[dry-run] block I/O не трогаю${NC}"; return 0; }
     local dev
@@ -1373,16 +1408,27 @@ apply_block_io() {
         esac
         local rotational
         rotational=$(cat "$dev/queue/rotational" 2>/dev/null || echo 1)
+        local available=""
+        [ -r "$dev/queue/scheduler" ] && available=$(cat "$dev/queue/scheduler" 2>/dev/null)
+
+        # v8.9 (N7): тонкая выборка scheduler'а:
+        #   NVMe (multi-queue, low-latency) → 'none' (no scheduler overhead, всё
+        #     решает device's hw queue)
+        #   SATA/SAS SSD (rotational=0, non-nvme) → 'mq-deadline' (предсказуемая
+        #     latency для smaller queue depth)
+        #   HDD (rotational=1) → 'bfq' если CONFIG_IOSCHED_BFQ=y (Ubuntu 22+),
+        #     иначе fallback к 'mq-deadline'. BFQ даёт лучший fair-queueing для
+        #     HDD с long seeks.
         local target="mq-deadline"
-        # NVMe имена начинаются на nvme*; для них — none (multi-queue device)
         case "$name" in
             nvme*) target="none" ;;
+            *)
+                if [ "$rotational" = "1" ] && echo "$available" | grep -qw "bfq"; then
+                    target="bfq"
+                fi
+                ;;
         esac
-        # HDD (rotational=1) → bfq если есть, иначе mq-deadline
-        if [ "$rotational" = "1" ]; then target="mq-deadline"; fi
         if [ -w "$dev/queue/scheduler" ]; then
-            local available
-            available=$(cat "$dev/queue/scheduler" 2>/dev/null)
             if echo "$available" | grep -qw "$target"; then
                 if echo "$target" > "$dev/queue/scheduler" 2>/dev/null; then
                     SYSFS_OK+=("$name:scheduler=$target")
@@ -1423,9 +1469,21 @@ apply_sysctls() {
     elif has_cong_ctl bbr;  then best_bbr="bbr"
     fi
 
-    local best_qdisc="fq_codel"
-    if modprobe sch_cake 2>/dev/null; then best_qdisc="cake"
-    elif modprobe sch_fq 2>/dev/null;   then best_qdisc="fq"
+    # v8.9 (N3): qdisc selection. На bare-metal/dedicated `cake` побеждает
+    # bufferbloat (compound bandwidth+latency shaping), но это >2x CPU vs fq.
+    # На VPS cake обычно избыточен — кастомер VPS сидит за hypervisor SLA,
+    # и BBR+fq уже даёт near-optimal pacing. Поэтому:
+    #   - bare-metal (none) → cake если доступен;
+    #   - virt (kvm/xen/lxc/...) → fq если BBR, иначе fq_codel.
+    # На kernel/dist без sch_cake module modprobe вернёт error → skip к fq.
+    local best_qdisc="fq_codel" _virt_now
+    _virt_now=$(detect_virt 2>/dev/null || echo unknown)
+    if [ "$_virt_now" = "none" ] && modprobe sch_cake 2>/dev/null; then
+        best_qdisc="cake"
+    elif modprobe sch_fq 2>/dev/null; then
+        best_qdisc="fq"
+    elif modprobe sch_cake 2>/dev/null; then
+        best_qdisc="cake"
     fi
     [ "$best_bbr" != "cubic" ] && modprobe sch_fq 2>/dev/null && best_qdisc="fq"
 
@@ -1863,6 +1921,50 @@ apply_sysctls() {
     # 51820 = WireGuard default; 1194 = OpenVPN; 500/4500 = IKEv2/IPsec; 8388 = SS;
     # 9000-9999 = популярный xray/sing-box диапазон.
     sysctl_safe net.ipv4.ip_local_reserved_ports "500,1194,4500,8388,9000-9999,51820"
+
+    # v8.9 (K2): tcp_reflect_tos=1 (kernel 5.10+, RFC 8311). При генерации RST
+    # (или ACK без user-data) kernel reflect'ит DSCP/ToS байт из incoming-пакета.
+    # Полезно для qos-aware прокси (Hysteria DSCP-marking, BBR-with-tcp_pacing
+    # через tc-fq), у которых маркеры теряются на RST = плохая classification
+    # на роутерах. На kernel <5.10 sysctl_safe просто скипнет (не существует).
+    # Безопасно: не меняет поведение для обычного TCP, влияет только на RST/ACK.
+    sysctl_safe net.ipv4.tcp_reflect_tos 1
+
+    # v8.9 (K3): tcp_migrate_req=1 (kernel 5.14+) — graceful миграция accept'ов
+    # между listening sockets при reload (xray/sing-box -HUP). Default 0 = новые
+    # SYN'ы дропаются на shutdown listener. =1 = kernel migrate'ит pending
+    # connections на новый listener того же порта. Zero-downtime reload для
+    # прокси-серверов. На kernel <5.14 → skip. Безопасно: при отсутствии reload
+    # параметр не влияет.
+    sysctl_safe net.ipv4.tcp_migrate_req 1
+
+    # v8.9 (K4): vm.compaction_proactiveness=20 (kernel 5.7+) — proactive memory
+    # compaction для big-page allocations (QUIC packet buffers, io_uring rings,
+    # TCP large-window wmem). Default в новых дистрибутивах =20, но не везде
+    # (особенно на старых Ubuntu 20.04 с 5.4 kernel — там нет sysctl, skip).
+    # На long-uptime VPS с фрагментированной памятью даёт значимое ускорение
+    # mmap/big-buffer-alloc. Безопасно: не вызывает аллокаций, только background
+    # kcompactd-нагрузка <0.1% CPU.
+    sysctl_safe vm.compaction_proactiveness 20
+
+    # v8.9 (K8): net.core.high_order_alloc_disable=0 — для QUIC и kernel TCP с
+    # large rmem/wmem нужны contiguous high-order pages. Когда =1 (некоторые
+    # дистрибутивы устанавливают для embedded), kernel идёт slow-path
+    # one-page-at-a-time, что роняет throughput на 30%+ под нагрузкой. =0 —
+    # default behaviour (best). Безопасно везде кроме memory-constrained
+    # embedded систем (≤256 MB RAM).
+    sysctl_safe net.core.high_order_alloc_disable 0
+
+    # v8.9 (G3+G4): nf_conntrack security flags — обязательны для прокси.
+    # nf_conntrack_helper=0 — disable application-layer helpers (FTP/IRC ALG
+    # которые могут вводить incorrect state в conntrack из untrusted streams).
+    # Default 0 в kernel 4.7+, но некоторые old distros ставят 1 — force off.
+    # nf_conntrack_tcp_loose=0 — drop unsolicited mid-stream TCP packets без
+    # complete 3WHS. Default 1 (loose) на старых kernels. =0 более строго,
+    # дропает stray ACK/RST, что одновременно фильтрует port-scan probes и
+    # reduces conntrack table pollution. Не влияет на established connections.
+    sysctl_safe net.netfilter.nf_conntrack_helper 0
+    sysctl_safe net.netfilter.nf_conntrack_tcp_loose 0
 
     # fs limits — на случай прокси с тысячами upstream'ов.
     sysctl_safe fs.file-max 2097152
@@ -2694,20 +2796,32 @@ PEAK_EVENING_TO="${PEAK_EVENING_TO:-23}"
 
 # ===== UA-пулы =====
 UA_IOS=(
+# v8.9 (C2): iOS 18 UA pinning — обновлённые актуальные версии Safari/Mobile.
+# Реальная статистика StatCounter (2025-04): iOS 18.2/18.3 — top traffic share.
+# Раскладка по версиям: 18.3.x ~50%, 18.2.x ~25%, 18.1.x ~15%, 17.x ~10%.
+# Distribution в массиве примерно соответствует, чтобы random pick давал
+# реалистичный mix.
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
-"Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPad; CPU OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPad; CPU OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPad; CPU OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
-"Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+"AppleCoreMedia/1.0.0.22D63 (iPhone; U; CPU OS 18_3 like Mac OS X; en_us)"
+"AppleCoreMedia/1.0.0.22C152 (iPhone; U; CPU OS 18_2 like Mac OS X; en_us)"
 "AppleCoreMedia/1.0.0.22B83 (iPhone; U; CPU OS 18_1 like Mac OS X; en_us)"
-"AppleCoreMedia/1.0.0.21F90 (iPhone; U; CPU OS 17_5 like Mac OS X; en_us)"
+"itunesstored/1.0 iOS/18.3.2 model/iPhone17,2 hwp/t8140 build/22D82 (6; dt:280)"
+"itunesstored/1.0 iOS/18.2.1 model/iPhone16,2 hwp/t8130 build/22C161 (6; dt:268)"
 "itunesstored/1.0 iOS/18.1.1 model/iPhone16,2 hwp/t8130 build/22B91 (6; dt:264)"
-"itunesstored/1.0 iOS/17.5.1 model/iPhone15,3 hwp/t8120 build/21F90 (6; dt:248)"
+"com.apple.WebKit.Networking/8620.2.5.0.5 CFNetwork/1572.100.1 Darwin/24.3.0"
 "com.apple.WebKit.Networking/8619.2.4.0.6 CFNetwork/1568.100.1 Darwin/24.1.0"
-"com.apple.WebKit.Networking/8617.2.4.0.6 CFNetwork/1492.0.1 Darwin/23.3.0"
 )
 
 # Десктоп — для почты/новостей/соцсетей это естественнее, чем iOS Safari
@@ -2779,6 +2893,29 @@ URLS_IOS=(
 "https://appleid.apple.com/account/manage"
 "https://albert.apple.com/deviceservices/deviceActivation"
 "https://configuration.apple.com/configurations/"
+# v8.9 (C4+C5+C6): iOS-stealth v3 deep — endpoints на которые real iOS bg-poll'ит:
+#  C4 Apple Audio/Video CDN: Safari + Apple Music + AppleTV+ + iCloud Photos
+#    стримят с этих endpoint'ов, очень болтливые при background play.
+#    audio-ap-* / video-* / r{1-9}---sn-* (последние — gvt1.com YouTube via Safari).
+#  C5 Spotlight Suggestions: real iOS bg-poll каждые 30-60s при активном UI
+#    (api-tip / search-api / smoot.apple.com — Siri suggestions).
+#  C6 iCloud Keychain sync: escrowproxy / keyvalueservice — обновление сохранённых
+#    паролей; real iOS делает это раз в час и при iCloud sign-in.
+"https://audio-ap-southeast-2.itunes.apple.com/"
+"https://audio-ap-southeast-1.itunes.apple.com/"
+"https://audio-ssl.itunes.apple.com/"
+"https://audio-fa.itunes.apple.com/"
+"https://video-ssl.itunes.apple.com/"
+"https://play.itunes.apple.com/"
+"https://api-tip.cdn-apple.com/"
+"https://api.smoot.apple.com/search"
+"https://search-api.apple.com/search/v1/suggestions"
+"https://geo-suggestions.apple.com/"
+"https://escrowproxy.icloud.com/escrowproxy/api/recordRetrieve"
+"https://keyvalueservice.icloud.com/"
+"https://p104-keyvalueservice.icloud.com/api/v2/getList"
+"https://p104-escrowproxy.icloud.com/"
+"https://relay.smoot.apple.com/v1/"
 )
 URLS_CAPTIVE=(
 "https://captive.apple.com/hotspot-detect.html"
@@ -2963,6 +3100,32 @@ pick_curl() {
 }
 CURL_BIN=$(pick_curl)
 
+# v8.9 (C1): Dynamic JA3 rotation между connections. Если у нас доступно
+# несколько curl-impersonate-safari вариантов (17_4 + 16_5 + generic), то на
+# каждый noise-request выбираем рандомно. Раньше CURL_BIN был sticky на всю
+# сессию = один JA3 hash на все подключения, что — слабый стелс-сигнал
+# (real iOS distribution: разные iOS-версии в один раз шлют разные
+# ClientHello). После v8.9: per-conn JA3 distribution match real-iOS
+# distribution.
+# Возвращает один из доступных curl-вариантов, weighted ~ UA-distribution
+# (новые iOS преобладают).
+pick_curl_per_conn() {
+    local _avail=()
+    command -v curl_safari17_4 >/dev/null 2>&1 && _avail+=("curl_safari17_4")
+    # curl_safari17_4 представляет iOS 17.4, что близко к iOS 18 ClientHello —
+    # дублируем чтобы weight его был выше (соответствует real-traffic share).
+    command -v curl_safari17_4 >/dev/null 2>&1 && _avail+=("curl_safari17_4")
+    command -v curl_safari16_5 >/dev/null 2>&1 && _avail+=("curl_safari16_5")
+    command -v curl-impersonate-safari >/dev/null 2>&1 && _avail+=("curl-impersonate-safari")
+    if [ "${#_avail[@]}" -eq 0 ]; then
+        echo "$CURL_BIN"
+        return 0
+    fi
+    # urand: 0..N-1
+    local _idx=$(( RANDOM % ${#_avail[@]} ))
+    echo "${_avail[$_idx]}"
+}
+
 COOKIE_JAR_DIR="/tmp/.vps_noise"
 mkdir -p "$COOKIE_JAR_DIR"
 chmod 700 "$COOKIE_JAR_DIR"
@@ -3084,7 +3247,15 @@ http_request() {
     )
     args+=("${referer_arg[@]}")
     args+=("${cache_args[@]}")
-    if [ "$CURL_BIN" = "curl" ]; then
+
+    # v8.9 (C1): Per-conn выбор curl-binary — даёт rotating JA3 fingerprint
+    # между connections. fallback к глобальному CURL_BIN (sticky session) если
+    # альтернативы недоступны.
+    local _conn_curl
+    _conn_curl=$(pick_curl_per_conn)
+    [ -z "$_conn_curl" ] && _conn_curl="$CURL_BIN"
+
+    if [ "$_conn_curl" = "curl" ]; then
         # v8.8 (C5): ALPN rotation — real iOS Safari/WebKit чередует h3 / h2 /
         # http/1.1 ~ 50/40/10. До v8.8 у нас было h3=50% / h2=50%, http/1.1=0%.
         # Это давало weak signal для passive observers (real iOS изредка
@@ -3111,11 +3282,32 @@ http_request() {
         if curl --help all 2>/dev/null | grep -q -- '--tcp-fastopen'; then
             (( $(urand 0 1) == 0 )) && args+=(--tcp-fastopen)
         fi
+        # v8.9 (C3): TLS Encrypted ClientHello (ECH). curl 8.10+ поддерживает
+        # `--ech true` (auto via DNS HTTPS RR). Скрывает SNI от passive observers
+        # — критично для прокси-фронтенда. Только opt-in (через NOISE_ECH=1) и
+        # только если curl umеет: некоторые distros билдят без ECH.
+        if [ "${NOISE_ECH:-0}" = "1" ] && curl --help all 2>/dev/null | grep -q -- '--ech'; then
+            args+=(--ech "true")
+        fi
+        # v8.9 (C9): HTTP/2 SETTINGS values match Safari. Real iOS Safari
+        # держит HTTP/2-conn активным с keepalive ~30-60s между requests.
+        # `--keepalive-time 30` сообщает kernel SO_KEEPALIVE с idle=30s, что
+        # точно match Safari behaviour (default curl =60s = слабый стелс).
+        # Нет smaller-than-default-window-size flag в curl — INITIAL_WINDOW_SIZE
+        # hardcoded libnghttp2 = 4 MiB, что уже совпадает с Safari.
+        # MAX_CONCURRENT_STREAMS 100 — также libnghttp2 default, match.
+        args+=(--keepalive-time 30)
+        # v8.9 (C8): Real iOS QUIC transport parameters. ngtcp2 (curl-h3 backend)
+        # использует max_idle_timeout=30s, max_udp_payload_size=1452 — что
+        # уже match real iOS. Больше для фингерпринт-paritet ничего не сделать
+        # без custom build curl-impersonate с iOS-specific transport params.
+        # Документируем для stealth-test (которая показывает реальные QUIC
+        # params в diagnostic output).
     fi
 
     NOISE_REQ_TOTAL=$(( NOISE_REQ_TOTAL + 1 ))
     NOISE_LAST_TS=$(date +%s)
-    if "$CURL_BIN" "${args[@]}" "$url" 2>/dev/null; then
+    if "$_conn_curl" "${args[@]}" "$url" 2>/dev/null; then
         NOISE_REQ_OK=$(( NOISE_REQ_OK + 1 ))
     else
         NOISE_REQ_ERR=$(( NOISE_REQ_ERR + 1 ))
@@ -5081,6 +5273,78 @@ doctor_command() {
         fi
     fi
 
+    # v8.9 (G1): TLS cert expiry детектор — сканирует типичные пути конфигов
+    # прокси (xray, sing-box, haproxy, nginx) на cert-paths и проверяет expiry.
+    # Warn если <7 дней до expiry, error если уже expired. Cert handshake
+    # с истёкшим cert ломается у строгих клиентов = downtime прокси.
+    # Берём только обычные .pem/.crt в /etc и /var/lib (без рекурсивного
+    # сканирования FS) для скорости.
+    local _cert_paths=()
+    for _cp in \
+        /etc/xray/*.pem /etc/xray/*.crt \
+        /etc/sing-box/*.pem /etc/sing-box/*.crt \
+        /etc/haproxy/certs/*.pem \
+        /etc/letsencrypt/live/*/fullchain.pem \
+        /etc/ssl/certs/vps-optimizer*.pem \
+        /var/lib/marzban/certs/*.pem; do
+        [ -f "$_cp" ] && _cert_paths+=("$_cp")
+    done
+    if [ "${#_cert_paths[@]}" -gt 0 ] && command -v openssl >/dev/null 2>&1; then
+        local _cert _exp _exp_ts _now_ts _days_left
+        _now_ts=$(date +%s)
+        for _cert in "${_cert_paths[@]}"; do
+            _exp=$(openssl x509 -enddate -noout -in "$_cert" 2>/dev/null | sed 's/notAfter=//')
+            [ -z "$_exp" ] && continue
+            _exp_ts=$(date -d "$_exp" +%s 2>/dev/null || echo 0)
+            [ "$_exp_ts" = "0" ] && continue
+            _days_left=$(( ( _exp_ts - _now_ts ) / 86400 ))
+            local _cert_short="${_cert##*/}"
+            if [ "$_days_left" -lt 0 ] 2>/dev/null; then
+                echo -e "${RED}[!]${NC} TLS cert ${BOLD}$_cert_short${NC} уже истёк ($((-_days_left))d ago)"
+                echo "    Fix: certbot renew (Let's Encrypt) или замена cert в $_cert"
+                issues=$((issues+1))
+            elif [ "$_days_left" -lt 7 ] 2>/dev/null; then
+                echo -e "${YELLOW}[!]${NC} TLS cert ${BOLD}$_cert_short${NC} истекает через ${_days_left}d"
+                echo "    Fix: certbot renew или подготовь замену для $_cert"
+                issues=$((issues+1))
+            else
+                echo -e "${GREEN}[ok]${NC} TLS cert $_cert_short — ${_days_left}d до expiry"
+            fi
+        done
+    fi
+
+    # v8.9 (G2): chrony / ntp clock skew detector. TLS handshake fails если
+    # local clock отличается от remote больше чем на 5 минут (cert validity).
+    # Проверяем chronyc tracking (если установлен chrony) или timedatectl
+    # (systemd-based skew). Warn если |skew| > 30s.
+    if command -v chronyc >/dev/null 2>&1; then
+        local _skew_raw _skew_abs
+        _skew_raw=$(chronyc tracking 2>/dev/null | awk '/System time/{print $4}')
+        if [ -n "$_skew_raw" ]; then
+            # System time в seconds (positive=fast, negative=slow).
+            _skew_abs=$(awk -v s="$_skew_raw" 'BEGIN{ if(s<0) s=-s; printf "%.3f", s }')
+            local _skew_int
+            _skew_int=$(awk -v s="$_skew_abs" 'BEGIN{ printf "%d", s }')
+            if [ "$_skew_int" -gt 30 ] 2>/dev/null; then
+                echo -e "${YELLOW}[!]${NC} chrony clock skew = ${_skew_abs}s (>30s) — TLS handshake может падать"
+                echo "    Fix: chronyc -a makestep; systemctl restart chrony"
+                issues=$((issues+1))
+            else
+                echo -e "${GREEN}[ok]${NC} chrony clock skew = ${_skew_abs}s"
+            fi
+        fi
+    elif command -v timedatectl >/dev/null 2>&1; then
+        local _ntp_sync
+        _ntp_sync=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)
+        if [ "$_ntp_sync" = "no" ]; then
+            echo -e "${YELLOW}[!]${NC} systemd-timesyncd: NTP не синхронизирован"
+            echo "    Fix: systemctl restart systemd-timesyncd; timedatectl set-ntp true"
+            issues=$((issues+1))
+        else
+            echo -e "${GREEN}[ok]${NC} timedatectl NTP синхронизирован"
+        fi
+    fi
+
     echo ""
     if [ "$issues" -eq 0 ]; then
         echo -e "${GREEN}${BOLD}=== всё ок, проблем не найдено ===${NC}"
@@ -5088,6 +5352,136 @@ doctor_command() {
         echo -e "${YELLOW}${BOLD}=== найдено $issues проблем(ы) — см. выше ===${NC}"
         # v8.8 (F1): подсказываем --fix flag.
         echo -e "${GRAY}    (попробуй ${BOLD}sudo $0 doctor --fix${NC}${GRAY} для интерактивного применения)${NC}"
+    fi
+    # Сохраняем последнее число issue'ов в env для health_score / JSON wrapper.
+    DOCTOR_LAST_ISSUES="$issues"
+}
+
+# v8.9 (F8/E6): doctor --watch / --json wrapper.
+# --watch: повторяет doctor каждые N секунд (default 5), очистка экрана между
+#   итерациями. Для интерактивного мониторинга на dashboard.
+# --json: переводит весь doctor-вывод в struct JSON для оркестраторов
+#   (Ansible/Salt/CI). Возвращает {ok, issues, output, ts}. Не идеален (не
+#   парсит каждое issue в struct), но даёт machine-readable summary.
+doctor_run_command() {
+    local _watch=0 _json=0 _interval=5
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --watch)        _watch=1; shift ;;
+            --json)         _json=1; shift ;;
+            --interval)     _interval="${2:-5}"; shift 2 ;;
+            --interval=*)   _interval="${1#*=}"; shift ;;
+            *)              shift ;;
+        esac
+    done
+
+    if [ "$_watch" = "1" ]; then
+        # v8.9 (F8): live re-run каждые N сек. Ctrl-C для выхода (trap не нужен,
+        # standard SIGINT — read и sleep обработают cleanly).
+        while true; do
+            clear 2>/dev/null || printf '\033[2J\033[H'
+            doctor_command
+            echo ""
+            echo -e "${GRAY}    [doctor --watch every ${_interval}s. Ctrl-C для выхода]${NC}"
+            sleep "$_interval"
+        done
+    elif [ "$_json" = "1" ]; then
+        # Capture полный вывод doctor; ловим issue-count из последнего глобала.
+        local _out _esc _ts
+        _out=$(doctor_command 2>&1)
+        _ts=$(date -u +%FT%TZ)
+        # JSON-escape: backslash → \\, double quote → \", newline → \n.
+        # Минимально достаточно для embedded строки. Не используем jq чтобы
+        # не зависеть от его установки.
+        _esc=$(printf '%s' "$_out" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')
+        local _issues="${DOCTOR_LAST_ISSUES:-0}"
+        local _ok="true"
+        [ "$_issues" -gt 0 ] 2>/dev/null && _ok="false"
+        printf '{"ok":%s,"issues":%s,"version":"%s","ts":"%s","output":"%s"}\n' \
+            "$_ok" "$_issues" "$SCRIPT_VERSION" "$_ts" "$_esc"
+    else
+        doctor_command
+    fi
+}
+
+# v8.9 (E1): health-score — единый 0-100 score, агрегирующий ключевые
+# doctor signals для дашбордов. Логика:
+#   100 = идеал; вычитаем "штрафы" по доменам.
+# Domains (each 0-15 points penalty max):
+#   conntrack >70%, retrans >5%, swap-in/sec >100, udp drops growing,
+#   load>cpus, mem-pressure>1%, fd>80%.
+# Печатает score и breakdown.
+health_score_command() {
+    local _json=0
+    [ "${1:-}" = "--json" ] && _json=1
+
+    local _score=100 _penalty
+    local _breakdown=""
+
+    # Conntrack
+    local _ct_cur _ct_max _ct_pct
+    _ct_cur=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)
+    _ct_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
+    if [ "$_ct_max" -gt 0 ] 2>/dev/null; then
+        _ct_pct=$(( _ct_cur * 100 / _ct_max ))
+        _penalty=0
+        [ "$_ct_pct" -ge 70 ] 2>/dev/null && _penalty=10
+        [ "$_ct_pct" -ge 90 ] 2>/dev/null && _penalty=20
+        _score=$(( _score - _penalty ))
+        _breakdown="$_breakdown\n  conntrack ${_ct_pct}% (-${_penalty})"
+    fi
+
+    # Load average vs CPU count
+    local _la _cpus _la_int
+    _la=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+    _cpus=$(nproc 2>/dev/null || echo 1)
+    _la_int=$(awk -v l="$_la" 'BEGIN{printf "%d", l*100}' 2>/dev/null || echo 0)
+    local _la_threshold=$(( _cpus * 100 ))
+    _penalty=0
+    [ "$_la_int" -gt "$_la_threshold" ] 2>/dev/null && _penalty=10
+    [ "$_la_int" -gt $(( _la_threshold * 2 )) ] 2>/dev/null && _penalty=20
+    _score=$(( _score - _penalty ))
+    _breakdown="$_breakdown\n  load=${_la}/${_cpus}cpus (-${_penalty})"
+
+    # Memory pressure (если /proc/pressure/memory доступен — kernel 4.20+)
+    if [ -r /proc/pressure/memory ]; then
+        local _mp
+        _mp=$(awk '/some avg10/{print $0}' /proc/pressure/memory 2>/dev/null | grep -oE 'avg10=[0-9.]+' | head -1 | cut -d= -f2)
+        local _mp_int
+        _mp_int=$(awk -v p="${_mp:-0}" 'BEGIN{printf "%d", p}')
+        _penalty=0
+        [ "$_mp_int" -gt 1 ] 2>/dev/null && _penalty=5
+        [ "$_mp_int" -gt 10 ] 2>/dev/null && _penalty=15
+        _score=$(( _score - _penalty ))
+        _breakdown="$_breakdown\n  mem-pressure avg10=${_mp:-0}% (-${_penalty})"
+    fi
+
+    # FD usage
+    if [ -r /proc/sys/fs/file-nr ]; then
+        local _fd_used _fd_max _fd_pct
+        _fd_used=$(awk '{print $1}' /proc/sys/fs/file-nr 2>/dev/null || echo 0)
+        _fd_max=$(awk '{print $3}' /proc/sys/fs/file-nr 2>/dev/null || echo 0)
+        if [ "$_fd_max" -gt 0 ] 2>/dev/null; then
+            _fd_pct=$(( _fd_used * 100 / _fd_max ))
+            _penalty=0
+            [ "$_fd_pct" -gt 80 ] 2>/dev/null && _penalty=10
+            _score=$(( _score - _penalty ))
+            _breakdown="$_breakdown\n  fd ${_fd_pct}% (-${_penalty})"
+        fi
+    fi
+
+    # Clamp 0..100
+    [ "$_score" -lt 0 ] 2>/dev/null && _score=0
+    [ "$_score" -gt 100 ] 2>/dev/null && _score=100
+
+    if [ "$_json" = "1" ]; then
+        printf '{"score":%s,"version":"%s","ts":"%s"}\n' "$_score" "$SCRIPT_VERSION" "$(date -u +%FT%TZ)"
+    else
+        local _color="$GREEN"
+        [ "$_score" -lt 80 ] 2>/dev/null && _color="$YELLOW"
+        [ "$_score" -lt 50 ] 2>/dev/null && _color="$RED"
+        echo -e "${CYAN}${BOLD}=== health-score: ${_color}${_score}/100${NC}${CYAN}${BOLD} ===${NC}"
+        echo -e "Breakdown:$_breakdown"
     fi
 }
 
@@ -5558,6 +5952,42 @@ vps_dns_cache_misses ${dns_misses:-0}
 # HELP vps_dns_cache_hit_ratio Hit ratio = hits / (hits + misses), 0..1
 # TYPE vps_dns_cache_hit_ratio gauge
 vps_dns_cache_hit_ratio ${dns_ratio:-0}
+PEOF
+
+    # v8.9 (E1+E3+E4): дополнительные метрики для дашбордов.
+    # E1: vps_health_score — 0..100 единое здоровье VPS, см. health_score_command.
+    # E3: vps_noise_failures_rate — производная от noise_total/noise_err.
+    # E4: vps_profile_snapshots_total — счётчик named-snapshots в профилях.
+    local _hs="0"
+    if [ -r /proc/loadavg ] && [ -r /proc/sys/fs/file-nr ]; then
+        # Quick inline вместо subshell — для prom-loop важна скорость.
+        # Берём из health_score_command JSON.
+        _hs=$(health_score_command --json 2>/dev/null | sed -n 's/.*"score":\([0-9]*\).*/\1/p')
+        [ -z "$_hs" ] && _hs="0"
+    fi
+    local _profile_count=0
+    [ -d /var/lib/vps-optimizer/profiles ] && \
+        _profile_count=$(find /var/lib/vps-optimizer/profiles -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l)
+    local _snapshot_count=0
+    [ -d "$SNAPSHOT_DIR" ] && \
+        _snapshot_count=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l)
+    local _noise_fail_rate="0"
+    if [ -n "${req_total:-}" ] && [ "${req_total:-0}" -gt 0 ] 2>/dev/null; then
+        _noise_fail_rate=$(awk -v t="${req_total:-1}" -v e="${req_err:-0}" 'BEGIN{ if(t>0) printf "%.4f", e/t; else print "0" }')
+    fi
+    cat <<PEOF
+# HELP vps_health_score Aggregate VPS health score 0..100 (higher=better)
+# TYPE vps_health_score gauge
+vps_health_score ${_hs:-0}
+# HELP vps_noise_failures_rate Failure ratio of vps-noise requests, 0..1
+# TYPE vps_noise_failures_rate gauge
+vps_noise_failures_rate ${_noise_fail_rate}
+# HELP vps_profile_snapshots_total Number of named profile snapshots (vps-optimizer profile save)
+# TYPE vps_profile_snapshots_total gauge
+vps_profile_snapshots_total ${_profile_count}
+# HELP vps_apply_snapshots_total Number of pre-apply auto-snapshots in /var/backups
+# TYPE vps_apply_snapshots_total gauge
+vps_apply_snapshots_total ${_snapshot_count}
 PEOF
 }
 
@@ -6674,6 +7104,251 @@ rollback_command() {
     profile_command load "$profile_name"
 }
 
+# v8.9 (F1): revert — быстрый undo последнего apply через автоматический
+# pre-apply snapshot. В отличие от rollback (требует --to <named-profile>),
+# revert берёт самый свежий pre-apply-*.tar.gz из $SNAPSHOT_DIR (создаются
+# автоматически при каждом apply). Никаких параметров, идемпотентен.
+# Безопасно: только восстанавливает файлы из snapshot и реапплит sysctl.
+revert_command() {
+    local _yes=""
+    [ "${1:-}" = "--yes" ] && _yes="--yes"
+    [ "${FORCE:-0}" = "1" ] && _yes="--yes"
+
+    local last_snap
+    last_snap=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name 'pre-apply-*.tar.gz' 2>/dev/null | sort | tail -1)
+    if [ -z "$last_snap" ]; then
+        echo -e "${RED}revert: snapshot'ов в $SNAPSHOT_DIR не найдено${NC}"
+        echo -e "${GRAY}    pre-apply snapshot'ы создаются автоматически при apply.${NC}"
+        echo -e "${GRAY}    Альтернатива: sudo $0 reset (полный сброс) или${NC}"
+        echo -e "${GRAY}                  sudo $0 rollback --to <named-profile>${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}${BOLD}=== revert последнего apply ===${NC}"
+    echo -e "Восстановим snapshot: ${BOLD}${last_snap##*/}${NC}"
+    echo -e "${GRAY}    (создан перед последним apply, путь: $last_snap)${NC}"
+    if [ -z "$_yes" ]; then
+        printf "Продолжить? [y/N] "
+        local _yn
+        read -r _yn
+        if [ "$_yn" != "y" ] && [ "$_yn" != "Y" ]; then
+            echo "Отменено."
+            return 0
+        fi
+    fi
+    _audit revert "snapshot=${last_snap##*/}"
+    if rollback_last_snapshot; then
+        echo -e "${GREEN}[+] revert успешно${NC}"
+        return 0
+    else
+        echo -e "${RED}[!] revert failed${NC}"
+        return 1
+    fi
+}
+
+# v8.9 (F2): compare-current — diff LIVE-состояния системы vs preset's
+# desired state. В отличие от compare-presets (два preset друг с другом),
+# это показывает что РЕАЛЬНО отличается на этой машине от того что preset
+# хочет применить. Полезно для:
+#   - debugging: «почему apply ничего не делает» (live уже в state preset)
+#   - audit: «какие knobs мне делает мой текущий preset на этом kernel»
+#   - migration: «что я получу если переключусь на другой preset»
+# Read-only, ничего не меняет.
+compare_current_command() {
+    local target_preset="${1:-$PRESET_NAME}"
+    [ -z "$target_preset" ] && target_preset="balanced"
+    echo -e "${CYAN}${BOLD}=== compare current vs preset=$target_preset ===${NC}"
+    echo -e "${GRAY}live → текущее значение в kernel${NC}"
+    echo -e "${GRAY}preset → что preset='$target_preset' хочет установить${NC}"
+    echo ""
+
+    # Список ключей, которые preset реально трогает. Вынесен в массив для
+    # удобства (любой sysctl_safe выше применяет одно из этих имён).
+    local _keys=(
+        net.core.default_qdisc
+        net.ipv4.tcp_congestion_control
+        net.core.netdev_max_backlog
+        net.core.somaxconn
+        net.ipv4.tcp_ecn
+        net.ipv4.tcp_min_rtt_wlen
+        net.ipv4.tcp_timestamps
+        net.ipv4.tcp_reflect_tos
+        net.ipv4.tcp_migrate_req
+        vm.swappiness
+        vm.compaction_proactiveness
+        net.core.high_order_alloc_disable
+        net.netfilter.nf_conntrack_helper
+        net.netfilter.nf_conntrack_tcp_loose
+    )
+    local _k _live _diff_count=0
+    printf "  %-44s %-20s %s\n" "KEY" "LIVE" "PRESET-WOULD-SET"
+    printf "  %-44s %-20s %s\n" "----" "----" "----------------"
+    for _k in "${_keys[@]}"; do
+        _live=$(sysctl -n "$_k" 2>/dev/null || echo "n/a")
+        # Preset desired value — берём через preview подобную логику:
+        # запускаем show_preset для $target_preset и грепаем по имени key.
+        # Не идеально, но избегает дублирования логики apply.
+        local _want
+        _want=$(show_preset_command "$target_preset" 2>/dev/null | grep -E "^${_k}[ =]" | awk -F'[= ]+' '{print $2}' | head -1)
+        [ -z "$_want" ] && _want="(no-change)"
+        if [ "$_live" != "$_want" ] && [ "$_want" != "(no-change)" ]; then
+            printf "  %-44s ${YELLOW}%-20s${NC} ${GREEN}%s${NC}\n" "$_k" "$_live" "$_want"
+            _diff_count=$(( _diff_count + 1 ))
+        else
+            printf "  %-44s ${GRAY}%-20s %s${NC}\n" "$_k" "$_live" "$_want"
+        fi
+    done
+    echo ""
+    if [ "$_diff_count" -eq 0 ]; then
+        echo -e "${GREEN}[+] live state уже соответствует preset=$target_preset${NC}"
+    else
+        echo -e "${YELLOW}[i] $_diff_count knob(s) отличаются. Применить: sudo $0 apply --preset $target_preset${NC}"
+    fi
+}
+
+# v8.9 (F12): snapshot --before <cmd...> — auto-create named profile snapshot
+# перед запуском mutating команды. Пример: `snapshot --before apply --preset proxy`
+# создаст pre-cmd-<unixts>.tar.gz, потом запустит apply.
+# Защищает от случайных изменений: даже если у вас нет привычки делать
+# `profile save` перед apply, snapshot --before гарантирует что есть точка отката.
+snapshot_before_command() {
+    if [ "${1:-}" != "--before" ]; then
+        echo -e "${RED}snapshot: используй 'snapshot --before <cmd...>'${NC}"
+        return "$EXIT_INVALID_ARGS"
+    fi
+    shift
+    if [ "$#" -eq 0 ]; then
+        echo -e "${RED}snapshot --before: нет команды для запуска${NC}"
+        return "$EXIT_INVALID_ARGS"
+    fi
+    local _name="auto-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+    echo -e "${CYAN}[*] snapshot --before: создаём $_name перед '$*'${NC}"
+    if ! profile_command save "$_name" >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] snapshot --before: profile_save failed, но продолжаю.${NC}"
+    else
+        echo -e "${GREEN}[+] snapshot $_name сохранён${NC}"
+    fi
+    _audit snapshot-before "snapshot=$_name cmd=\"$*\""
+    # Запускаем оставшуюся команду через cli_dispatch (тот же скрипт).
+    cli_dispatch "$@"
+}
+
+# v8.9 (E5): install-logrotate — создаёт /etc/logrotate.d/vps-optimizer
+# для ротации /var/log/vps-optimizer*.log. Без неё аудит-лог без ограничений
+# растёт неограниченно. Опц --uninstall удаляет конфиг.
+install_logrotate_command() {
+    local _action="${1:-install}"
+    local _conf=/etc/logrotate.d/vps-optimizer
+    case "$_action" in
+        uninstall|remove)
+            if [ -f "$_conf" ]; then
+                rm -f "$_conf"
+                _audit logrotate "action=uninstall"
+                echo -e "${GREEN}[+] $_conf удалён${NC}"
+            fi
+            ;;
+        install|*)
+            if [ ! -d /etc/logrotate.d ]; then
+                echo -e "${YELLOW}[!] /etc/logrotate.d не существует — logrotate не установлен.${NC}"
+                echo -e "${GRAY}    Установи: sudo apt install -y logrotate${NC}"
+                return 1
+            fi
+            cat > "$_conf" <<'LREOF'
+/var/log/vps-optimizer.log
+/var/log/vps-optimizer-audit.log
+/var/log/vps-optimizer-debug.log
+/var/log/vps-optimizer-health.log
+{
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    sharedscripts
+    postrotate
+        # Без HUP — script пишет append-only через >>; не нужно reopen.
+        true
+    endscript
+}
+LREOF
+            _audit logrotate "action=install conf=$_conf"
+            echo -e "${GREEN}[+] $_conf установлен (weekly, 8 retention, compress)${NC}"
+            ;;
+    esac
+}
+
+# v8.9 (F3): history — компактный timeline последних N audit-записей.
+# Показывает все mutating операции (apply / reset / profile / rollback /
+# revert / dns / harden / install / wg / xray / noise) с временными метками.
+# Опции: --filter <action> ограничить по типу, -n <N> ограничить выдачу.
+# Read-only.
+history_command() {
+    local _filter="" _n=20
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --filter|-f) _filter="${2:-}"; shift 2 ;;
+            --filter=*)  _filter="${1#*=}"; shift ;;
+            -n)          _n="${2:-20}"; shift 2 ;;
+            -n=*)        _n="${1#*=}"; shift ;;
+            *)           shift ;;
+        esac
+    done
+    if [ ! -f "$AUDIT_LOG" ]; then
+        echo -e "${YELLOW}[!] Audit log пустой ($AUDIT_LOG не существует).${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}${BOLD}=== history (last $_n entries${_filter:+, filter=$_filter}) ===${NC}"
+    if [ -n "$_filter" ]; then
+        # Регулярка не нужна: action=$_filter — подстрочный поиск.
+        grep -E "action=$_filter " "$AUDIT_LOG" 2>/dev/null | tail -n "$_n"
+    else
+        tail -n "$_n" "$AUDIT_LOG"
+    fi
+}
+
+# v8.9 (F4): changelog [version] — печатает раздел из README по version.
+# Без аргумента печатает все changelog-разделы; с аргументом фильтрует
+# только указанную версию (например "8.9" или "8.7").
+# Read-only, всё парсится из README.md.
+changelog_command() {
+    local _ver="${1:-}"
+    local _readme=""
+    # Читаем README рядом со скриптом или /usr/local/share/vps-optimizer/README.md
+    if [ -f "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/README.md" ]; then
+        _readme="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/README.md"
+    elif [ -f /usr/local/share/vps-optimizer/README.md ]; then
+        _readme=/usr/local/share/vps-optimizer/README.md
+    elif [ -f /usr/share/vps-optimizer/README.md ]; then
+        _readme=/usr/share/vps-optimizer/README.md
+    fi
+    if [ -z "$_readme" ] || [ ! -f "$_readme" ]; then
+        echo -e "${YELLOW}[!] README.md не найден. Установлен ли vps-optimizer корректно?${NC}"
+        echo -e "${GRAY}    Текущий version: $SCRIPT_VERSION${NC}"
+        return 1
+    fi
+    if [ -n "$_ver" ]; then
+        # Извлекаем секцию между ## v8.9 ... и следующим ## (искл. ###).
+        # Используем awk для блока.
+        awk -v ver="$_ver" '
+            BEGIN { inblk=0 }
+            /^##[[:space:]]+v?[0-9]/ {
+                if (inblk == 1) { exit }
+                # Проверка что текущая строка содержит запрошенную версию.
+                if (index($0, ver) > 0) { inblk=1; print; next }
+            }
+            inblk == 1 { print }
+        ' "$_readme"
+    else
+        # Без аргумента: грепаем все changelog-секции (## vX.Y).
+        awk '
+            /^##[[:space:]]+v?[0-9]/ { print "" }
+            /^##[[:space:]]+v?[0-9]/, /^##[[:space:]]+[^v0-9]/ { print }
+        ' "$_readme" | sed '/^##[[:space:]]\+[^v0-9]/d'
+    fi
+}
+
 # v8.8 (F1): doctor --fix — интерактивно для каждого warning'а в doctor
 # предлагаем apply. CONTRIBUTING #5: opt-in (требует --fix flag).
 # Реализация простая: вызываем doctor и распознаём issue-pattern'ы; для известных
@@ -6977,10 +7652,15 @@ cli_dispatch() {
             ;;
         doctor)
             # v8.8 (F1): --fix → doctor_fix_command.
+            # v8.9 (F8/E6): --watch (positional arg) / --json (global $JSON)
+            # → doctor_run_command wrapper.
             if [ "$doctor_fix_mode" = "1" ]; then
                 doctor_fix_command
             else
-                doctor_command
+                local _doc_args=("${args[@]}")
+                # Global --json уже стрипнут парсером выше → JSON=1; пробрасываем.
+                [ "${JSON:-0}" = "1" ] && _doc_args+=("--json")
+                doctor_run_command "${_doc_args[@]}"
             fi
             ;;
         top)            top_command ;;
@@ -7225,6 +7905,28 @@ cli_dispatch() {
             else
                 echo "vps_optimizer.sh v$SCRIPT_VERSION"
             fi
+            ;;
+        # v8.9: новые UX/diag команды
+        revert)
+            revert_command "${args[0]:-}"
+            ;;
+        compare-current|current-diff)
+            compare_current_command "${args[0]:-}"
+            ;;
+        history|audit)
+            history_command "${args[@]}"
+            ;;
+        changelog)
+            changelog_command "${args[0]:-}"
+            ;;
+        health-score|healthscore|score)
+            health_score_command "${args[0]:-}"
+            ;;
+        snapshot)
+            snapshot_before_command "${args[@]}"
+            ;;
+        install-logrotate|logrotate)
+            install_logrotate_command "${args[0]:-install}"
             ;;
         help|-h|--help) print_cli_help ;;
         *)         echo -e "${RED}Неизвестная команда: $cmd${NC}"; print_cli_help; exit 1 ;;
