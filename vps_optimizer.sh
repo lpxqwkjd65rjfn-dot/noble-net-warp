@@ -9306,6 +9306,16 @@ CCEOF
                     ;;
             esac
             ;;
+        *)
+            # R14-9 fix: для unrecognized $_mode (например typo "audo" вместо "auto")
+            # bench-loop уже выполнил transient sysctl -w на каждый CC.
+            # Без `*)` default — last-tested CC остаётся active в kernel.
+            # Restore saved cc обязательно для safety + audit как warning.
+            sysctl -w "net.ipv4.tcp_congestion_control=$_saved_cc" >/dev/null 2>&1
+            echo -e "${YELLOW}[!] unknown mode '$_mode' — CC восстановлен на $_saved_cc${NC}"
+            _audit cc-bench-apply "cc=$_saved_cc mode=unknown:$_mode restored"
+            return 1
+            ;;
     esac
 }
 

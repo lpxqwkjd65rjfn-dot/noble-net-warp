@@ -1272,6 +1272,15 @@ setup() {
     echo "$code_only" | grep -qE 'would: systemctl disable --now vps-ios-behavior\.timer'
 }
 
+@test "v8.11 R14-9: cc-bench post-bench case has *) default that restores saved CC" {
+    # Devin Review R14-9: typo в mode (cc-bench audo) проваливался через
+    # bench-loop (transient sysctl -w) и оставлял last-tested CC active.
+    run grep -E 'unknown mode .* — CC восстановлен на' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '_audit cc-bench-apply.*mode=unknown' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
 @test "v8.11 proactive: tls-safari + notsent-lowat snippet writes respect DRY_RUN" {
     local tls_block
     tls_block=$(sed -n '/^tls_safari_command()/,/^}/p' "$SCRIPT")
