@@ -1272,6 +1272,23 @@ setup() {
     echo "$code_only" | grep -qE 'would: systemctl disable --now vps-ios-behavior\.timer'
 }
 
+@test "v8.11 R14-14/R14-15/R14-16: ecn-l4s + icmp-ios + netdev-budget DRY_RUN explicit guard" {
+    # Devin Review R14-14/R14-15/R14-16: success message и _audit выполнялись
+    # безусловно в dry-run mode, ложно сообщая что применено.
+    local ecn_block
+    ecn_block=$(awk '/^ecn_l4s_command\(\)/{p=1} p; p && /^}/{exit}' "$SCRIPT")
+    echo "$ecn_block" | grep -qE 'mode=dry-run'
+
+    local icmp_block
+    icmp_block=$(awk '/^icmp_ios_command\(\)/{p=1} p; p && /^}/{exit}' "$SCRIPT")
+    echo "$icmp_block" | grep -qE 'mode=dry-run TTL=64'
+    echo "$icmp_block" | grep -qE 'mode=dry-run disabled'
+
+    local nb_block
+    nb_block=$(awk '/^netdev_budget_command\(\)/{p=1} p; p && /^}/{exit}' "$SCRIPT")
+    echo "$nb_block" | grep -qE 'mode=dry-run budget='
+}
+
 @test "v8.11 R14-13: _v811_persist_sysctl probes kernel_supports_sysctl (CONTRIBUTING #4)" {
     # Devin Review R14-13: writing к /etc/sysctl.d/ без kernel probe →
     # после reboot `sysctl --system` будет выдавать errors на unsupported keys.

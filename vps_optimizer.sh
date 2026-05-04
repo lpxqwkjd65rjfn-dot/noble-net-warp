@@ -9480,6 +9480,14 @@ ecn_l4s_command() {
                 echo -e "${RED}[!] requires root${NC}"; return 1
             fi
             echo -e "${CYAN}${BOLD}=== ECN/L4S apply ===${NC}"
+            # R14-14 fix: explicit DRY_RUN check. Без этого _audit и success
+            # message выполняются безусловно, ложно сообщая что изменения
+            # применены. Pattern matches notsent/dscp/ios-behavior commands.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would apply: tcp_ecn=2 tcp_l4s_ecn=1 tcp_recovery=1 tcp_early_retrans=3"
+                _audit ecn-l4s "mode=dry-run tcp_ecn=2 tcp_l4s_ecn=1"
+                return 0
+            fi
             sysctl_safe net.ipv4.tcp_ecn 2 || true
             sysctl_safe net.ipv4.tcp_l4s_ecn 1 || true
             sysctl_safe net.ipv4.tcp_recovery 1 || true
@@ -9622,6 +9630,12 @@ netdev_budget_command() {
                 echo -e "  ${GREEN}✓${NC} 10G link detected → moderate bump"
             else
                 echo -e "  ${GRAY}link <10G — defaults sufficient${NC}"
+                return 0
+            fi
+            # R14-16 fix: explicit DRY_RUN check (consistent с другими v8.11 cmd).
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would apply: netdev_budget=$_budget netdev_budget_usecs=$_budget_usecs"
+                _audit netdev-budget "mode=dry-run budget=$_budget usecs=$_budget_usecs link_speed=$_speed"
                 return 0
             fi
             sysctl_safe net.core.netdev_budget "$_budget" || true
@@ -9806,6 +9820,12 @@ icmp_ios_command() {
             if [ "$(id -u)" != "0" ]; then
                 echo -e "${RED}[!] requires root${NC}"; return 1
             fi
+            # R14-15 fix: explicit DRY_RUN check.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would apply: ip_default_ttl=64 hop_limit=64 (ipv4+ipv6)"
+                _audit icmp-ios "mode=dry-run TTL=64 hop_limit=64"
+                return 0
+            fi
             sysctl_safe net.ipv4.ip_default_ttl 64 || true
             sysctl_safe net.ipv6.conf.all.hop_limit 64 || true
             sysctl_safe net.ipv6.conf.default.hop_limit 64 || true
@@ -9819,6 +9839,12 @@ icmp_ios_command() {
         disable|off)
             if [ "$(id -u)" != "0" ]; then
                 echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            # R14-15 fix: explicit DRY_RUN check для disable path.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would: keep TTL=64 (Linux default)"
+                _audit icmp-ios "mode=dry-run disabled"
+                return 0
             fi
             # Возвращаем kernel-defaults (мы не знаем что было до). 64 — стандарт Linux/iOS.
             sysctl_safe net.ipv4.ip_default_ttl 64 || true
