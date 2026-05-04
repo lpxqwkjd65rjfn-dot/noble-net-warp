@@ -9096,11 +9096,15 @@ cc_bench_command() {
     local _ref_default="lg.ovh.net iperf.he.net iperf.it-north.net"
     local _ref="${BENCH_REF:-$_ref_default}"
 
+    # R14-1 fix: разделяем shift на два, чтобы при отсутствии value
+    # (например `cc-bench auto --duration` без числа) `shift || true`
+    # gracefully завершал loop вместо infinite-loop (bash `shift 2` при
+    # $#=1 не decrement'ит $# и we'd loop forever).
     while [ $# -gt 0 ]; do
         case "$1" in
-            --duration|-d) _duration="${2:-10}"; shift 2 ;;
+            --duration|-d) _duration="${2:-10}"; shift; shift || true ;;
             --duration=*)  _duration="${1#*=}"; shift ;;
-            --ref) _ref="${2:-$_ref_default}"; shift 2 ;;
+            --ref) _ref="${2:-$_ref_default}"; shift; shift || true ;;
             --ref=*) _ref="${1#*=}"; shift ;;
             *) shift ;;
         esac
@@ -9148,6 +9152,17 @@ CCEOF
     if [ "$(id -u)" != "0" ]; then
         echo -e "${RED}[!] cc-bench требует root (изменяет sysctl).${NC}"
         return 1
+    fi
+
+    # R14-2 fix: respect DRY_RUN. cc-bench bench-loop делает sysctl mutations
+    # (transient probe) — это incompatible с --dry-run. Final apply через
+    # sysctl_safe ниже автоматически no-op'ит при DRY_RUN, но bench-loop
+    # — нет. Проще всего: skip всю операцию при DRY_RUN с информативным msg.
+    if [ "$DRY_RUN" = "1" ]; then
+        echo -e "${YELLOW}[dry-run]${NC} cc-bench пропущен — bench-loop требует transient sysctl mutations."
+        echo -e "${GRAY}    Запусти без --dry-run для real bench.${NC}"
+        _audit cc-bench "skipped (dry-run)"
+        return 0
     fi
 
     _v811_ensure_dir "$V811_STATE_DIR" || return 1
@@ -9248,8 +9263,11 @@ CCEOF
             echo -e "${GRAY}    (mode=bench: CC восстановлен на $_saved_cc, ничего не applied)${NC}"
             ;;
         auto)
-            # Auto-apply best.
-            sysctl -w "net.ipv4.tcp_congestion_control=$_best_cc" >/dev/null 2>&1
+            # Auto-apply best. R14-2 fix: используем sysctl_safe вместо `sysctl -w`
+            # для CONTRIBUTING #4 (probe-then-write + persist в $SYSCTL_CONF).
+            # sysctl_safe также: respect DRY_RUN, kernel_supports_sysctl probe,
+            # SYSCTL_OK/SYSCTL_SKIP tracking. CC будет survived reboot.
+            sysctl_safe net.ipv4.tcp_congestion_control "$_best_cc" || true
             echo -e "${GREEN}[+] auto-apply: tcp_congestion_control = $_best_cc${NC}"
             _audit cc-bench-apply "cc=$_best_cc mode=auto score=$_best_score"
             ;;
@@ -9277,7 +9295,8 @@ CCEOF
                 *)
                     if [ "$_choice" -ge 1 ] && [ "$_choice" -le "${#_ccs[@]}" ] 2>/dev/null; then
                         local _picked="${_ccs[$((_choice-1))]}"
-                        sysctl -w "net.ipv4.tcp_congestion_control=$_picked" >/dev/null 2>&1
+                        # R14-2 fix: sysctl_safe для persistence + CONTRIBUTING #4.
+                        sysctl_safe net.ipv4.tcp_congestion_control "$_picked" || true
                         echo -e "${GREEN}[+] applied: tcp_congestion_control = $_picked${NC}"
                         _audit cc-bench-apply "cc=$_picked mode=manual score=user-pick"
                     else

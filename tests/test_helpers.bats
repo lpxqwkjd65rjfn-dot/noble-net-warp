@@ -1188,3 +1188,32 @@ setup() {
     run grep '^SCRIPT_VERSION="8.11"' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
+
+@test "v8.11 R14-1: cc-bench arg-parser uses split shifts (no infinite loop)" {
+    # Devin Review R14-1: shift 2 при $#=1 не decrement'ит → infinite loop.
+    # Fix: shift; shift || true (graceful exit).
+    run grep -E 'shift; shift \|\| true' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Verify NO active code line (без leading `#`) с `shift 2` в cc-bench parser.
+    # Берём только non-comment lines, отсекаем ведущие пробелы.
+    local code_only
+    code_only=$(sed -n '/^cc_bench_command()/,/^}/p' "$SCRIPT" | grep -vE '^\s*#')
+    if echo "$code_only" | grep -qE '\bshift 2\b'; then
+        echo "FOUND active 'shift 2' in cc_bench_command — should be split into shift; shift"
+        return 1
+    fi
+}
+
+@test "v8.11 R14-2: cc-bench final apply uses sysctl_safe (CONTRIBUTING #4)" {
+    # Devin Review R14-2: sysctl -w bypasses sysctl_safe → no DRY_RUN respect,
+    # no $SYSCTL_CONF persistence. Fix: use sysctl_safe.
+    run grep -E 'sysctl_safe net\.ipv4\.tcp_congestion_control' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 R14-2: cc-bench respects DRY_RUN early-exit" {
+    run grep -E '\[ "\$DRY_RUN" = "1" \]' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'cc-bench пропущен — bench-loop требует transient' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
