@@ -756,7 +756,8 @@ setup() {
 # ============================================================================
 
 @test "v8.10: SCRIPT_VERSION bumped to 8.10 or higher" {
-    run grep -E '^SCRIPT_VERSION="8\.(10|[2-9][0-9]+|1[1-9])"$' "$SCRIPT"
+    # Match 8.10, 8.11, ..., 8.99, 8.100, 8.101, ... — все multi-digit minor.
+    run grep -E '^SCRIPT_VERSION="8\.([1-9][0-9]+)"$' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
