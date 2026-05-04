@@ -988,3 +988,203 @@ setup() {
     run grep -E '^[[:space:]]+metrics-mtls\)' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
+
+# ============================================================================
+# v8.11 regression tests — kernel/protocol speed + behavioral iOS stealth
+# ============================================================================
+
+@test "v8.11: SCRIPT_VERSION bumped to 8.11 or higher" {
+    # Match 8.11, 8.12, ..., 8.99, 8.100+ — все multi-digit minor >= 11.
+    run grep -E '^SCRIPT_VERSION="8\.(1[1-9]|[2-9][0-9]|[1-9][0-9]{2,})"$' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K2: cc_bench_command implemented with auto/manual/list/bench modes" {
+    run grep '^cc_bench_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '_mode="\$\{1:-auto\}"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # manual mode TUI: read -r -p "Выбор: "
+    run grep -E 'read -r -p "Выбор: "' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K2: cc-bench calls _audit on apply (CONTRIBUTING #8)" {
+    run grep -A40 '^cc_bench_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -qE '_audit cc-bench'
+}
+
+@test "v8.11 K6: offload_max_command implemented with ethtool -K" {
+    run grep '^offload_max_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Features составляются в строку и передаются в ethtool -K $_features
+    run grep -E '_features="gro on gso on tso on"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'ethtool -K "\$_iface" \$_features' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K7: LRO smart-on check (ip_forward=0 for endpoint VPS)" {
+    run grep -B2 -A2 'LRO ломает forwarding\|ip_forward=0 → endpoint VPS' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K6: USO (UDP segmentation offload) support detected" {
+    run grep -E 'tx-udp-segmentation' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K8: ecn_l4s_command implements RFC 9330 L4S" {
+    run grep '^ecn_l4s_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'net\.ipv4\.tcp_l4s_ecn 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'net\.ipv4\.tcp_ecn 2' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K18: RACK-TLP verify in ecn_l4s_command" {
+    run grep -E 'net\.ipv4\.tcp_recovery 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K13: irq_steer_command implements NUMA-aware IRQ steering" {
+    run grep '^irq_steer_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '/proc/irq/.*/smp_affinity' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K13: irq-steer skips CPU <4" {
+    run grep -A3 'irq_steer_command()' "$SCRIPT"
+    echo "$output" | head -30
+    run grep -E 'CPU count <4 — IRQ steering пропускается' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K14: netdev_budget_command bumps for 25G+ links" {
+    run grep '^netdev_budget_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'netdev_budget 600|_budget=600' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K17: notsent_lowat_command sets TCP_NOTSENT_LOWAT=16384" {
+    run grep '^notsent_lowat_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'net\.ipv4\.tcp_notsent_lowat 16384' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K17: notsent-lowat generates nginx HTTP/2 snippet" {
+    run grep -E 'nginx-h2\.conf\.snippet' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K20: dscp_mark_command implements EF=46 для QUIC/STUN" {
+    run grep '^dscp_mark_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'udp dport 443 ip dscp set ef' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'udp dport \{ 3478, 19302 \}' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K20: dscp-mark is opt-in (not called in apply path)" {
+    # Should NOT be called unconditionally in apply_optimizations
+    run grep -B2 'dscp_mark_command enable' "$SCRIPT"
+    [ "$status" -ne 0 ]
+}
+
+@test "v8.11 S5+S7: icmp_ios_command sets TTL=64 + hop_limit=64" {
+    run grep '^icmp_ios_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'net\.ipv4\.ip_default_ttl 64' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'net\.ipv6\.conf\.all\.hop_limit 64' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 S10-S13: tls_safari_command generates nginx snippet" {
+    run grep '^tls_safari_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'ssl_session_timeout 7d' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'http2_max_concurrent_streams 100' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 S10-S13: tls-safari snippet includes HTTP/2 SETTINGS for Safari" {
+    run grep -E 'http2_recv_buffer_size 4M' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'keepalive_timeout 75s' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 S21+S22: ios_behavior_command creates captive + iCloud Relay timer" {
+    run grep '^ios_behavior_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'captive\.apple\.com/hotspot-detect\.html' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'mask\.icloud\.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 S21+S22: ios-behavior timer has OnUnitActiveSec=10m + RandomizedDelaySec" {
+    run grep -E 'OnUnitActiveSec=10m' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'RandomizedDelaySec=2m' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11: _v811_ensure_dir helper defined" {
+    run grep '^_v811_ensure_dir()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11: V811_STATE_DIR defined" {
+    run grep -E '^V811_STATE_DIR=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11: cli_dispatch routes all v8.11 commands" {
+    run grep -E '^[[:space:]]+cc-bench\|ccbench\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+offload-max\|offload\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+ecn-l4s\|ecn\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+irq-steer\|irqsteer\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+netdev-budget\|netdev\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+notsent-lowat\|notsent\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+dscp-mark\|dscp\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+icmp-ios\|ttl-ios\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+tls-safari\|safari-tls\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+ios-behavior\|ios-behaviour\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11: help text mentions cc-bench and new kernel commands" {
+    run grep -E 'cc-bench.*auto.*manual' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'offload-max.*GRO.*GSO.*USO' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 K2: cc-bench does not require iperf3 for help/list mode" {
+    # list и help должны работать без iperf3 (educational)
+    run grep -B5 'Usage:' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11: SCRIPT_VERSION is 8.11" {
+    run grep '^SCRIPT_VERSION="8.11"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}

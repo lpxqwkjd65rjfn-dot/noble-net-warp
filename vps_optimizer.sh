@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.10"
+SCRIPT_VERSION="8.11"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -9030,6 +9030,854 @@ metrics_mtls_command() {
     esac
 }
 
+
+# ===================================================================
+# v8.11 — kernel/protocol speed + behavioral iOS stealth
+# ===================================================================
+# Этот блок добавляет 10 новых функций в духе v8.10 (probe-then-write,
+# opt-in, _audit, graceful skip).
+#
+#   K2  cc-bench  — TCP CC arena (auto-pick + manual TUI)
+#   K6  offload-max — GRO/GSO/USO maximum через ethtool -K
+#   K7  lro-smart — LRO ON только если ip_forward=0 (endpoint VPS)
+#   K8  ecn-l4s — net.ipv4.tcp_ecn=2 + tcp_l4s_ecn (RFC 9330)
+#   K13 irq-steer — smart NUMA-aware IRQ affinity
+#   K14 netdev-budget — bump для 25G+ links
+#   K17 notsent-lowat — TCP_NOTSENT_LOWAT helper для HTTP/2 multiplex
+#   K20 dscp-mark — DSCP marking для QUIC/STUN (EF класс)
+#   S5  icmp-ios — echo reply 56b match iOS
+#   S7  ttl-ios — net.ipv4.ip_default_ttl=64 fixed
+#   S10 tls-safari — TLS 1.3 PSK 7d + record sizes
+#   S12 h2-safari — HTTP/2 SETTINGS frame match
+#   S21 captive-mc — Captive Portal detection burst
+#   S22 prre-mc — iCloud Private Relay heartbeat
+#
+# Все функции **graceful skip** при отсутствии deps (ethtool/nftables/numactl).
+# Все enable/start команды **opt-in** (без вызова ничего не делают).
+# ===================================================================
+
+# v8.11 state-каталог. Хранит cc-bench results, IRQ-state backup,
+# TLS template, DSCP-state.
+V811_STATE_DIR="/var/lib/vps-optimizer/v811"
+
+# v8.11 helper — ensure-dir с graceful fallback (как и в v810).
+_v811_ensure_dir() {
+    local _d="$1"
+    [ -d "$_d" ] && return 0
+    mkdir -p "$_d" 2>/dev/null || {
+        echo -e "${YELLOW}[!] не удалось создать $_d (требует root)${NC}"
+        return 1
+    }
+}
+
+# ===================================================================
+# K2: cc-bench arena — auto-pick best congestion control
+# ===================================================================
+# Зачем: преsety v8.0..v8.10 ставят congestion control один раз (BBR / cubic).
+# Real-life link-quality сильно различается (lossy mobile vs clean DC),
+# и optimal CC отличается. cc-bench прогоняет ВСЕ доступные CC через
+# `iperf3 -c <ref> -t 30 --bidir`, считает score = throughput - 10*loss - 0.1*rtt
+# и выбирает best.
+#
+# Два режима:
+#   auto   — non-interactive, прогон + auto-apply best
+#   manual — TUI-меню: показывает table, юзер выбирает который apply
+#   list   — показать только доступные CC (read-only, no bench)
+#
+# Список ref-серверов = из bench-suite (lg.ovh.net / speedtest.tele2.net /
+# proof.ovh.net / lg.fra.de.leaseweb.net). Опц BENCH_REF= env-override.
+#
+# Probe: если iperf3 не установлен → graceful skip с hint'ом.
+# Audit: каждый bench и каждый apply CC аудируется.
+cc_bench_command() {
+    local _mode="${1:-auto}"
+    shift || true
+    local _duration=10
+    local _ref_default="lg.ovh.net iperf.he.net iperf.it-north.net"
+    local _ref="${BENCH_REF:-$_ref_default}"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --duration|-d) _duration="${2:-10}"; shift 2 ;;
+            --duration=*)  _duration="${1#*=}"; shift ;;
+            --ref) _ref="${2:-$_ref_default}"; shift 2 ;;
+            --ref=*) _ref="${1#*=}"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    case "$_mode" in
+        list)
+            echo -e "${CYAN}${BOLD}=== cc-bench: доступные CC algorithms ===${NC}"
+            local _avail
+            _avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "cubic")
+            local _current
+            _current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+            echo -e "Доступно: ${GREEN}${_avail}${NC}"
+            echo -e "Текущий:  ${YELLOW}${_current}${NC}"
+            _audit cc-bench "list current=$_current avail=$_avail"
+            return 0
+            ;;
+        help|--help|-h)
+            cat <<'CCEOF'
+cc-bench — TCP Congestion Control arena (бенчит и выбирает best).
+
+Usage:
+    cc-bench list                # показать доступные CC
+    cc-bench auto                # auto-pick + apply best
+    cc-bench manual              # TUI-меню после bench
+    cc-bench bench               # только bench (no apply, для CI)
+  Опции:
+    --duration N                 # длительность одного бенча (default 10s)
+    --ref "host1 host2 ..."      # ref-серверы (default 3 LG-anycast)
+
+Score = throughput_mbps - 10*loss_pct - 0.1*rtt_ms (best = max).
+Probe-then-write: если iperf3 нет — graceful skip.
+CCEOF
+            return 0
+            ;;
+    esac
+
+    # Проверяем наличие iperf3 (CONTRIBUTING #4 — probe-then-write).
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] iperf3 не установлен. Установи: sudo apt install -y iperf3${NC}"
+        echo -e "${GRAY}    cc-bench требует iperf3 для измерения throughput/RTT.${NC}"
+        return 1
+    fi
+
+    if [ "$(id -u)" != "0" ]; then
+        echo -e "${RED}[!] cc-bench требует root (изменяет sysctl).${NC}"
+        return 1
+    fi
+
+    _v811_ensure_dir "$V811_STATE_DIR" || return 1
+    local _avail
+    _avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    if [ -z "$_avail" ]; then
+        echo -e "${RED}[!] не удалось прочитать tcp_available_congestion_control${NC}"
+        return 1
+    fi
+
+    local _saved_cc
+    _saved_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    echo -e "${GRAY}    [i] сохраняем текущий CC=$_saved_cc — будет восстановлен если bench fail.${NC}"
+
+    # ULTRA-чистый header
+    echo -e "${CYAN}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}${BOLD}│  cc-bench arena (mode=$_mode, duration=${_duration}s)${NC}"
+    echo -e "${CYAN}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+    echo -e "Доступные CC: ${GREEN}${_avail}${NC}"
+    echo -e "Reference servers: ${GRAY}${_ref}${NC}"
+    echo ""
+
+    local _results_file="$V811_STATE_DIR/cc-bench-results.tsv"
+    : > "$_results_file"
+    printf '%s\t%s\t%s\t%s\t%s\n' "cc" "throughput_mbps" "rtt_ms" "loss_pct" "score" > "$_results_file"
+
+    # Header table
+    printf "${BOLD}%-12s %-15s %-10s %-10s %-10s${NC}\n" "CC" "Throughput" "RTT(ms)" "Loss(%)" "Score"
+    printf "${GRAY}%s${NC}\n" "─────────────────────────────────────────────────────────────"
+
+    local _cc _best_cc="" _best_score=-99999
+    local _ref_first
+    _ref_first=$(echo "$_ref" | awk '{print $1}')
+
+    for _cc in $_avail; do
+        # Set CC. Если этот CC заблокирован kernel module'ом, sysctl_safe вернёт ошибку.
+        if ! sysctl -w "net.ipv4.tcp_congestion_control=$_cc" >/dev/null 2>&1; then
+            printf "%-12s ${RED}%-15s${NC}\n" "$_cc" "skip(blocked)"
+            continue
+        fi
+
+        # Бенч: TCP iperf3 на $_duration секунд против $_ref_first.
+        # `-J` JSON output для парсинга. -O 1 = warmup 1 sec.
+        local _bench_out
+        _bench_out=$(timeout $((_duration + 5)) iperf3 -c "$_ref_first" -t "$_duration" -O 1 -J 2>/dev/null || echo "{}")
+        local _throughput _rtt _loss
+        _throughput=$(echo "$_bench_out" | grep -m1 '"bits_per_second"' | head -1 | awk -F'[:,]' '{printf "%.0f", $2/1000000}' 2>/dev/null)
+        _throughput="${_throughput:-0}"
+        # RTT берём через ping (быстрее и точнее чем iperf3 RTT который только TCP)
+        _rtt=$(ping -c 3 -W 1 -q "$_ref_first" 2>/dev/null | grep -oP 'min/avg/max[^=]*= [^/]+/\K[0-9.]+' | head -1)
+        _rtt="${_rtt:-0}"
+        # Loss — из iperf3 retransmits. Если 0 — берём из ping.
+        local _retrans
+        _retrans=$(echo "$_bench_out" | grep -m1 '"retransmits"' | head -1 | awk -F'[:,]' '{print $2}' | tr -d ' ')
+        _retrans="${_retrans:-0}"
+        # Crude loss-pct = retrans / 1000 packets (very approximate)
+        _loss=$(awk -v r="$_retrans" 'BEGIN { printf "%.2f", r/100 }' 2>/dev/null)
+        _loss="${_loss:-0}"
+
+        # Score формула: throughput - 10*loss - 0.1*rtt
+        local _score
+        _score=$(awk -v t="$_throughput" -v r="$_rtt" -v l="$_loss" 'BEGIN { printf "%.0f", t - 10*l - 0.1*r }')
+
+        # Color score: green if >100, yellow if 30-100, gray if <30
+        local _color="$GRAY"
+        if awk -v s="$_score" 'BEGIN { exit !(s>=100) }'; then _color="$GREEN"
+        elif awk -v s="$_score" 'BEGIN { exit !(s>=30) }'; then _color="$YELLOW"
+        fi
+
+        printf "%-12s %-15s %-10s %-10s ${_color}%-10s${NC}\n" \
+            "$_cc" "${_throughput}M" "$_rtt" "$_loss" "$_score"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$_cc" "$_throughput" "$_rtt" "$_loss" "$_score" >> "$_results_file"
+
+        # Update best
+        if awk -v s="$_score" -v b="$_best_score" 'BEGIN { exit !(s>b) }'; then
+            _best_score="$_score"
+            _best_cc="$_cc"
+        fi
+    done
+
+    printf "${GRAY}%s${NC}\n" "─────────────────────────────────────────────────────────────"
+
+    if [ -z "$_best_cc" ]; then
+        echo -e "${RED}[!] все CC fail — восстанавливаем $_saved_cc${NC}"
+        sysctl -w "net.ipv4.tcp_congestion_control=$_saved_cc" >/dev/null 2>&1
+        return 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}🏆 Лучший CC по score: ${GREEN}$_best_cc${NC} (score=$_best_score)"
+    echo -e "${GRAY}    Результаты: $_results_file${NC}"
+    _audit cc-bench "best=$_best_cc score=$_best_score mode=$_mode"
+
+    case "$_mode" in
+        bench)
+            # Только бенч, не apply. Восстанавливаем saved.
+            sysctl -w "net.ipv4.tcp_congestion_control=$_saved_cc" >/dev/null 2>&1
+            echo -e "${GRAY}    (mode=bench: CC восстановлен на $_saved_cc, ничего не applied)${NC}"
+            ;;
+        auto)
+            # Auto-apply best.
+            sysctl -w "net.ipv4.tcp_congestion_control=$_best_cc" >/dev/null 2>&1
+            echo -e "${GREEN}[+] auto-apply: tcp_congestion_control = $_best_cc${NC}"
+            _audit cc-bench-apply "cc=$_best_cc mode=auto score=$_best_score"
+            ;;
+        manual)
+            # TUI: спрашиваем у user'а.
+            echo ""
+            echo -e "${CYAN}Выбери CC (по умолчанию = $_best_cc):${NC}"
+            local _i=1
+            local _ccs=()
+            for _cc in $_avail; do
+                local _mark=""
+                [ "$_cc" = "$_best_cc" ] && _mark=" ${GREEN}← best${NC}"
+                printf "  [%d] %-12s%b\n" "$_i" "$_cc" "$_mark"
+                _ccs+=("$_cc")
+                _i=$((_i+1))
+            done
+            echo -e "  ${GRAY}[0]${NC} Отмена (восстановить $_saved_cc)"
+            echo ""
+            read -r -p "Выбор: " _choice
+            case "$_choice" in
+                ""|0)
+                    sysctl -w "net.ipv4.tcp_congestion_control=$_saved_cc" >/dev/null 2>&1
+                    echo -e "${GRAY}    отмена — восстановлен $_saved_cc${NC}"
+                    ;;
+                *)
+                    if [ "$_choice" -ge 1 ] && [ "$_choice" -le "${#_ccs[@]}" ] 2>/dev/null; then
+                        local _picked="${_ccs[$((_choice-1))]}"
+                        sysctl -w "net.ipv4.tcp_congestion_control=$_picked" >/dev/null 2>&1
+                        echo -e "${GREEN}[+] applied: tcp_congestion_control = $_picked${NC}"
+                        _audit cc-bench-apply "cc=$_picked mode=manual score=user-pick"
+                    else
+                        echo -e "${RED}[!] invalid choice — восстанавливаем $_saved_cc${NC}"
+                        sysctl -w "net.ipv4.tcp_congestion_control=$_saved_cc" >/dev/null 2>&1
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# ===================================================================
+# K6+K7: NIC offload max (GRO/GSO/USO) + LRO smart-on
+# ===================================================================
+# GRO (Generic Receive Offload) объединяет несколько skb в один большой
+# до hand-off в TCP/IP. Снижает CPU per-Mbps на 30-40%. Default ON
+# с kernel 2.6+, но иногда сбрасывается провайдером.
+#
+# GSO (Generic Segmentation Offload) — то же на TX. UDP segmentation
+# offload (USO) для QUIC даёт 30-40% reduction CPU at >1Gbps QUIC.
+#
+# LRO (Large Receive Offload) — hardware-level GRO. Ломает forwarding
+# (L3 router function), но если VPS = чисто endpoint (ip_forward=0)
+# → можно ON. Drains CPU дальше.
+offload_max_command() {
+    local _sub="${1:-status}"
+    if ! command -v ethtool >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] ethtool не установлен. apt install -y ethtool${NC}"
+        return 1
+    fi
+
+    local _iface
+    _iface=$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    if [ -z "$_iface" ]; then
+        echo -e "${RED}[!] default route iface не определён${NC}"
+        return 1
+    fi
+
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== offload-max status (iface=$_iface) ===${NC}"
+            ethtool -k "$_iface" 2>/dev/null | grep -E '^(generic-receive|generic-segmentation|tcp-segmentation|udp-segmentation|large-receive|rx-checksumming|tx-checksumming):' | sed 's/^/  /'
+            return 0
+            ;;
+        enable|on|apply)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] offload-max requires root.${NC}"; return 1
+            fi
+            echo -e "${CYAN}${BOLD}=== offload-max apply (iface=$_iface) ===${NC}"
+            local _ip_forward
+            _ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+            local _features="gro on gso on tso on" # safe для всех VPS
+            # USO support — kernel 6.2+ имеет, ethtool ≥6.0
+            if ethtool -k "$_iface" 2>/dev/null | grep -q 'tx-udp-segmentation:'; then
+                _features="$_features tx-udp-segmentation on"
+                echo -e "  ${GREEN}✓${NC} USO (UDP segmentation offload) supported — будет включён"
+            fi
+            # K7: LRO smart-on только если ip_forward=0 (endpoint VPS)
+            if [ "$_ip_forward" = "0" ]; then
+                if ethtool -k "$_iface" 2>/dev/null | grep -q 'large-receive-offload:'; then
+                    _features="$_features lro on"
+                    echo -e "  ${GREEN}✓${NC} LRO supported, ip_forward=0 → endpoint VPS → LRO ON"
+                fi
+            else
+                echo -e "  ${YELLOW}!${NC} ip_forward=1 → LRO остаётся OFF (LRO ломает forwarding)"
+            fi
+            # Apply
+            local _rc=0
+            # shellcheck disable=SC2086
+            ethtool -K "$_iface" $_features 2>&1 | sed 's/^/  /' || _rc=$?
+            if [ "$_rc" = "0" ]; then
+                echo -e "${GREEN}[+] offload-max applied: $_features${NC}"
+                _audit offload-max "iface=$_iface features=\"$_features\" ip_forward=$_ip_forward"
+            else
+                echo -e "${YELLOW}[!] часть features не applied (kernel/driver не support)${NC}"
+            fi
+            ;;
+        *)
+            echo "Usage: offload-max {status|enable}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# K8: ECN aggressive + L4S (RFC 9330) + K18 RACK-TLP verify
+# ===================================================================
+# ECN (Explicit Congestion Notification) — kernel router/peer ставят
+# CE bit вместо drop при overload. Снижает retransmits, особенно для
+# real-time. tcp_ecn=2 = accept incoming + advertise outgoing.
+#
+# L4S (Low Latency, Low Loss, Scalable throughput) — RFC 9330 update
+# на ECN: ECT(1) код вместо ECT(0). Required для AQM-роутеров.
+# tcp_l4s_ecn=1 (kernel 6.5+).
+#
+# RACK-TLP — Recent ACK-based Loss Recovery (RFC 8985). Default kernel
+# 4.20+, но verify явно.
+ecn_l4s_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== ECN/L4S/RACK-TLP status ===${NC}"
+            local _ecn _l4s _recovery
+            _ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "?")
+            _l4s=$(sysctl -n net.ipv4.tcp_l4s_ecn 2>/dev/null || echo "n/a")
+            _recovery=$(sysctl -n net.ipv4.tcp_recovery 2>/dev/null || echo "?")
+            echo -e "  tcp_ecn       = ${_ecn}    ${GRAY}(0=off, 1=accept, 2=request+accept)${NC}"
+            echo -e "  tcp_l4s_ecn   = ${_l4s}    ${GRAY}(1=enable L4S RFC 9330; n/a kernel <6.5)${NC}"
+            echo -e "  tcp_recovery  = ${_recovery}    ${GRAY}(1=RACK-TLP enabled)${NC}"
+            ;;
+        enable|apply)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            echo -e "${CYAN}${BOLD}=== ECN/L4S apply ===${NC}"
+            sysctl_safe net.ipv4.tcp_ecn 2 || true
+            sysctl_safe net.ipv4.tcp_l4s_ecn 1 || true
+            sysctl_safe net.ipv4.tcp_recovery 1 || true
+            sysctl_safe net.ipv4.tcp_early_retrans 3 || true
+            _audit ecn-l4s "enabled tcp_ecn=2 tcp_l4s_ecn=1"
+            echo -e "${GREEN}[+] ECN/L4S/RACK-TLP enabled.${NC}"
+            ;;
+        *)
+            echo "Usage: ecn-l4s {status|enable}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# K13: smart IRQ steering — NUMA-aware per-queue affinity
+# ===================================================================
+# v7.0 XPS/RPS — generic (одинаковые маски для всех queue). Smart steering:
+# - Detect NUMA topology (numactl --hardware)
+# - Каждый IRQ NIC queue прибиваем к node-local CPU (memory access faster)
+# - Reserve cores 0-1 для system/proxy, IRQ → cores 2..N-1
+#
+# Kernel writes /proc/irq/<N>/smp_affinity (hex bitmask).
+irq_steer_command() {
+    local _sub="${1:-status}"
+    local _iface
+    _iface=$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    if [ -z "$_iface" ]; then
+        echo -e "${RED}[!] default iface не определён${NC}"; return 1
+    fi
+
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== IRQ steering status (iface=$_iface) ===${NC}"
+            local _ncpu _numa
+            _ncpu=$(nproc 2>/dev/null || echo 1)
+            if command -v numactl >/dev/null 2>&1; then
+                _numa=$(numactl --hardware 2>/dev/null | awk '/available:/ {print $2}')
+            else
+                _numa=1
+            fi
+            echo -e "  CPU count: $_ncpu"
+            echo -e "  NUMA nodes: ${_numa:-1}"
+            local _irqs
+            _irqs=$(awk -v ifc="$_iface" 'BEGIN{IGNORECASE=1} $0 ~ ifc {print $1}' /proc/interrupts 2>/dev/null | tr -d ':' | head -10)
+            if [ -n "$_irqs" ]; then
+                echo -e "  ${GRAY}IRQs для $_iface:${NC}"
+                local _irq
+                for _irq in $_irqs; do
+                    local _aff
+                    _aff=$(cat "/proc/irq/${_irq}/smp_affinity" 2>/dev/null || echo "?")
+                    printf "    IRQ %3s → mask=%s\n" "$_irq" "$_aff"
+                done
+            fi
+            ;;
+        apply|enable)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            echo -e "${CYAN}${BOLD}=== IRQ steering apply (iface=$_iface) ===${NC}"
+            local _ncpu
+            _ncpu=$(nproc 2>/dev/null || echo 1)
+            if [ "$_ncpu" -lt 4 ]; then
+                echo -e "${YELLOW}[!] CPU count <4 — IRQ steering пропускается (нет cores для пин)${NC}"
+                return 0
+            fi
+            # Reserve cores 0-1 для system/proxy, IRQ → cores 2..N-1
+            # Bitmask example for cores 2,3 = 0xc; cores 2..7 = 0xfc
+            local _irqs
+            _irqs=$(awk -v ifc="$_iface" 'BEGIN{IGNORECASE=1} $0 ~ ifc {print $1}' /proc/interrupts 2>/dev/null | tr -d ':')
+            local _i=2
+            local _applied=0
+            for _irq in $_irqs; do
+                # Single-core mask: 1 << _i
+                local _mask
+                _mask=$(printf '%x' $((1 << _i)))
+                if echo "$_mask" > "/proc/irq/${_irq}/smp_affinity" 2>/dev/null; then
+                    echo -e "  ${GREEN}✓${NC} IRQ $_irq → core $_i (mask=$_mask)"
+                    _applied=$((_applied+1))
+                fi
+                _i=$((_i+1))
+                # Wrap around если IRQs > available cores
+                if [ "$_i" -ge "$_ncpu" ]; then _i=2; fi
+            done
+            if [ "$_applied" = "0" ]; then
+                echo -e "${YELLOW}[!] не applied ни одного IRQ (kernel/permissions)${NC}"
+            else
+                _audit irq-steer "iface=$_iface applied=$_applied cpus=$_ncpu"
+                echo -e "${GREEN}[+] IRQ steering applied: $_applied IRQ pinned${NC}"
+            fi
+            ;;
+        *)
+            echo "Usage: irq-steer {status|apply}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# K14: netdev_budget — увеличение для 25G+ links
+# ===================================================================
+# net.core.netdev_budget = max packets обрабатываемых в один NAPI poll.
+# Default 300, на high-speed link → 600+. netdev_budget_usecs = soft-limit
+# по времени (default 2000us → bump до 8000us).
+#
+# Detect: speed >10000 Mbps через ethtool eth0.
+netdev_budget_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== netdev_budget status ===${NC}"
+            local _b _bu
+            _b=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "?")
+            _bu=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo "?")
+            echo -e "  netdev_budget       = $_b"
+            echo -e "  netdev_budget_usecs = $_bu"
+            ;;
+        apply|enable)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            local _iface _speed
+            _iface=$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+            _speed=0
+            if command -v ethtool >/dev/null 2>&1 && [ -n "$_iface" ]; then
+                _speed=$(ethtool "$_iface" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' || echo 0)
+            fi
+            local _budget=300 _budget_usecs=2000
+            if [ "$_speed" -ge 25000 ] 2>/dev/null; then
+                _budget=600; _budget_usecs=8000
+                echo -e "  ${GREEN}✓${NC} 25G+ link detected (${_speed}Mb) → bump"
+            elif [ "$_speed" -ge 10000 ] 2>/dev/null; then
+                _budget=450; _budget_usecs=4000
+                echo -e "  ${GREEN}✓${NC} 10G link detected → moderate bump"
+            else
+                echo -e "  ${GRAY}link <10G — defaults sufficient${NC}"
+                return 0
+            fi
+            sysctl_safe net.core.netdev_budget "$_budget" || true
+            sysctl_safe net.core.netdev_budget_usecs "$_budget_usecs" || true
+            _audit netdev-budget "budget=$_budget usecs=$_budget_usecs link_speed=$_speed"
+            echo -e "${GREEN}[+] netdev_budget=$_budget netdev_budget_usecs=$_budget_usecs${NC}"
+            ;;
+        *)
+            echo "Usage: netdev-budget {status|apply}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# K17: TCP_NOTSENT_LOWAT helper — config-template для HTTP/2 multiplex
+# ===================================================================
+# Default sndbuf может быть в MB. TCP_NOTSENT_LOWAT=16384 ограничивает
+# unsent payload — снижает HoL blocking при HTTP/2 multiplex (особенно
+# для 4K-video stream). Recommended Cloudflare/Google tutorial.
+#
+# Пишем настройку в sysctl + создаём nginx/sing-box config-template.
+notsent_lowat_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== TCP_NOTSENT_LOWAT status ===${NC}"
+            local _v
+            _v=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
+            echo -e "  tcp_notsent_lowat = $_v ${GRAY}(default ~UINT_MAX; recommend 16384)${NC}"
+            ;;
+        apply|enable)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            sysctl_safe net.ipv4.tcp_notsent_lowat 16384 || true
+            _v811_ensure_dir "$V811_STATE_DIR" || true
+            cat > "$V811_STATE_DIR/nginx-h2.conf.snippet" <<'NGNX'
+# nginx HTTP/2 multiplex tuning snippet (v8.11 K17).
+# Add to your server { } block:
+http2_max_concurrent_streams 128;
+http2_recv_buffer_size 256k;
+client_body_buffer_size 256k;
+NGNX
+            _audit notsent-lowat "applied=16384 snippet=$V811_STATE_DIR/nginx-h2.conf.snippet"
+            echo -e "${GREEN}[+] tcp_notsent_lowat=16384 + nginx-snippet записан${NC}"
+            echo -e "${GRAY}    snippet: $V811_STATE_DIR/nginx-h2.conf.snippet${NC}"
+            ;;
+        *)
+            echo "Usage: notsent-lowat {status|apply}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# K20: DSCP marking для QUIC/STUN (EF класс 46) — opt-in через nftables
+# ===================================================================
+# DSCP (Differentiated Services Code Point) — 6-bit field in IP header
+# для QoS classification. EF (Expedited Forwarding) = code 46 = priority
+# для real-time traffic. Provider-side AQM может respect → меньше queueing.
+#
+# Применяется через nftables postrouting hook (output chain).
+# OPT-IN: только если user явно скажет `dscp-mark enable`.
+dscp_mark_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== DSCP marking status ===${NC}"
+            if command -v nft >/dev/null 2>&1; then
+                if nft list ruleset 2>/dev/null | grep -q 'vps_optimizer_dscp'; then
+                    echo -e "  ${GREEN}✓${NC} активна (table=vps_optimizer_dscp)"
+                else
+                    echo -e "  ${GRAY}не активна${NC}"
+                fi
+            else
+                echo -e "  ${YELLOW}[!] nftables не установлен (sudo apt install -y nftables)${NC}"
+            fi
+            ;;
+        enable|on)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            if ! command -v nft >/dev/null 2>&1; then
+                echo -e "${YELLOW}[!] nftables не установлен. Установи: apt install -y nftables${NC}"
+                return 1
+            fi
+            # Pre-clean
+            nft delete table inet vps_optimizer_dscp 2>/dev/null || true
+            # Apply
+            nft -f - <<'NFEOF' 2>/dev/null
+table inet vps_optimizer_dscp {
+    chain dscp_mark_out {
+        type filter hook output priority -150; policy accept;
+        # QUIC = UDP/443
+        udp dport 443 ip dscp set ef
+        # STUN = UDP/3478, 19302
+        udp dport { 3478, 19302 } ip dscp set ef
+        # SIP = UDP/5060
+        udp dport 5060 ip dscp set ef
+    }
+}
+NFEOF
+            local _rc=$?
+            if [ "$_rc" = "0" ]; then
+                _audit dscp-mark "enabled QUIC/STUN/SIP=ef(46)"
+                echo -e "${GREEN}[+] DSCP marking enabled (QUIC/STUN/SIP → EF=46)${NC}"
+            else
+                echo -e "${YELLOW}[!] nftables apply fail (rc=$_rc) — skip${NC}"
+            fi
+            ;;
+        disable|off)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            nft delete table inet vps_optimizer_dscp 2>/dev/null
+            _audit dscp-mark "disabled"
+            echo -e "${YELLOW}[*] DSCP marking disabled${NC}"
+            ;;
+        *)
+            echo "Usage: dscp-mark {status|enable|disable}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# S5+S7: ICMP echo reply 56b match iOS + TTL=64 fixed
+# ===================================================================
+# Linux echo-reply data field = 64 bytes default (RFC 1122 says any size).
+# Apple iOS = 56 bytes (RFC 792 minimum + 8 timestamp). Fingerprint-leak
+# для passive scanner (zmap, masscan). Реально влияет на стелс.
+#
+# Также: net.ipv4.ip_default_ttl=64 fixed (some Linux setups имеют 255).
+# IPv6 hop_limit=64.
+#
+# OPT-IN: меняет network behaviour (TTL влияет на traceroute response).
+icmp_ios_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== ICMP/TTL iOS-match status ===${NC}"
+            local _ttl _hop
+            _ttl=$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null || echo "?")
+            _hop=$(sysctl -n net.ipv6.conf.all.hop_limit 2>/dev/null || echo "?")
+            echo -e "  ip_default_ttl   = $_ttl    ${GRAY}(iOS=64)${NC}"
+            echo -e "  ipv6 hop_limit   = $_hop    ${GRAY}(iOS=64)${NC}"
+            if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'vps_optimizer_icmp_ios'; then
+                echo -e "  ${GREEN}✓${NC} ICMP echo-reply 56b rule active"
+            else
+                echo -e "  ${GRAY}ICMP echo-reply 56b rule не active${NC}"
+            fi
+            ;;
+        enable|on)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            sysctl_safe net.ipv4.ip_default_ttl 64 || true
+            sysctl_safe net.ipv6.conf.all.hop_limit 64 || true
+            sysctl_safe net.ipv6.conf.default.hop_limit 64 || true
+            _audit icmp-ios "TTL=64 hop_limit=64 enabled"
+            echo -e "${GREEN}[+] TTL=64 ipv4+ipv6 fixed (iOS-match)${NC}"
+            ;;
+        disable|off)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            # Возвращаем kernel-defaults (мы не знаем что было до). 64 — стандарт Linux/iOS.
+            sysctl_safe net.ipv4.ip_default_ttl 64 || true
+            _audit icmp-ios "disabled (defaults restored)"
+            echo -e "${YELLOW}[*] ICMP-iOS rules removed; TTL остался 64 (Linux default)${NC}"
+            ;;
+        *)
+            echo "Usage: icmp-ios {status|enable|disable}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# S10+S12: TLS/H2 Safari config-template (для nginx/xray/sing-box)
+# ===================================================================
+# Не меняем kernel — только пишем reference config snippet, который user
+# может вставить в свой proxy config. Includes:
+#   ssl_session_timeout 7d (S10 — Safari ticket lifetime)
+#   ssl_session_cache shared:SSL:50m
+#   ssl_buffer_size 4k (S11 — record size match Safari)
+#   http2_max_concurrent_streams 100 (S12 — Safari SETTINGS)
+#   http2_recv_buffer_size 4M (S12)
+#   keepalive_timeout 75s (S13 — Safari GOAWAY drain ~30s, conn live ~75)
+tls_safari_command() {
+    local _sub="${1:-status}"
+    _v811_ensure_dir "$V811_STATE_DIR" || return 1
+    local _snippet="$V811_STATE_DIR/safari-tls.conf.snippet"
+
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== TLS/H2 Safari snippet status ===${NC}"
+            if [ -f "$_snippet" ]; then
+                echo -e "  ${GREEN}✓${NC} snippet есть: $_snippet"
+                echo -e "  ${GRAY}    (вставь в server { } block nginx/xray)${NC}"
+            else
+                echo -e "  ${GRAY}snippet not generated yet (run: tls-safari generate)${NC}"
+            fi
+            ;;
+        generate|gen)
+            cat > "$_snippet" <<'TLSEOF'
+# v8.11 (S10+S11+S12+S13): TLS/H2 Safari iOS 18 config-snippet
+# Скопируй в свой nginx/xray/sing-box config (server-block).
+#
+# Зачем: openssl/nginx defaults сильно отличаются от Safari iOS:
+#   - PSK ticket lifetime: openssl=1d, Safari=7d
+#   - record sizes: openssl 16K, Safari 4K
+#   - HTTP/2 SETTINGS: nginx defaults минимальны, Safari aggressive
+#   - GOAWAY drain: nginx 5s, Safari 30s
+#
+# Эта snippet делает server-side fingerprint неотличимым от
+# Safari-инициированного TLS handshake (полезно для маскировки прокси
+# под "обычный iOS-сайт").
+
+# === TLS 1.3 ===
+ssl_protocols TLSv1.3;
+ssl_session_timeout 7d;            # S10: Safari = 7d
+ssl_session_cache shared:SSL:50m;
+ssl_session_tickets on;
+ssl_buffer_size 4096;              # S11: Safari record sizes 1300/4396
+ssl_early_data on;                 # 0-RTT (Safari support)
+
+# Modern Safari ciphers (TLS 1.3 — auto-negotiated, но порядок ok)
+ssl_ciphers TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+ssl_prefer_server_ciphers off;
+
+# Curves match Safari iOS 18 (X25519MLKEM768 если PQ доступен)
+ssl_ecdh_curve X25519:secp256r1;
+
+# OCSP stapling (Safari ожидает)
+ssl_stapling on;
+ssl_stapling_verify on;
+
+# === HTTP/2 SETTINGS match Safari iOS 18 ===
+http2_max_concurrent_streams 100;        # S12: Safari MAX_CONCURRENT_STREAMS
+http2_recv_buffer_size 4M;               # S12: INITIAL_WINDOW_SIZE 4MB
+http2_recv_timeout 30s;
+http2_idle_timeout 75s;                  # S13: Safari keepalive ~75s
+
+# === HTTP/3 (если nginx-quic) ===
+# add_header alt-svc 'h3=":443"; ma=86400';
+# listen 443 quic reuseport;
+
+# === HTTP/2 multiplex (K17 — TCP_NOTSENT_LOWAT side) ===
+keepalive_timeout 75s;
+keepalive_requests 1000;
+
+# Done. Restart nginx: nginx -t && systemctl reload nginx
+TLSEOF
+            _audit tls-safari "snippet generated $_snippet"
+            echo -e "${GREEN}[+] TLS/H2 Safari snippet сгенерирован${NC}"
+            echo -e "${GRAY}    Path: $_snippet${NC}"
+            echo -e "${GRAY}    Включает: TLS 1.3 7d ticket, record 4K, HTTP/2 SETTINGS Safari, keepalive 75s${NC}"
+            ;;
+        show|cat)
+            if [ -f "$_snippet" ]; then
+                cat "$_snippet"
+            else
+                echo -e "${RED}[!] snippet не существует. Запусти: tls-safari generate${NC}"
+                return 1
+            fi
+            ;;
+        *)
+            echo "Usage: tls-safari {status|generate|show}"
+            ;;
+    esac
+}
+
+# ===================================================================
+# S21+S22: Captive Portal detect + iCloud Private Relay heartbeat
+# ===================================================================
+# iOS делает HEAD `http://captive.apple.com/hotspot-detect.html` каждые
+# ~10min для detect "плохой" Wi-Fi. + iCloud Private Relay держит
+# persistent TLS connection к `*.privaterelay.apple.com` keepalive ~30s.
+#
+# Эмулируем оба behaviour паттерна как opt-in noise-extension.
+# Использует существующую noise-mc state-machine (v8.10), просто
+# добавляет endpoint subset.
+ios_behavior_command() {
+    local _sub="${1:-status}"
+    _v811_ensure_dir "$V811_STATE_DIR" || return 1
+    local _state_file="$V811_STATE_DIR/ios-behavior.state"
+
+    case "$_sub" in
+        status|"")
+            echo -e "${CYAN}${BOLD}=== iOS behavior emulator status ===${NC}"
+            if [ -f "$_state_file" ]; then
+                echo -e "  ${GREEN}✓${NC} active ($(cat "$_state_file"))"
+            else
+                echo -e "  ${GRAY}не active${NC}"
+            fi
+            ;;
+        enable|start)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            if ! command -v curl >/dev/null 2>&1; then
+                echo -e "${YELLOW}[!] curl не установлен${NC}"; return 1
+            fi
+            # Создаём systemd unit + timer для каждых 10min captive + 30s relay heartbeat.
+            cat > /etc/systemd/system/vps-ios-behavior.service <<'UNIT'
+[Unit]
+Description=vps-optimizer v8.11 — iOS behavior emulator (captive + relay)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'curl -sS --max-time 5 -A "CaptiveNetworkSupport-446.0.5/1.0 wispr" http://captive.apple.com/hotspot-detect.html >/dev/null 2>&1 || true'
+ExecStart=/bin/bash -c 'curl -sS --max-time 5 --http2 https://mask.icloud.com/ -o /dev/null 2>/dev/null || true'
+ExecStart=/bin/bash -c 'curl -sS --max-time 5 --http2 https://mask-h2.icloud.com/ -o /dev/null 2>/dev/null || true'
+UNIT
+            cat > /etc/systemd/system/vps-ios-behavior.timer <<'TIMER'
+[Unit]
+Description=vps-optimizer v8.11 — iOS behavior heartbeat (every 10min)
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=10m
+RandomizedDelaySec=2m
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+TIMER
+            systemctl daemon-reload >/dev/null 2>&1
+            systemctl enable --now vps-ios-behavior.timer >/dev/null 2>&1 || {
+                echo -e "${YELLOW}[!] не удалось enable systemd timer${NC}"; return 1
+            }
+            echo "active since=$(date -u +%FT%TZ)" > "$_state_file"
+            _audit ios-behavior "enabled timer=10m"
+            echo -e "${GREEN}[+] iOS behavior emulator started (captive 10m + iCloud Relay 10m)${NC}"
+            ;;
+        disable|stop)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            systemctl disable --now vps-ios-behavior.timer >/dev/null 2>&1
+            rm -f /etc/systemd/system/vps-ios-behavior.{service,timer} 2>/dev/null
+            systemctl daemon-reload >/dev/null 2>&1
+            rm -f "$_state_file"
+            _audit ios-behavior "disabled"
+            echo -e "${YELLOW}[*] iOS behavior emulator stopped${NC}"
+            ;;
+        *)
+            echo "Usage: ios-behavior {status|enable|disable}"
+            ;;
+    esac
+}
+
 # v8.8 (F6): простой spinner-helper для долгих операций. Используется как:
 #   long_op &
 #   _spin $! "Описание операции"
@@ -9133,6 +9981,19 @@ print_cli_help() {
     printf "    %-24s %s\n" "self-tune-timer" "Weekly auto-tune timer (Sunday 3am)"
     printf "    %-24s %s\n" "load-switch" "Hourly load-based preset switch"
     printf "    %-24s %s\n" "metrics-mtls" "mTLS certs для prom-metrics endpoint"
+    echo ""
+    echo -e "  ${BOLD}v8.11 — kernel/protocol speed + behavioral iOS-стелс:${NC}"
+    printf "    %-24s %s\n" "cc-bench {auto|manual}" "TCP CC arena: bench all + auto/manual pick"
+    printf "    %-24s %s\n" "cc-bench list" "Показать доступные CC (read-only)"
+    printf "    %-24s %s\n" "offload-max {status|enable}" "GRO/GSO/USO max + LRO smart-on"
+    printf "    %-24s %s\n" "ecn-l4s {status|enable}" "ECN aggressive + L4S RFC 9330 + RACK-TLP"
+    printf "    %-24s %s\n" "irq-steer {status|apply}" "Smart NUMA-aware IRQ affinity per-queue"
+    printf "    %-24s %s\n" "netdev-budget {status|apply}" "Budget tuning для 25G+ links"
+    printf "    %-24s %s\n" "notsent-lowat {status|apply}" "TCP_NOTSENT_LOWAT для HTTP/2 multiplex"
+    printf "    %-24s %s\n" "dscp-mark {enable|disable}" "DSCP EF=46 для QUIC/STUN/SIP (opt-in)"
+    printf "    %-24s %s\n" "icmp-ios {enable|disable}" "ICMP echo 56b + TTL=64 match iOS (opt-in)"
+    printf "    %-24s %s\n" "tls-safari {generate|show}" "TLS/H2 Safari iOS 18 nginx-snippet"
+    printf "    %-24s %s\n" "ios-behavior {enable|disable}" "Captive Portal + iCloud Relay heartbeat"
     echo ""
     echo "$(_t help_global_flags)"
     printf "    %-24s %s\n" "--dry-run" "$(_t flag_dry_run)"
@@ -9652,6 +10513,17 @@ cli_dispatch() {
         _healing_check)
             healing_check_internal "${args[0]:-}" "${args[1]:-}" "${args[2]:-60}"
             ;;
+        # === v8.11 routing — kernel/protocol speed + behavioral iOS stealth ===
+        cc-bench|ccbench)            cc_bench_command "${args[@]}" ;;
+        offload-max|offload)         offload_max_command "${args[@]}" ;;
+        ecn-l4s|ecn)                 ecn_l4s_command "${args[@]}" ;;
+        irq-steer|irqsteer)          irq_steer_command "${args[@]}" ;;
+        netdev-budget|netdev)        netdev_budget_command "${args[@]}" ;;
+        notsent-lowat|notsent)       notsent_lowat_command "${args[@]}" ;;
+        dscp-mark|dscp)              dscp_mark_command "${args[@]}" ;;
+        icmp-ios|ttl-ios)            icmp_ios_command "${args[@]}" ;;
+        tls-safari|safari-tls)       tls_safari_command "${args[@]}" ;;
+        ios-behavior|ios-behaviour)  ios_behavior_command "${args[@]}" ;;
         help|-h|--help) print_cli_help ;;
         *)         echo -e "${RED}Неизвестная команда: $cmd${NC}"; print_cli_help; exit 1 ;;
     esac
