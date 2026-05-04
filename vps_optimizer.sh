@@ -9364,15 +9364,27 @@ offload_max_command() {
             else
                 echo -e "  ${YELLOW}!${NC} ip_forward=1 → LRO остаётся OFF (LRO ломает forwarding)"
             fi
+            # R14-6 fix: respect DRY_RUN. ethtool -K не идёт через
+            # sysctl_safe/sysfs_safe (которые auto-handle DRY_RUN), поэтому
+            # explicit check необходим. Аналогично pattern apply_irq_affinity.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would apply: ethtool -K $_iface $_features"
+                _audit offload-max "iface=$_iface features=\"$_features\" mode=dry-run"
+                return 0
+            fi
             # Apply
             local _rc=0
             # shellcheck disable=SC2086
             ethtool -K "$_iface" $_features 2>&1 | sed 's/^/  /' || _rc=$?
+            # R14-4 fix: ethtool -K rc=80 = partial-success (некоторые features
+            # appied, некоторые отвергнуты driver). State уже мутирован — нужен
+            # _audit (CONTRIBUTING #8). Логируем rc для трассировки.
             if [ "$_rc" = "0" ]; then
                 echo -e "${GREEN}[+] offload-max applied: $_features${NC}"
-                _audit offload-max "iface=$_iface features=\"$_features\" ip_forward=$_ip_forward"
+                _audit offload-max "iface=$_iface features=\"$_features\" ip_forward=$_ip_forward rc=0"
             else
                 echo -e "${YELLOW}[!] часть features не applied (kernel/driver не support)${NC}"
+                _audit offload-max "iface=$_iface features=\"$_features\" ip_forward=$_ip_forward partial_fail=rc$_rc"
             fi
             ;;
         *)
@@ -9487,7 +9499,10 @@ irq_steer_command() {
                 # Single-core mask: 1 << _i
                 local _mask
                 _mask=$(printf '%x' $((1 << _i)))
-                if echo "$_mask" > "/proc/irq/${_irq}/smp_affinity" 2>/dev/null; then
+                # R14-3 fix: используем sysfs_safe (CONTRIBUTING #4) — обеспечивает
+                # DRY_RUN respect, LEARN_MODE diff display, и SYSFS_OK/SYSFS_SKIP
+                # tracking. Аналогично существующему apply_irq_affinity().
+                if sysfs_safe "/proc/irq/${_irq}/smp_affinity" "$_mask"; then
                     echo -e "  ${GREEN}✓${NC} IRQ $_irq → core $_i (mask=$_mask)"
                     _applied=$((_applied+1))
                 fi
@@ -9581,7 +9596,10 @@ notsent_lowat_command() {
                 echo -e "${RED}[!] requires root${NC}"; return 1
             fi
             sysctl_safe net.ipv4.tcp_notsent_lowat 16384 || true
-            _v811_ensure_dir "$V811_STATE_DIR" || true
+            # R14-5 fix: || return 1 вместо || true — иначе при mkdir failure
+            # cat'аем в несуществующий dir, печатаем "записан" и логируем
+            # _audit (false success). Аналогично cc-bench/tls-safari.
+            _v811_ensure_dir "$V811_STATE_DIR" || return 1
             cat > "$V811_STATE_DIR/nginx-h2.conf.snippet" <<'NGNX'
 # nginx HTTP/2 multiplex tuning snippet (v8.11 K17).
 # Add to your server { } block:

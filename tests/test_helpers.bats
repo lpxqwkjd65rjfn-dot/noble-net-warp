@@ -1217,3 +1217,39 @@ setup() {
     run grep -E 'cc-bench пропущен — bench-loop требует transient' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
+
+@test "v8.11 R14-3: irq-steer uses sysfs_safe (CONTRIBUTING #4)" {
+    # Devin Review R14-3: echo > /proc/irq/.../smp_affinity bypasses
+    # DRY_RUN, LEARN_MODE, SYSFS_OK/SYSFS_SKIP. Fix: use sysfs_safe.
+    run grep -E 'sysfs_safe "/proc/irq/\$\{_irq\}/smp_affinity"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # No active code line с echo > /proc/irq/*/smp_affinity внутри irq_steer.
+    local code_only
+    code_only=$(sed -n '/^irq_steer_command()/,/^}/p' "$SCRIPT" | grep -vE '^\s*#')
+    if echo "$code_only" | grep -qE 'echo .* > "?/proc/irq/'; then
+        echo "FOUND raw 'echo > /proc/irq/...' in irq_steer_command — use sysfs_safe"
+        return 1
+    fi
+}
+
+@test "v8.11 R14-4: offload-max audits on partial fail (CONTRIBUTING #8)" {
+    # Devin Review R14-4: ethtool -K rc=80 = partial-success state-mutation,
+    # надо _audit при rc != 0.
+    run grep -E '_audit offload-max.*partial_fail=rc\$_rc' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 R14-5: notsent-lowat ensure-dir uses || return 1" {
+    # Devin Review R14-5: || true → false success. Fix: || return 1.
+    local code_only
+    code_only=$(sed -n '/^notsent_lowat_command()/,/^}/p' "$SCRIPT")
+    echo "$code_only" | grep -qE '_v811_ensure_dir "\$V811_STATE_DIR" \|\| return 1'
+}
+
+@test "v8.11 R14-6: offload-max enable respects DRY_RUN" {
+    # Devin Review R14-6: ethtool -K bypasses sysctl_safe DRY_RUN handling.
+    local code_only
+    code_only=$(sed -n '/^offload_max_command()/,/^}/p' "$SCRIPT")
+    echo "$code_only" | grep -qE 'DRY_RUN.*=.*"1"' && \
+    echo "$code_only" | grep -qE 'would apply: ethtool -K'
+}
