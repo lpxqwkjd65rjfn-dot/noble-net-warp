@@ -1272,6 +1272,27 @@ setup() {
     echo "$code_only" | grep -qE 'would: systemctl disable --now vps-ios-behavior\.timer'
 }
 
+@test "v8.11 R14-12: _v811_persist_sysctl helper exists + используется в standalone commands" {
+    # Devin Review R14-12: sysctl_safe persistит в SYSCTL_CONF только когда
+    # SYSCTL_TMP set (apply flow). Standalone cc-bench/ecn-l4s/etc. → CC
+    # пропадает после reboot. Helper _v811_persist_sysctl это исправляет.
+    run grep -E '^_v811_persist_sysctl\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Используется в cc-bench (auto + manual)
+    run grep -cE '_v811_persist_sysctl net\.ipv4\.tcp_congestion_control' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ "${output:-0}" -ge 2 ]
+    # Используется в ecn-l4s, netdev-budget, notsent-lowat, icmp-ios
+    run grep -E '_v811_persist_sysctl net\.ipv4\.tcp_ecn' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '_v811_persist_sysctl net\.core\.netdev_budget' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '_v811_persist_sysctl net\.ipv4\.tcp_notsent_lowat' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '_v811_persist_sysctl net\.ipv4\.ip_default_ttl' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
 @test "v8.11 R14-10/R14-11: ensure_dir НЕ вызывается до case в tls-safari/ios-behavior" {
     # Devin Review R14-10/R14-11: read-only status падал на fresh system
     # без root, потому что _v811_ensure_dir вызывался до case.

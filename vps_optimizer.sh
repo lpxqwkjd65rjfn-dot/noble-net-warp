@@ -9070,6 +9070,40 @@ _v811_ensure_dir() {
     }
 }
 
+# v8.11 helper — standalone sysctl persist в $SYSCTL_CONF.
+# R14-12 fix: sysctl_safe записывает в $SYSCTL_TMP только во время
+# apply_optimizations (где SYSCTL_TMP установлен). При standalone CLI
+# (cc-bench, ecn-l4s, etc.) SYSCTL_TMP="" → CC применяется только в running
+# kernel и теряется после reboot. Эта функция гарантирует persistence
+# даже при standalone использовании.
+#
+# Behaviour: idempotent — если строка уже есть с тем же value, no-op.
+# Если есть с другим value, replace via sed in-place. Если нет — append.
+# Respect DRY_RUN (просто info-output). Requires root для записи.
+_v811_persist_sysctl() {
+    local _key="$1"
+    local _value="$2"
+    [ -z "$_key" ] || [ -z "$_value" ] && return 1
+    if [ "$DRY_RUN" = "1" ]; then
+        echo -e "${GRAY}[dry-run]${NC} would persist: $_key=$_value → $SYSCTL_CONF"
+        return 0
+    fi
+    [ "$(id -u)" != "0" ] && return 0  # silent skip — already-applied к kernel
+    # Если SYSCTL_TMP установлен — sysctl_safe уже записал, дублировать не надо.
+    [ -n "$SYSCTL_TMP" ] && return 0
+    # Создаём conf если нет.
+    if [ ! -f "$SYSCTL_CONF" ]; then
+        mkdir -p "$(dirname "$SYSCTL_CONF")" 2>/dev/null
+        : > "$SYSCTL_CONF"
+    fi
+    # Replace existing or append.
+    if grep -qE "^[[:space:]]*${_key}[[:space:]]*=" "$SYSCTL_CONF" 2>/dev/null; then
+        sed -i -E "s|^[[:space:]]*${_key}[[:space:]]*=.*|${_key} = ${_value}|" "$SYSCTL_CONF"
+    else
+        echo "${_key} = ${_value}" >> "$SYSCTL_CONF"
+    fi
+}
+
 # ===================================================================
 # K2: cc-bench arena — auto-pick best congestion control
 # ===================================================================
@@ -9263,11 +9297,15 @@ CCEOF
             echo -e "${GRAY}    (mode=bench: CC восстановлен на $_saved_cc, ничего не applied)${NC}"
             ;;
         auto)
-            # Auto-apply best. R14-2 fix: используем sysctl_safe вместо `sysctl -w`
-            # для CONTRIBUTING #4 (probe-then-write + persist в $SYSCTL_CONF).
-            # sysctl_safe также: respect DRY_RUN, kernel_supports_sysctl probe,
-            # SYSCTL_OK/SYSCTL_SKIP tracking. CC будет survived reboot.
+            # Auto-apply best. R14-2 fix: sysctl_safe — probe-then-write
+            # (CONTRIBUTING #4), respect DRY_RUN, kernel_supports_sysctl probe,
+            # SYSCTL_OK/SYSCTL_SKIP tracking.
+            # R14-12 fix: sysctl_safe persistит в $SYSCTL_CONF только когда
+            # $SYSCTL_TMP установлен (внутри apply_optimizations). При standalone
+            # cc-bench запуске SYSCTL_TMP="" → persist пропускается → CC
+            # пропадёт после reboot. Дополняем _v811_persist_sysctl.
             sysctl_safe net.ipv4.tcp_congestion_control "$_best_cc" || true
+            _v811_persist_sysctl net.ipv4.tcp_congestion_control "$_best_cc"
             echo -e "${GREEN}[+] auto-apply: tcp_congestion_control = $_best_cc${NC}"
             _audit cc-bench-apply "cc=$_best_cc mode=auto score=$_best_score"
             ;;
@@ -9295,8 +9333,9 @@ CCEOF
                 *)
                     if [ "$_choice" -ge 1 ] && [ "$_choice" -le "${#_ccs[@]}" ] 2>/dev/null; then
                         local _picked="${_ccs[$((_choice-1))]}"
-                        # R14-2 fix: sysctl_safe для persistence + CONTRIBUTING #4.
+                        # R14-2 + R14-12 fix: sysctl_safe + standalone persist.
                         sysctl_safe net.ipv4.tcp_congestion_control "$_picked" || true
+                        _v811_persist_sysctl net.ipv4.tcp_congestion_control "$_picked"
                         echo -e "${GREEN}[+] applied: tcp_congestion_control = $_picked${NC}"
                         _audit cc-bench-apply "cc=$_picked mode=manual score=user-pick"
                     else
@@ -9438,6 +9477,11 @@ ecn_l4s_command() {
             sysctl_safe net.ipv4.tcp_l4s_ecn 1 || true
             sysctl_safe net.ipv4.tcp_recovery 1 || true
             sysctl_safe net.ipv4.tcp_early_retrans 3 || true
+            # R14-12: persist для standalone использования (CC будет survived reboot).
+            _v811_persist_sysctl net.ipv4.tcp_ecn 2
+            _v811_persist_sysctl net.ipv4.tcp_l4s_ecn 1
+            _v811_persist_sysctl net.ipv4.tcp_recovery 1
+            _v811_persist_sysctl net.ipv4.tcp_early_retrans 3
             _audit ecn-l4s "enabled tcp_ecn=2 tcp_l4s_ecn=1"
             echo -e "${GREEN}[+] ECN/L4S/RACK-TLP enabled.${NC}"
             ;;
@@ -9575,6 +9619,9 @@ netdev_budget_command() {
             fi
             sysctl_safe net.core.netdev_budget "$_budget" || true
             sysctl_safe net.core.netdev_budget_usecs "$_budget_usecs" || true
+            # R14-12: persist для standalone.
+            _v811_persist_sysctl net.core.netdev_budget "$_budget"
+            _v811_persist_sysctl net.core.netdev_budget_usecs "$_budget_usecs"
             _audit netdev-budget "budget=$_budget usecs=$_budget_usecs link_speed=$_speed"
             echo -e "${GREEN}[+] netdev_budget=$_budget netdev_budget_usecs=$_budget_usecs${NC}"
             ;;
@@ -9606,6 +9653,8 @@ notsent_lowat_command() {
                 echo -e "${RED}[!] requires root${NC}"; return 1
             fi
             sysctl_safe net.ipv4.tcp_notsent_lowat 16384 || true
+            # R14-12: persist для standalone.
+            _v811_persist_sysctl net.ipv4.tcp_notsent_lowat 16384
             # sysctl_safe выше уже respect DRY_RUN. Но cat → file — тоже state
             # mutation. В dry-run mode skip snippet write.
             if [ "$DRY_RUN" = "1" ]; then
@@ -9753,6 +9802,10 @@ icmp_ios_command() {
             sysctl_safe net.ipv4.ip_default_ttl 64 || true
             sysctl_safe net.ipv6.conf.all.hop_limit 64 || true
             sysctl_safe net.ipv6.conf.default.hop_limit 64 || true
+            # R14-12: persist для standalone.
+            _v811_persist_sysctl net.ipv4.ip_default_ttl 64
+            _v811_persist_sysctl net.ipv6.conf.all.hop_limit 64
+            _v811_persist_sysctl net.ipv6.conf.default.hop_limit 64
             _audit icmp-ios "TTL=64 hop_limit=64 enabled"
             echo -e "${GREEN}[+] TTL=64 ipv4+ipv6 fixed (iOS-match)${NC}"
             ;;
