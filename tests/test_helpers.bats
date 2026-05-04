@@ -257,8 +257,9 @@ setup() {
 # ============================================================================
 
 @test "v8.7: SCRIPT_VERSION is at least 8.7" {
-    # SCRIPT_VERSION может быть 8.7+ (8.8, 8.9, ...) — bump в новых релизах ок.
-    run grep -E '^SCRIPT_VERSION="8\.[7-9]"' "$SCRIPT"
+    # SCRIPT_VERSION может быть 8.7+ (8.8, 8.9, 8.10, ...) — bump в новых релизах ок.
+    # Regex match for 8.7..8.9 single-digit OR 8.10+ multi-digit.
+    run grep -E '^SCRIPT_VERSION="8\.([7-9]|[1-9][0-9]+)"' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
@@ -562,8 +563,9 @@ setup() {
 
 # ---- v8.9 regression tests ----
 
-@test "v8.9: SCRIPT_VERSION bumped to 8.9" {
-    run grep '^SCRIPT_VERSION="8.9"' "$SCRIPT"
+@test "v8.9: SCRIPT_VERSION bumped to 8.9 or higher" {
+    # 8.9 ИЛИ 8.10+ (после bump в новых релизах).
+    run grep -E '^SCRIPT_VERSION="8\.(9|[1-9][0-9]+)"$' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
@@ -746,5 +748,243 @@ setup() {
     run grep -E '^[[:space:]]+snapshot\)' "$SCRIPT"
     [ "$status" -eq 0 ]
     run grep -E 'compare-current' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+# ============================================================================
+# v8.10 regression tests — глобальные архитектурные сдвиги
+# ============================================================================
+
+@test "v8.10: SCRIPT_VERSION bumped to 8.10 or higher" {
+    # Match 8.10, 8.11, ..., 8.99, 8.100, 8.101, ... — все multi-digit minor.
+    run grep -E '^SCRIPT_VERSION="8\.([1-9][0-9]+)"$' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 X1: ebpf_command implemented (retrans-watch, drop-reasons, latency-hist)" {
+    run grep '^ebpf_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'retrans-watch|retrans)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'drop-reasons|drops)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'latency-hist|lat)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Audit calls должны быть для всех под-команд (CONTRIBUTING #8 — mutating audited)
+    run grep '_audit ebpf' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 X2: healing watchdog (--healing flag, healing_watchdog_start)" {
+    run grep '^healing_watchdog_start()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^healing_check_internal()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -- '--healing) apply_healing_mode=1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Audit healing actions
+    run grep '_audit healing-' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 X3: auto-tune coordinate descent on 5 knobs" {
+    run grep '^auto_tune_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^auto_tune_run_iteration()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # 5 knobs round-robin
+    run grep 'rmem_max wmem_max tcp_rmem3 tcp_wmem3 netdev_max_backlog' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit auto-tune' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 X4: dashboard with HTML/CSS/JS + systemd unit" {
+    run grep '^dashboard_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # HTML-template
+    run grep '<title>vps-optimizer dashboard</title>' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # systemd unit на 127.0.0.1:9909
+    run grep -- '--bind 127.0.0.1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit dashboard' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 X10: provider-tune covers Hetzner/AWS/GCP/Azure" {
+    run grep '^provider_tune_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'hetzner)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'aws)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'gcp)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'azure)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # provider-tune вызывается из apply_optimizations
+    run grep 'provider_tune_command 2>/dev/null' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 S1: stealth-check via tcpdump + JA3 audit" {
+    run grep '^stealth_check_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Проверяет 5 критичных TLS extensions
+    run grep '0017' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '002b' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'fe0d' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit stealth-check' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 S6: noise-mc Markov chain — 4 states" {
+    run grep '^noise_mc_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # 4 states присутствуют
+    run grep 'IDLE)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'STREAMING)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'SYNC)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'MESSAGING)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit noise-mc' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 Y4+Y5: pin command (auto + service) with NUMA-aware" {
+    run grep '^pin_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'CPUAffinity=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'NUMAPolicy=bind' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit pin' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 Y8: nic-vendor profile covers mlx5/ena/intel/bnxt/virtio" {
+    run grep '^nic_vendor_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'mlx5_core' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ena)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ixgbe' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'virtio_net' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit nic-vendor' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 Y7+Z1: doctor checks io_uring + PQ-TLS readiness" {
+    run grep 'io_uring доступен' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'PQ-TLS' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # PQ KEM detection
+    run grep 'kyber|mlkem|ml-kem' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 O1: ts (TSDB) command with sample/query/prune" {
+    run grep '^ts_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_ts_sample()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_ts_query()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_ts_prune()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit ts' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 O3: TUI command with sparkline rendering" {
+    run grep '^tui_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_tui_sparkline()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # 8 sparkline characters
+    run grep '"▁"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit tui' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 O5: webhook command with Slack/Discord/Telegram support" {
+    run grep '^webhook_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^webhook_send()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'hooks.slack.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'discord.com/api/webhooks' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'api.telegram.org/bot' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit webhook' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 A1+A2: self-tune-timer + load-switch with systemd timers" {
+    run grep '^self_tune_timer_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^load_switch_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'OnCalendar=Sun 03:00' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit self-tune-timer' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit load-switch' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10 Z3: metrics-mtls generates CA + server + client certs" {
+    run grep '^metrics_mtls_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'openssl genrsa' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'openssl x509 -req' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit metrics-mtls' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.10: cli_dispatch routes all new v8.10 commands" {
+    run grep -E '^[[:space:]]+ebpf\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+auto-tune\|autotune\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+dashboard\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+provider-tune\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+stealth-check\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+noise-mc\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+pin\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+nic-vendor\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+ts\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+tui\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+webhook\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+self-tune-timer\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+load-switch\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+metrics-mtls\)' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
