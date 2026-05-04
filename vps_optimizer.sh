@@ -9596,6 +9596,13 @@ notsent_lowat_command() {
                 echo -e "${RED}[!] requires root${NC}"; return 1
             fi
             sysctl_safe net.ipv4.tcp_notsent_lowat 16384 || true
+            # sysctl_safe выше уже respect DRY_RUN. Но cat → file — тоже state
+            # mutation. В dry-run mode skip snippet write.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would write nginx HTTP/2 snippet to: $V811_STATE_DIR/nginx-h2.conf.snippet"
+                _audit notsent-lowat "mode=dry-run"
+                return 0
+            fi
             # R14-5 fix: || return 1 вместо || true — иначе при mkdir failure
             # cat'аем в несуществующий dir, печатаем "записан" и логируем
             # _audit (false success). Аналогично cc-bench/tls-safari.
@@ -9649,6 +9656,14 @@ dscp_mark_command() {
                 echo -e "${YELLOW}[!] nftables не установлен. Установи: apt install -y nftables${NC}"
                 return 1
             fi
+            # R14-7 fix: respect DRY_RUN. nft -f не идёт через sysctl_safe.
+            # Даже pre-clean (nft delete) — это system mutation.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would create nft table inet vps_optimizer_dscp"
+                echo -e "${GRAY}    QUIC(udp/443) + STUN(udp/3478,19302) + SIP(udp/5060) → ef(46)${NC}"
+                _audit dscp-mark "mode=dry-run target=ef(46)"
+                return 0
+            fi
             # Pre-clean
             nft delete table inet vps_optimizer_dscp 2>/dev/null || true
             # Apply
@@ -9671,11 +9686,18 @@ NFEOF
                 echo -e "${GREEN}[+] DSCP marking enabled (QUIC/STUN/SIP → EF=46)${NC}"
             else
                 echo -e "${YELLOW}[!] nftables apply fail (rc=$_rc) — skip${NC}"
+                # Audit even on failure — pre-clean уже мутировал state.
+                _audit dscp-mark "apply_fail rc=$_rc"
             fi
             ;;
         disable|off)
             if [ "$(id -u)" != "0" ]; then
                 echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would: nft delete table inet vps_optimizer_dscp"
+                _audit dscp-mark "mode=dry-run disable"
+                return 0
             fi
             nft delete table inet vps_optimizer_dscp 2>/dev/null
             _audit dscp-mark "disabled"
@@ -9766,6 +9788,11 @@ tls_safari_command() {
             fi
             ;;
         generate|gen)
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would write nginx/xray Safari snippet to: $_snippet"
+                _audit tls-safari "mode=dry-run snippet=$_snippet"
+                return 0
+            fi
             cat > "$_snippet" <<'TLSEOF'
 # v8.11 (S10+S11+S12+S13): TLS/H2 Safari iOS 18 config-snippet
 # Скопируй в свой nginx/xray/sing-box config (server-block).
@@ -9865,6 +9892,18 @@ ios_behavior_command() {
             if ! command -v curl >/dev/null 2>&1; then
                 echo -e "${YELLOW}[!] curl не установлен${NC}"; return 1
             fi
+            # R14-8 fix: respect DRY_RUN. Создание /etc/systemd/system/*.service
+            # и systemctl enable --now это system mutation. Без проверки —
+            # `--dry-run ios-behavior enable` реально стартанёт timer и сделает
+            # network calls к captive.apple.com / mask.icloud.com.
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would create:"
+                echo -e "${GRAY}    /etc/systemd/system/vps-ios-behavior.service${NC}"
+                echo -e "${GRAY}    /etc/systemd/system/vps-ios-behavior.timer (10m + 2m random)${NC}"
+                echo -e "${GRAY}    + systemctl enable --now${NC}"
+                _audit ios-behavior "mode=dry-run timer=10m"
+                return 0
+            fi
             # Создаём systemd unit + timer для каждых 10min captive + 30s relay heartbeat.
             cat > /etc/systemd/system/vps-ios-behavior.service <<'UNIT'
 [Unit]
@@ -9901,6 +9940,11 @@ TIMER
         disable|stop)
             if [ "$(id -u)" != "0" ]; then
                 echo -e "${RED}[!] requires root${NC}"; return 1
+            fi
+            if [ "$DRY_RUN" = "1" ]; then
+                echo -e "${GRAY}[dry-run]${NC} would: systemctl disable --now vps-ios-behavior.timer + rm units"
+                _audit ios-behavior "mode=dry-run disable"
+                return 0
             fi
             systemctl disable --now vps-ios-behavior.timer >/dev/null 2>&1
             rm -f /etc/systemd/system/vps-ios-behavior.{service,timer} 2>/dev/null

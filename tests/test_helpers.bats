@@ -1253,3 +1253,30 @@ setup() {
     echo "$code_only" | grep -qE 'DRY_RUN.*=.*"1"' && \
     echo "$code_only" | grep -qE 'would apply: ethtool -K'
 }
+
+@test "v8.11 R14-7: dscp-mark enable+disable respect DRY_RUN" {
+    # Devin Review R14-7: nft -f is a state mutation outside sysctl_safe.
+    # NB: `sed /^}/` stops at heredoc-content `}` at col 0. Используем grep напрямую.
+    run grep -E 'would create nft table inet vps_optimizer_dscp' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'would: nft delete table inet vps_optimizer_dscp' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 R14-8: ios-behavior enable+disable respect DRY_RUN" {
+    # Devin Review R14-8: systemd unit creation + enable --now is state mutation.
+    local code_only
+    code_only=$(sed -n '/^ios_behavior_command()/,/^}/p' "$SCRIPT")
+    echo "$code_only" | grep -qE 'would create:'
+    echo "$code_only" | grep -qE '/etc/systemd/system/vps-ios-behavior\.service'
+    echo "$code_only" | grep -qE 'would: systemctl disable --now vps-ios-behavior\.timer'
+}
+
+@test "v8.11 proactive: tls-safari + notsent-lowat snippet writes respect DRY_RUN" {
+    local tls_block
+    tls_block=$(sed -n '/^tls_safari_command()/,/^}/p' "$SCRIPT")
+    echo "$tls_block" | grep -qE 'would write nginx/xray Safari snippet'
+    local notsent_block
+    notsent_block=$(sed -n '/^notsent_lowat_command()/,/^}/p' "$SCRIPT")
+    echo "$notsent_block" | grep -qE 'would write nginx HTTP/2 snippet'
+}
