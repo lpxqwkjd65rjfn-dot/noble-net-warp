@@ -1272,6 +1272,24 @@ setup() {
     echo "$code_only" | grep -qE 'would: systemctl disable --now vps-ios-behavior\.timer'
 }
 
+@test "v8.11 R14-10/R14-11: ensure_dir НЕ вызывается до case в tls-safari/ios-behavior" {
+    # Devin Review R14-10/R14-11: read-only status падал на fresh system
+    # без root, потому что _v811_ensure_dir вызывался до case.
+    # Проверяем: в первой строке после `local _sub=` нет _v811_ensure_dir.
+    local tls_top
+    tls_top=$(awk '/^tls_safari_command\(\)/{p=1; next} p && /case/{exit} p' "$SCRIPT")
+    if echo "$tls_top" | grep -qE '_v811_ensure_dir'; then
+        echo "FAIL: tls_safari_command вызывает _v811_ensure_dir до case"
+        return 1
+    fi
+    local ios_top
+    ios_top=$(awk '/^ios_behavior_command\(\)/{p=1; next} p && /case/{exit} p' "$SCRIPT")
+    if echo "$ios_top" | grep -qE '_v811_ensure_dir'; then
+        echo "FAIL: ios_behavior_command вызывает _v811_ensure_dir до case"
+        return 1
+    fi
+}
+
 @test "v8.11 R14-9: cc-bench post-bench case has *) default that restores saved CC" {
     # Devin Review R14-9: typo в mode (cc-bench audo) проваливался через
     # bench-loop (transient sysctl -w) и оставлял last-tested CC active.

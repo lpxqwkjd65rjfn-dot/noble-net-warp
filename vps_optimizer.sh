@@ -9784,7 +9784,9 @@ icmp_ios_command() {
 #   keepalive_timeout 75s (S13 — Safari GOAWAY drain ~30s, conn live ~75)
 tls_safari_command() {
     local _sub="${1:-status}"
-    _v811_ensure_dir "$V811_STATE_DIR" || return 1
+    # R14-10 fix: НЕ вызываем _v811_ensure_dir ДО case — это требует root и
+    # ломает read-only status/show на fresh system. Перенесли внутрь generate.
+    # Аналогично notsent_lowat_command, cc_bench_command, metrics_mtls_command.
     local _snippet="$V811_STATE_DIR/safari-tls.conf.snippet"
 
     case "$_sub" in
@@ -9803,6 +9805,7 @@ tls_safari_command() {
                 _audit tls-safari "mode=dry-run snippet=$_snippet"
                 return 0
             fi
+            _v811_ensure_dir "$V811_STATE_DIR" || return 1
             cat > "$_snippet" <<'TLSEOF'
 # v8.11 (S10+S11+S12+S13): TLS/H2 Safari iOS 18 config-snippet
 # Скопируй в свой nginx/xray/sing-box config (server-block).
@@ -9883,7 +9886,8 @@ TLSEOF
 # добавляет endpoint subset.
 ios_behavior_command() {
     local _sub="${1:-status}"
-    _v811_ensure_dir "$V811_STATE_DIR" || return 1
+    # R14-11 fix: НЕ вызываем _v811_ensure_dir ДО case — это ломает read-only
+    # status на fresh system (требует root для mkdir). Перенесли внутрь enable.
     local _state_file="$V811_STATE_DIR/ios-behavior.state"
 
     case "$_sub" in
@@ -9914,6 +9918,7 @@ ios_behavior_command() {
                 _audit ios-behavior "mode=dry-run timer=10m"
                 return 0
             fi
+            _v811_ensure_dir "$V811_STATE_DIR" || return 1
             # Создаём systemd unit + timer для каждых 10min captive + 30s relay heartbeat.
             cat > /etc/systemd/system/vps-ios-behavior.service <<'UNIT'
 [Unit]
