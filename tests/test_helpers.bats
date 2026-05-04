@@ -1272,6 +1272,14 @@ setup() {
     echo "$code_only" | grep -qE 'would: systemctl disable --now vps-ios-behavior\.timer'
 }
 
+@test "v8.11 R14-13: _v811_persist_sysctl probes kernel_supports_sysctl (CONTRIBUTING #4)" {
+    # Devin Review R14-13: writing к /etc/sysctl.d/ без kernel probe →
+    # после reboot `sysctl --system` будет выдавать errors на unsupported keys.
+    local fn_block
+    fn_block=$(awk '/^_v811_persist_sysctl\(\)/{p=1} p; p && /^}/{exit}' "$SCRIPT")
+    echo "$fn_block" | grep -qE 'kernel_supports_sysctl'
+}
+
 @test "v8.11 R14-12: _v811_persist_sysctl helper exists + используется в standalone commands" {
     # Devin Review R14-12: sysctl_safe persistит в SYSCTL_CONF только когда
     # SYSCTL_TMP set (apply flow). Standalone cc-bench/ecn-l4s/etc. → CC

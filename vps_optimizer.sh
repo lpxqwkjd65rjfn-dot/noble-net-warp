@@ -9084,6 +9084,13 @@ _v811_persist_sysctl() {
     local _key="$1"
     local _value="$2"
     [ -z "$_key" ] || [ -z "$_value" ] && return 1
+    # R14-13 fix: probe kernel supports key. CONTRIBUTING #4: "Never write
+    # directly into /etc/sysctl.d/ without first probing the kernel."
+    # Без этого `sysctl --system` после reboot будет выдавать ошибки.
+    if ! kernel_supports_sysctl "$_key"; then
+        _debug "v811_persist: kernel не поддерживает $_key — skip"
+        return 0
+    fi
     if [ "$DRY_RUN" = "1" ]; then
         echo -e "${GRAY}[dry-run]${NC} would persist: $_key=$_value → $SYSCTL_CONF"
         return 0
