@@ -988,3 +988,125 @@ setup() {
     run grep -E '^[[:space:]]+metrics-mtls\)' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
+
+# ============================================================================
+# v8.11 regression tests — perf/stealth/RU-realism consolidated PR
+# ============================================================================
+
+@test "v8.11: SCRIPT_VERSION is 8.11 or higher" {
+    run grep -E '^SCRIPT_VERSION="8\.(1[1-9]|[2-9][0-9])"$' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 A1: udp_early_demux=1 applied" {
+    run grep 'sysctl_safe net.ipv4.udp_early_demux 1' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 A2: per-preset tcp_notsent_lowat (PRESET_TCP_NOTSENT_LOWAT)" {
+    run grep 'PRESET_TCP_NOTSENT_LOWAT' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 A3: per-preset tcp_pingpong_thresh (PRESET_TCP_PINGPONG_THRESH)" {
+    run grep 'PRESET_TCP_PINGPONG_THRESH' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 D1: per-preset busy_poll (PRESET_BUSY_POLL_USEC)" {
+    run grep 'PRESET_BUSY_POLL_USEC' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 B1: ALPN distribution updated to 60/35/5 (urand 0 19)" {
+    run grep -E '_alpn_pick=\$\(urand 0 19\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 B2: UA stickiness per session (sticky_ua function)" {
+    run grep '^sticky_ua()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'STICKY_UA_PER_TAG' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 B4: IMAP IDLE keepalive loop" {
+    run grep '^imap_idle_keepalive()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_imap_idle()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 B10: keepalive-time set to 60 in http_request" {
+    run grep -- '--keepalive-time 60' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 C1: day_class function (weekday/weekend) implemented" {
+    run grep '^day_class()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 C2: is_ru_holiday function implemented" {
+    run grep '^is_ru_holiday()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 C3: is_lunch_break function implemented" {
+    run grep '^is_lunch_break()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 C4: hard_sleep_suppress + in_hard_sleep_window" {
+    run grep '^in_hard_sleep_window()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^hard_sleep_suppress()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 C5: dwell_for_class function or dwell_class injection" {
+    run grep 'dwell_for_class\|dwell_class' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 C8: yandex_autosuggest_burst function" {
+    run grep '^yandex_autosuggest_burst()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 E1: fastpath_command (nftables flowtable)" {
+    run grep '^fastpath_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'flowtable ft0' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '_audit fastpath' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 E2: quic_tune_command implemented" {
+    run grep '^quic_tune_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'tx-udp-segmentation' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 E6: noise_calendar_refresh fetches isdayoff.ru" {
+    run grep '^noise_calendar_refresh()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'isdayoff.ru/api/getdata' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11 F1: _curl_help/_curl_supports caching" {
+    run grep '^_curl_help()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^_curl_supports()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.11: cli_dispatch routes fastpath and quic-tune" {
+    run grep -E '^[[:space:]]+fastpath\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+quic-tune\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
