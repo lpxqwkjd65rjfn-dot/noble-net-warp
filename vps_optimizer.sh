@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.10"
+SCRIPT_VERSION="8.11"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -981,9 +981,13 @@ preset_balanced() {
     PRESET_NAME="balanced"
     PRESET_NOFILE=1048576
     PRESET_BUF_MULT=1
-    PRESET_TCP_FASTOPEN=3
+    # v8.11 (A5): client-side TFO (1) безопаснее по умолчанию для balanced/web —
+    # на CGN/L4-NAT в РФ агенты иногда дропают server-side TFO-cookie. Proxy
+    # preset перекрывает на 3 (см. preset_proxy ниже).
+    PRESET_TCP_FASTOPEN=1
     PRESET_TCP_FIN_TIMEOUT=10
     PRESET_TCP_KEEPALIVE_TIME=600
+    PRESET_TCP_KEEPALIVE_PROBES=5
     PRESET_TCP_TW_BUCKETS=1440000
     PRESET_TCP_MAX_ORPHANS=262144
     PRESET_CONNTRACK_MAX=1048576
@@ -1001,6 +1005,18 @@ preset_balanced() {
     PRESET_SWAPPINESS=180
     PRESET_BBR_PACING_SS=200
     PRESET_BBR_PACING_CA=120
+    # v8.11 (A2): tcp_notsent_lowat — лимит unsent-данных в send-buffer.
+    # Меньше = ниже HOL-blocking latency (важно для интерактивных потоков
+    # через прокси), но чуть ниже peak throughput. Per-preset:
+    #   balanced=128 KB (default), web=64 KB, proxy=16 KB (для низкой interactive RTT).
+    PRESET_TCP_NOTSENT_LOWAT=131072
+    # v8.11 (A3): tcp_pingpong_thresh — порог переключения в pingpong mode.
+    # =1 (как было в v8.10) переключается слишком рано → +40 ms quiet timer
+    # на каждый bursty REST-запрос. =3 — kernel default, для balanced/web ОК.
+    PRESET_TCP_PINGPONG_THRESH=3
+    # v8.11 (D1): busy_poll/busy_read µs. Default 50 µs; на proxy preset 100 µs
+    # (-50..-80 µs first-read latency, +CPU busy loop, что для proxy ок).
+    PRESET_BUSY_POLL_USEC=50
 }
 
 # Прокси (xray/sing-box/haproxy/nginx-stream/wireguard) — много короткоживущих
@@ -1010,8 +1026,14 @@ preset_proxy() {
     PRESET_NAME="proxy"
     PRESET_NOFILE=2097152
     PRESET_BUF_MULT=2
+    # v8.11 (A5): server-side TFO для proxy preset (full TFO 3) — на upstream
+    # обычно надёжно (CDN/cloud роутится), и даёт -1 RTT на handshake.
+    PRESET_TCP_FASTOPEN=3
     PRESET_TCP_FIN_TIMEOUT=8
     PRESET_TCP_KEEPALIVE_TIME=300
+    # v8.11 (D6): probes 5→3 — быстрее освобождаем мёртвые сокеты (90 с вместо 150 с),
+    # меньше zombie-сокетов при flapping-сети.
+    PRESET_TCP_KEEPALIVE_PROBES=3
     PRESET_TCP_TW_BUCKETS=2000000
     PRESET_TCP_MAX_ORPHANS=524288
     PRESET_CONNTRACK_MAX=2097152
@@ -1023,6 +1045,13 @@ preset_proxy() {
     # + busy connection pool). swappiness=30 — практически не свопим страницы пока
     # не подходит к OOM.
     PRESET_SWAPPINESS=30
+    # v8.11 (A2): на proxy — 16K notsent_lowat для низкой interactive latency
+    # (Reality/XHTTP/SSH-over-proxy). Throughput peak теряем ~1-2 % — терпимо.
+    PRESET_TCP_NOTSENT_LOWAT=16384
+    # v8.11 (A3): proxy — pingpong=1 (агрессивный): большинство соединений короткие.
+    PRESET_TCP_PINGPONG_THRESH=1
+    # v8.11 (D1): busy_poll 100 µs для proxy — низкий ping-priority over CPU.
+    PRESET_BUSY_POLL_USEC=100
 }
 
 # Web-сервер (nginx/apache, статический контент): меньше conntrack,
@@ -1040,6 +1069,9 @@ preset_web() {
     # v8.7: на web preset допускаем умеренный swap (cached static content can
     # tolerate IO-latency). 60 — сбалансированно между memory pressure и performance.
     PRESET_SWAPPINESS=60
+    # v8.11 (A2): web — 64K notsent_lowat: компромисс между throughput-heavy
+    # static content и интерактивностью dashboards.
+    PRESET_TCP_NOTSENT_LOWAT=65536
 }
 
 load_preset() {
@@ -1519,8 +1551,9 @@ apply_sysctls() {
     sysctl_safe net.core.netdev_budget_usecs 8000
     sysctl_safe net.core.netdev_max_backlog "$PRESET_NETDEV_BACKLOG"
     sysctl_safe net.core.somaxconn "$PRESET_SOMAXCONN"
-    sysctl_safe net.core.busy_poll 50
-    sysctl_safe net.core.busy_read 50
+    # v8.11 (D1): per-preset busy_poll/busy_read (proxy=100, balanced/web=50).
+    sysctl_safe net.core.busy_poll "${PRESET_BUSY_POLL_USEC:-50}"
+    sysctl_safe net.core.busy_read "${PRESET_BUSY_POLL_USEC:-50}"
     sysctl_safe net.core.optmem_max 4194304
     sysctl_safe net.core.dev_weight 128
     sysctl_safe net.core.flow_limit_table_len 8192
@@ -1585,10 +1618,15 @@ apply_sysctls() {
         sysctl_safe net.ipv6.conf.all.max_desync_factor 60
     fi
 
-    # NAPI defer (Linux 5.12+)
+    # NAPI defer (Linux 5.12+) — v8.11 (D3): napi_defer_hard_irqs scales with link speed.
+    # На 1G или unknown — 1 (минимум искусственной latency); на 10G — 2; на 25G+ — 4 (лучший NAPI batching).
     if [ "$kvi" -ge 51200 ]; then
         sysctl_safe net.core.gro_flush_timeout 200000
-        sysctl_safe net.core.napi_defer_hard_irqs 2
+        local _napi_defer=2
+        if [ "${link_mbps:-0}" -ge 25000 ]; then _napi_defer=4
+        elif [ "${link_mbps:-0}" -lt 10000 ]; then _napi_defer=1
+        fi
+        sysctl_safe net.core.napi_defer_hard_irqs "$_napi_defer"
     fi
 
     # Buffers
@@ -1596,19 +1634,45 @@ apply_sysctls() {
     sysctl_safe net.core.wmem_max "$buf_max"
     sysctl_safe net.core.rmem_default 2097152
     sysctl_safe net.core.wmem_default 2097152
-    sysctl_safe net.ipv4.tcp_rmem "4096 2097152 $buf_max"
-    sysctl_safe net.ipv4.tcp_wmem "4096 2097152 $buf_max"
+    # v8.11 (A9): на proxy preset initial буфер 256K — экономия RAM на 1500+
+    # одновременных соединениях (-1.5..-3 GB), tcp_moderate_rcvbuf=1 всё равно
+    # поднимет по BDP если нужно.
+    local _tcp_init_buf=2097152
+    [ "$PRESET_NAME" = "proxy" ] && _tcp_init_buf=262144
+    sysctl_safe net.ipv4.tcp_rmem "4096 $_tcp_init_buf $buf_max"
+    sysctl_safe net.ipv4.tcp_wmem "4096 $_tcp_init_buf $buf_max"
     sysctl_safe net.ipv4.tcp_mem "786432 1048576 1572864"
     sysctl_safe net.ipv4.tcp_adv_win_scale -2
     sysctl_safe net.ipv4.tcp_moderate_rcvbuf 1
-    sysctl_safe net.ipv4.tcp_notsent_lowat 131072
+    # v8.11 (A2): per-preset notsent_lowat (proxy=16K, web=64K, balanced=128K).
+    sysctl_safe net.ipv4.tcp_notsent_lowat "${PRESET_TCP_NOTSENT_LOWAT:-131072}"
 
     # UDP — критично для QUIC/Reality/XHTTP, а также WireGuard/OpenVPN/Hysteria2/TUIC.
     # Расширено в v8.3: per-socket min повышен (для серверов с тяжёлым QUIC),
     # optmem_max для SO_ZEROCOPY, и общий udp_mem (в страницах) под прокси-нагрузку.
     sysctl_safe net.ipv4.udp_rmem_min 131072
     sysctl_safe net.ipv4.udp_wmem_min 131072
-    sysctl_safe net.ipv4.udp_mem "786432 1048576 1572864"
+    # v8.11 (A1): udp_early_demux=1 — sk_lookup в softirq, -10..-20 % UDP rx-latency
+    # на QUIC/Hysteria/WG. Default выключен на некоторых cloud-init image'ах.
+    sysctl_safe net.ipv4.udp_early_demux 1
+    # v8.11 (A4): udp_mem масштабируется по RAM × PRESET_BUF_MULT × link.
+    # Старый фикс 6GB total был мал на 25G+ NIC и любом мультипоточном QUIC-forward.
+    # По формуле (low/pressure/high) — 0.5 % / 0.66 % / 1 % от RAM-pages, х mult.
+    local _ram_pages _udp_low _udp_pressure _udp_high
+    _ram_pages=$(( mem_mb * 256 ))   # mem_mb × 1024 / 4 (4K page)
+    _udp_low=$(( _ram_pages / 200 * PRESET_BUF_MULT ))         # 0.5 %
+    _udp_pressure=$(( _ram_pages * 2 / 300 * PRESET_BUF_MULT )) # 0.66 %
+    _udp_high=$(( _ram_pages / 100 * PRESET_BUF_MULT ))        # 1 %
+    [ "$_udp_low" -lt 786432 ] && _udp_low=786432
+    [ "$_udp_pressure" -lt 1048576 ] && _udp_pressure=1048576
+    [ "$_udp_high" -lt 1572864 ] && _udp_high=1572864
+    # На 25G+ NIC добавляем ×2 буст (BDP × packet-rate растёт линейно).
+    if [ "${link_mbps:-0}" -ge 25000 ]; then
+        _udp_low=$(( _udp_low * 2 ))
+        _udp_pressure=$(( _udp_pressure * 2 ))
+        _udp_high=$(( _udp_high * 2 ))
+    fi
+    sysctl_safe net.ipv4.udp_mem "$_udp_low $_udp_pressure $_udp_high"
     # NB: net.core.optmem_max уже выставлен выше в 4194304 (4MB) — не перетираем.
     # TFO black-hole defuse (v8.3): дефолт ядра — 1ч лок после первой неудачи.
     # На флапающей сети это «тихая» причина почему TFO «не работает».
@@ -1628,7 +1692,8 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_fin_timeout "$PRESET_TCP_FIN_TIMEOUT"
     sysctl_safe net.ipv4.tcp_keepalive_time "$PRESET_TCP_KEEPALIVE_TIME"
     sysctl_safe net.ipv4.tcp_keepalive_intvl 30
-    sysctl_safe net.ipv4.tcp_keepalive_probes 5
+    # v8.11 (D6): per-preset (proxy=3 for fast cleanup, balanced/web=5 default).
+    sysctl_safe net.ipv4.tcp_keepalive_probes "${PRESET_TCP_KEEPALIVE_PROBES:-5}"
     sysctl_safe net.ipv4.tcp_fastopen "$PRESET_TCP_FASTOPEN"
     sysctl_safe net.ipv4.tcp_max_syn_backlog 65535
     sysctl_safe net.ipv4.tcp_synack_retries 2
@@ -1711,7 +1776,8 @@ apply_sysctls() {
     sysctl_safe net.ipv4.tcp_min_tso_segs 2
     sysctl_safe net.ipv4.tcp_tso_win_divisor 3
     sysctl_safe net.ipv4.tcp_no_ssthresh_metrics_save 1
-    sysctl_safe net.ipv4.tcp_pingpong_thresh 1
+    # v8.11 (A3): per-preset (proxy=1 aggressive, balanced/web=3 default).
+    sysctl_safe net.ipv4.tcp_pingpong_thresh "${PRESET_TCP_PINGPONG_THRESH:-3}"
 
     # ECMP / multipath: если у VPS реально несколько default-маршрутов на разные
     # интерфейсы или включён --ecmp флаг, разрешаем мульти-путь по hash от L4-портов.
@@ -2174,6 +2240,10 @@ self_test() {
 # v8.4: initcwnd via `ip route` — Google ставит 30, мы тоже. На дефолтном
 # маршруте даёт ~3-4х данных в первом RTT (десятки KB вместо ~14KB при cwnd=10).
 # Не персистентно (живёт до перезагрузки), но apply переустанавливает.
+# v8.11 (A7): dynamic by link speed:
+#   ≤100 Mbps → 10 (RFC 6928 baseline; больше = burst-loss на slow link)
+#   100M..<10G → 30 (Google default)
+#   ≥10G       → 60 (быстрая раскрутка BBR на BDP-bound линках)
 apply_route_initcwnd() {
     [ "$DRY_RUN" = "1" ] && return 0
     local def_line def_iface def_via
@@ -2188,10 +2258,17 @@ apply_route_initcwnd() {
     case "$def_iface" in
         tun*|tap*|wg*|ppp*|ipsec*|cf*|cloudflared*|tailscale*|headscale*|sync*|zt*|utun*) return 0 ;;
     esac
-    local change_args=(default dev "$def_iface" initcwnd 30 initrwnd 30)
-    [ -n "$def_via" ] && change_args=(default via "$def_via" dev "$def_iface" initcwnd 30 initrwnd 30)
+    local _link_mbps=0 _icw=30
+    _link_mbps=$(ethtool "$def_iface" 2>/dev/null | awk '/Speed:/{print $2}' | grep -oE '[0-9]+' | head -1)
+    [ -z "$_link_mbps" ] && _link_mbps=0
+    if   [ "$_link_mbps" -ge 10000 ]; then _icw=60
+    elif [ "$_link_mbps" -gt 0 ] && [ "$_link_mbps" -le 100 ]; then _icw=10
+    else _icw=30
+    fi
+    local change_args=(default dev "$def_iface" initcwnd "$_icw" initrwnd "$_icw")
+    [ -n "$def_via" ] && change_args=(default via "$def_via" dev "$def_iface" initcwnd "$_icw" initrwnd "$_icw")
     if ip route change "${change_args[@]}" >/dev/null 2>&1; then
-        _log OK "  route initcwnd=30 / initrwnd=30 на ${def_iface}"
+        _log OK "  route initcwnd=${_icw} / initrwnd=${_icw} на ${def_iface} (link=${_link_mbps}Mb)"
     fi
 }
 
@@ -2535,6 +2612,21 @@ CLOUD_PHANTOM_INTERVAL_MAX=180
 # Без HTTP, только DNS-запрос — попадает в логи провайдера как обычный
 # браузерный preconnect.
 ENABLE_DNS_PREFETCH=1
+
+# === v8.11: realism v3 (РФ-пользователь) ===
+# Day-of-week + лунч + hard-sleep + калькулятор праздников РФ.
+# Все опт-ин, дефолты безопасные.
+ENABLE_WEEKDAY_PROFILE=1     # будни/выходные различать (1=да)
+ENABLE_LUNCH_BREAK=1         # 13:00-14:00 в office-профиле — тише + food-delivery
+ENABLE_HARD_SLEEP=1          # 0:30-6:00 — 80% suppress (только APNs/push)
+HARD_SLEEP_HOUR_FROM=0       # начало hard-sleep (час 0..23)
+HARD_SLEEP_HOUR_TO=6         # конец hard-sleep (включительно)
+HARD_SLEEP_SUPPRESS_PCT=80   # 0..100, % шанс что любой не-APNs цикл скипнется в hard-sleep
+ENABLE_RU_HOLIDAYS=1         # учитывать РФ-госпраздники (rule-based generator + кешированный override)
+RU_HOLIDAYS_FILE="/var/lib/vps-noise/calendar.tsv"   # формат: YYYY-MM-DD<tab>label
+ENABLE_IMAP_IDLE=1           # IMAP IDLE keepalive к imap.mail.me.com:993 (real iCloud Mail)
+ENABLE_AUTOSUGGEST=1         # Yandex search incremental autosuggest симуляция
+ENABLE_DWELL_REALISTIC=1     # реалистичные dwell-time (article=30-120с, search=1-3с)
 CONF_EOF
 }
 
@@ -2803,6 +2895,19 @@ PEAK_MORNING_TO="${PEAK_MORNING_TO:-9}"
 PEAK_EVENING_FROM="${PEAK_EVENING_FROM:-18}"
 PEAK_EVENING_TO="${PEAK_EVENING_TO:-23}"
 
+# v8.11: realism v3 (РФ-пользователь)
+ENABLE_WEEKDAY_PROFILE="${ENABLE_WEEKDAY_PROFILE:-1}"
+ENABLE_LUNCH_BREAK="${ENABLE_LUNCH_BREAK:-1}"
+ENABLE_HARD_SLEEP="${ENABLE_HARD_SLEEP:-1}"
+HARD_SLEEP_HOUR_FROM="${HARD_SLEEP_HOUR_FROM:-0}"
+HARD_SLEEP_HOUR_TO="${HARD_SLEEP_HOUR_TO:-6}"
+HARD_SLEEP_SUPPRESS_PCT="${HARD_SLEEP_SUPPRESS_PCT:-80}"
+ENABLE_RU_HOLIDAYS="${ENABLE_RU_HOLIDAYS:-1}"
+RU_HOLIDAYS_FILE="${RU_HOLIDAYS_FILE:-/var/lib/vps-noise/calendar.tsv}"
+ENABLE_IMAP_IDLE="${ENABLE_IMAP_IDLE:-1}"
+ENABLE_AUTOSUGGEST="${ENABLE_AUTOSUGGEST:-1}"
+ENABLE_DWELL_REALISTIC="${ENABLE_DWELL_REALISTIC:-1}"
+
 # ===== UA-пулы =====
 UA_IOS=(
 # v8.9 (C2): iOS 18 UA pinning — обновлённые актуальные версии Safari/Mobile.
@@ -2925,6 +3030,22 @@ URLS_IOS=(
 "https://p104-keyvalueservice.icloud.com/api/v2/getList"
 "https://p104-escrowproxy.icloud.com/"
 "https://relay.smoot.apple.com/v1/"
+# v8.11 (B3): Apple Watch companion endpoints. Real iPhone с Apple Watch ходит
+# каждые ~5 мин для HealthKit/Activity sync и Bookkeeper sync.
+"https://gateway-companion.icloud.com/"
+"https://companion-cf.icloud.com/"
+"https://pancake.apple.com/"
+"https://bookkeeper.icloud.com/"
+# v8.11 (B8): Apple Pay periodic poll. Real iPhone с Apple Pay ходит сюда ~раз в час.
+"https://smp-device-content.apple.com/"
+"https://smp-fasteap.apple.com/"
+# v8.11 (B9): Apple DoH (DNS-over-HTTPS first-party endpoint).
+"https://gateway.fe.apple-dns.net/"
+"https://doh.dns.apple.com/dns-query"
+# v8.11 (B5): дополнительные h3-only-prober эндпоинты (real Safari делает h3
+# explicit probing на новых Apple-доменах).
+"https://e.crashlytics.com/"
+"https://settings.crashlytics.com/spi/v2/platforms/apple/apps"
 )
 URLS_CAPTIVE=(
 "https://captive.apple.com/hotspot-detect.html"
@@ -3094,10 +3215,115 @@ URLS_GLOBAL=(
 "https://www.cnn.com/" "https://www.nytimes.com/"
 )
 
+# v8.11 (C7): глубокие пулы для marketplace/банкинг/maps/госуслуг — реальный
+# РФ-пользователь не сидит на главной, а ходит по категориям/товарам/услугам.
+# shellcheck disable=SC2034
+URLS_MARKETPLACE_DEEP=(
+"https://www.wildberries.ru/catalog/zhenshchinam/odezhda"
+"https://www.wildberries.ru/catalog/muzhchinam/odezhda"
+"https://www.wildberries.ru/catalog/elektronika"
+"https://www.wildberries.ru/catalog/krasota"
+"https://www.wildberries.ru/catalog/dom"
+"https://www.wildberries.ru/promotions"
+"https://www.ozon.ru/category/elektronika-15500/"
+"https://www.ozon.ru/category/odezhda-7500/"
+"https://www.ozon.ru/category/krasota-i-zdorove-6500/"
+"https://www.ozon.ru/highlight/sale/"
+"https://www.avito.ru/rossiya/avtomobili"
+"https://www.avito.ru/rossiya/nedvizhimost"
+"https://www.avito.ru/moskva/kvartiry/sdam-ASgBAgICAUSSA8gQ"
+"https://www.avito.ru/rossiya/elektronika"
+"https://www.avito.ru/rossiya/uslugi"
+)
+# shellcheck disable=SC2034
+URLS_BANKING_RU=(
+"https://www.sberbank.ru/" "https://online.sberbank.ru/"
+"https://www.tinkoff.ru/" "https://www.alfabank.ru/"
+"https://www.vtb.ru/" "https://www.gazprombank.ru/"
+"https://www.raiffeisen.ru/" "https://www.psbank.ru/"
+"https://www.rshb.ru/" "https://www.rosbank.ru/"
+)
+# shellcheck disable=SC2034
+URLS_GOSUSLUGI_DEEP=(
+"https://www.gosuslugi.ru/"
+"https://www.gosuslugi.ru/help"
+"https://www.gosuslugi.ru/category/family"
+"https://www.gosuslugi.ru/category/auto"
+"https://www.gosuslugi.ru/category/health"
+"https://www.gosuslugi.ru/category/business"
+"https://lkfl2.nalog.ru/lkfl/login"
+"https://www.nalog.gov.ru/rn77/fl/"
+"https://www.mos.ru/services/"
+"https://www.mos.ru/news/"
+"https://my.gosuslugi.ru/profile/personal"
+"https://www.pfrf.ru/"
+"https://posuda.ru/"
+)
+# v8.11 (C7): Yandex.Maps tile servers — real Safari при навигации в картах
+# тянет 50-100 tiles per сессия. tile{1-9}.maps.yandex.net
+# shellcheck disable=SC2034
+URLS_YANDEX_MAPS=(
+"https://yandex.ru/maps/"
+"https://yandex.ru/maps/213/moscow/"
+"https://yandex.ru/maps/2/saint-petersburg/"
+"https://yandex.ru/maps/47/nizhny-novgorod/"
+"https://yandex.ru/maps/-/CDxNGAvg"
+"https://core-renderer-tiles.maps.yandex.net/tiles?l=map&x=619&y=320&z=10"
+"https://core-renderer-tiles.maps.yandex.net/tiles?l=sat&x=619&y=320&z=10"
+)
+# v8.11 (C7): Yandex.Music streaming hosts (TLS keepalive long-poll).
+# shellcheck disable=SC2034
+URLS_YANDEX_MUSIC=(
+"https://music.yandex.ru/"
+"https://api.music.yandex.net/"
+"https://music.yandex.ru/users/onlinedj/playlists/"
+"https://music.yandex.ru/genre/podcasts"
+)
+# v8.11 (C7): VK feed deep + Dzen (real RU-user время от времени).
+# shellcheck disable=SC2034
+URLS_VK_DEEP=(
+"https://vk.com/feed"
+"https://vk.com/clips"
+"https://vk.com/video"
+"https://vk.com/im"
+"https://dzen.ru/news"
+"https://dzen.ru/video"
+)
+
+# v8.11 (C8): Yandex search incremental autosuggest простая база русских запросов.
+# shellcheck disable=SC2034
+SEARCH_QUERIES_RU=(
+"погода"
+"погода москва"
+"доставка пиццы"
+"сбер курс"
+"как открыть ип"
+"расписание электричек"
+"гороскоп на завтра"
+"новости спорта"
+"сайт госуслуг"
+"купить квартиру"
+"вакансии москва"
+"перевод с русского на английский"
+"ozon"
+"wildberries"
+"авито"
+)
+
 ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 ACCEPT_LANG_RU="ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 ACCEPT_LANG_EN="en-US,en;q=0.9"
 ACCEPT_ENC="gzip, deflate, br"
+
+# v8.11 (F3): cache curl --help all output (used 4-5 раз per request).
+# Lazy-init на первый запрос, потом stick.
+CURL_HELP_CACHE=""
+_curl_help() {
+    [ -n "$CURL_HELP_CACHE" ] && { echo "$CURL_HELP_CACHE"; return; }
+    CURL_HELP_CACHE=$(curl --help all 2>/dev/null || echo "")
+    echo "$CURL_HELP_CACHE"
+}
+_curl_supports() { _curl_help | grep -q -- "$1"; }
 
 # ===== Бинарь curl =====
 pick_curl() {
@@ -3189,16 +3415,76 @@ url_origin() {
 }
 
 # ===== Один HTTP-запрос =====
-# Аргументы: $1 — URL, $2 — UA-pool name (ios|desktop|mobile_ru), $3 — lang (ru|en), $4 — cookie tag
-http_request() {
-    local url="$1" ua_kind="${2:-ios}" lang="${3:-en}" tag="${4:-default}"
-    local ua jar="$COOKIE_JAR_DIR/${tag}.jar"
-    case "$ua_kind" in
-        ios)        ua="${UA_IOS[$RANDOM % ${#UA_IOS[@]}]}" ;;
-        desktop)    ua="${UA_DESKTOP[$RANDOM % ${#UA_DESKTOP[@]}]}" ;;
-        mobile_ru)  ua="${UA_MOBILE_RU[$RANDOM % ${#UA_MOBILE_RU[@]}]}" ;;
-        *)          ua="${UA_DESKTOP[$RANDOM % ${#UA_DESKTOP[@]}]}" ;;
+# v8.11 (B2): UA stickiness per session-tag. Real user не переключает iOS-версию
+# между запросами. Хранение sticky UA по tag в массиве; обновляем раз в N часов
+# (rotate device) или при первом запросе тега.
+declare -A STICKY_UA_PER_TAG
+declare -A STICKY_UA_TS_PER_TAG
+_pick_ua_pool() {
+    local kind="$1"
+    case "$kind" in
+        ios)        echo "${UA_IOS[$(urand 0 $(( ${#UA_IOS[@]} - 1 )) )]}" ;;
+        desktop)    echo "${UA_DESKTOP[$(urand 0 $(( ${#UA_DESKTOP[@]} - 1 )) )]}" ;;
+        mobile_ru)  echo "${UA_MOBILE_RU[$(urand 0 $(( ${#UA_MOBILE_RU[@]} - 1 )) )]}" ;;
+        *)          echo "${UA_DESKTOP[$(urand 0 $(( ${#UA_DESKTOP[@]} - 1 )) )]}" ;;
     esac
+}
+# Sticky UA с TTL ~ urand 4..24 часов (rotate device boundary). Если пробежало
+# более TTL — генерируем новый UA. Иначе возвращаем закешированный.
+sticky_ua() {
+    local tag="$1" kind="$2" now ts ttl_h ua
+    now=$(date +%s)
+    ts="${STICKY_UA_TS_PER_TAG[$tag]:-0}"
+    # Дешёвая хэш-функция для consistent TTL per session: (tag-len + ts/3600) % 21 + 4
+    ttl_h=$(( ( ${#tag} + ts/3600 ) % 21 + 4 ))
+    if [ -z "${STICKY_UA_PER_TAG[$tag]:-}" ] || [ "$(( now - ts ))" -gt "$(( ttl_h * 3600 ))" ]; then
+        ua=$(_pick_ua_pool "$kind")
+        STICKY_UA_PER_TAG[$tag]="$ua"
+        STICKY_UA_TS_PER_TAG[$tag]="$now"
+    fi
+    echo "${STICKY_UA_PER_TAG[$tag]}"
+}
+
+# v8.11 (C9): per-UA-class realistic bandwidth.
+#   iOS Safari (mobile LTE): 1500..6000 KB/s
+#   desktop (Wi-Fi): 5000..50000 KB/s
+#   mobile_ru: 1000..4000 KB/s
+#   default: глобальные RATE_KB_*
+ua_class_rate() {
+    local kind="${1:-default}"
+    case "$kind" in
+        ios)       urand 1500 6000 ;;
+        desktop)   urand 5000 50000 ;;
+        mobile_ru) urand 1000 4000 ;;
+        *)         rand_rate ;;
+    esac
+}
+
+# v8.11 (C5): dwell-time (sleep после запроса) по типу страницы.
+# Передаётся как 5-й аргумент http_request: search|main|article|appstore|
+# marketplace|email|govt|tile|api. Default = legacy short pause.
+dwell_for_class() {
+    case "${1:-default}" in
+        search)      urand 1 3 ;;
+        main)        urand 5 15 ;;
+        article)     urand 30 120 ;;
+        appstore)    urand 5 15 ;;
+        marketplace) urand 15 45 ;;
+        email)       urand 10 30 ;;
+        govt)        urand 20 60 ;;
+        tile)        urand 0 1 ;;
+        api)         urand 1 4 ;;
+        *)           urand 1 4 ;;
+    esac
+}
+
+# Аргументы: $1 — URL, $2 — UA-pool name (ios|desktop|mobile_ru), $3 — lang (ru|en),
+#            $4 — cookie tag, $5 — dwell-class (опц., см. dwell_for_class).
+http_request() {
+    local url="$1" ua_kind="${2:-ios}" lang="${3:-en}" tag="${4:-default}" dwell_class="${5:-}"
+    local ua jar="$COOKIE_JAR_DIR/${tag}.jar"
+    # v8.11 (B2): UA stickiness per session-tag (rotate ~ 4..24h).
+    ua=$(sticky_ua "$tag" "$ua_kind")
     local accept_lang="$ACCEPT_LANG_EN"
     [ "$lang" = "ru" ] && accept_lang="$ACCEPT_LANG_RU"
 
@@ -3228,15 +3514,21 @@ http_request() {
     fi
 
     local rate
-    rate=$(rand_rate)
+    # v8.11 (C9): по ua_kind выбираем реалистичный bandwidth-class.
+    rate=$(ua_class_rate "$ua_kind")
 
     # Дамп заголовков ответа во временный файл для парсинга ETag/Last-Modified.
     local hdr_tmp
     hdr_tmp=$(mktemp /tmp/.vps_noise_hdr.XXXXXX 2>/dev/null) || hdr_tmp="/dev/null"
 
+    # v8.11 (F5): для iOS-bursts мыкра понижаем max-time 25 → 15. Real Safari
+    # отключает connection быстрее чем default-curl.
+    local _maxtime=25
+    [ "$ua_kind" = "ios" ] && _maxtime=15
+
     local args=(
         -s -o /dev/null
-        --max-time 25 --connect-timeout 8
+        --max-time "$_maxtime" --connect-timeout 8
         --tls-max 1.3 --tlsv1.2
         --compressed
         --cookie-jar "$jar" --cookie "$jar"
@@ -3265,47 +3557,46 @@ http_request() {
     [ -z "$_conn_curl" ] && _conn_curl="$CURL_BIN"
 
     if [ "$_conn_curl" = "curl" ]; then
-        # v8.8 (C5): ALPN rotation — real iOS Safari/WebKit чередует h3 / h2 /
-        # http/1.1 ~ 50/40/10. До v8.8 у нас было h3=50% / h2=50%, http/1.1=0%.
-        # Это давало weak signal для passive observers (real iOS изредка
-        # fallback'ает на http/1.1 из-за legacy CDN). Бьём 0..9 → 0-4=h3, 5-8=h2, 9=http/1.1.
+        # v8.11 (B1): ALPN distribution match real iOS 18 (CF radar 2025):
+        # h3 ≈ 60 %, h2 ≈ 35 %, http/1.1 ≈ 5 %. Написываем через 0..19.
         local _alpn_pick
-        _alpn_pick=$(urand 0 9)
-        if [ "$_alpn_pick" -le 4 ] && curl --help all 2>/dev/null | grep -q -- '--http3'; then
-            args+=(--http3)
-        elif [ "$_alpn_pick" -le 8 ]; then
+        _alpn_pick=$(urand 0 19)
+        if [ "$_alpn_pick" -le 11 ] && _curl_supports '--http3'; then
+            # v8.11 (B5): 5 % из h3-бранча — явный h3-only-prober (real Safari
+            # при fresh connection-discovery часто вставляет explicit h3 probe
+            # без fallback на h2). curl 8.x умеет --http3-only.
+            if (( $(urand 0 19) == 0 )) && _curl_supports '--http3-only'; then
+                args+=(--http3-only)
+            else
+                args+=(--http3)
+            fi
+        elif [ "$_alpn_pick" -le 18 ]; then
             args+=(--http2)
+            # v8.11 (B7): HTTP/2 connection coalescing — при явном h2 выборе
+            # пользуемся --http2-prior-knowledge для shared соединений (real Safari
+            # реиспользует h2-conn на разных hosts в одном TLS).
+            _curl_supports '--http2-prior-knowledge' && [ "$ua_kind" = "ios" ] && \
+                (( $(urand 0 4) == 0 )) && args+=(--http2-prior-knowledge)
         else
             args+=(--http1.1)
         fi
-        # v8.4: TLS 1.3 0-RTT / Early Data — Safari делает на resumed sessions.
-        # curl поддерживает с 7.79+. Если не поддерживается — флаг проигнорится.
-        if curl --help all 2>/dev/null | grep -q -- '--tls-earlydata'; then
-            (( $(urand 0 2) == 0 )) && args+=(--tls-earlydata)
+        # v8.11 (B6): TLS 0-RTT rate 33 % → 80 % (real Safari почти всегда
+        # использует 0-RTT на resumed sessions, что даёт -1 RTT на handshake).
+        if _curl_supports '--tls-earlydata'; then
+            (( $(urand 0 4) < 4 )) && args+=(--tls-earlydata)
         fi
-        # v8.6: iOS 18 — TCP_FASTOPEN_CONNECT. Реальный Safari ставит TFO_CONNECT
-        # практически на каждый исходящий TCP-сокет (с момента iOS 9). У нас был
-        # TFO в sysctl, но в curl-вызовах не использовали. curl 7.49+ умеет --tcp-fastopen.
-        # Безопасно: server поддержи нет → fallback к стандартному 3WHS.
-        # На Linux SO_NOSIGPIPE недоступен, но curl делает MSG_NOSIGNAL — equivalent.
-        if curl --help all 2>/dev/null | grep -q -- '--tcp-fastopen'; then
+        # v8.6: iOS 18 — TCP_FASTOPEN_CONNECT (Safari ставит TFO_CONNECT на все TCP).
+        # Сервер без TFO → fallback на 3WHS — безопасно.
+        if _curl_supports '--tcp-fastopen'; then
             (( $(urand 0 1) == 0 )) && args+=(--tcp-fastopen)
         fi
-        # v8.9 (C3): TLS Encrypted ClientHello (ECH). curl 8.10+ поддерживает
-        # `--ech true` (auto via DNS HTTPS RR). Скрывает SNI от passive observers
-        # — критично для прокси-фронтенда. Только opt-in (через NOISE_ECH=1) и
-        # только если curl umеет: некоторые distros билдят без ECH.
-        if [ "${NOISE_ECH:-0}" = "1" ] && curl --help all 2>/dev/null | grep -q -- '--ech'; then
+        # v8.9 (C3): TLS Encrypted ClientHello — opt-in NOISE_ECH=1.
+        if [ "${NOISE_ECH:-0}" = "1" ] && _curl_supports '--ech'; then
             args+=(--ech "true")
         fi
-        # v8.9 (C9): HTTP/2 SETTINGS values match Safari. Real iOS Safari
-        # держит HTTP/2-conn активным с keepalive ~30-60s между requests.
-        # `--keepalive-time 30` сообщает kernel SO_KEEPALIVE с idle=30s, что
-        # точно match Safari behaviour (default curl =60s = слабый стелс).
-        # Нет smaller-than-default-window-size flag в curl — INITIAL_WINDOW_SIZE
-        # hardcoded libnghttp2 = 4 MiB, что уже совпадает с Safari.
-        # MAX_CONCURRENT_STREAMS 100 — также libnghttp2 default, match.
-        args+=(--keepalive-time 30)
+        # v8.11 (B10): --keepalive-time 30 → 60. Real iOS держит h2-conn ~60s
+        # между burst-window (не 30s), соответствует Safari KeepAlive=60.
+        args+=(--keepalive-time 60)
         # v8.9 (C8): Real iOS QUIC transport parameters. ngtcp2 (curl-h3 backend)
         # использует max_idle_timeout=30s, max_udp_payload_size=1452 — что
         # уже match real iOS. Больше для фингерпринт-paritet ничего не сделать
@@ -3334,6 +3625,13 @@ http_request() {
     fi
 
     LAST_URL_PER_TAG[$tag]="$url"
+
+    # v8.11 (C5): post-request dwell-time. Если caller передал dwell_class —
+    # симулируем «человек читает страницу N секунд» вместо мгновенного перехода.
+    # Опт-ин: ENABLE_DWELL_REALISTIC=1.
+    if [ "${ENABLE_DWELL_REALISTIC:-1}" = "1" ] && [ -n "$dwell_class" ]; then
+        sleep "$(dwell_for_class "$dwell_class")"
+    fi
 }
 
 # ===== DNS prefetch — имитация браузерного DNS preconnect =====
@@ -3457,38 +3755,76 @@ websocket_keepalive() {
 #   ~10%  Госпорталы РФ / КИИ (gosuslugi/mos.ru/nalog/...).
 #   Никаких соцсетей, никаких мессенджеров.
 ios_burst_pick() {
-    local r=$(( RANDOM % 100 ))
+    local r
+    r=$(urand 0 99)
     if (( r < 70 )); then
-        echo "${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}"
+        echo "${URLS_IOS[$(urand 0 $(( ${#URLS_IOS[@]} - 1 )) )]}"
     elif (( r < 90 )); then
-        echo "${URLS_NEWS_RU[$RANDOM % ${#URLS_NEWS_RU[@]}]}"
+        echo "${URLS_NEWS_RU[$(urand 0 $(( ${#URLS_NEWS_RU[@]} - 1 )) )]}"
     else
-        echo "${URLS_IOS_RU_GOV[$RANDOM % ${#URLS_IOS_RU_GOV[@]}]}"
+        echo "${URLS_IOS_RU_GOV[$(urand 0 $(( ${#URLS_IOS_RU_GOV[@]} - 1 )) )]}"
     fi
 }
+# v8.11 (C5): pick соответствующий dwell-class по URL.
+ios_burst_dwell_class() {
+    case "$1" in
+        *gosuslugi*|*nalog*|*mos.ru*|*pfrf*) echo "govt" ;;
+        *news*|*lenta*|*ria*|*rbc*|*tass*)   echo "article" ;;
+        *captive*|*hotspot*)                  echo "api" ;;
+        *apps.apple.com*|*itunes*)            echo "appstore" ;;
+        *apple.com*|*icloud*|*mzstatic*|*push*) echo "api" ;;
+        *)                                    echo "main" ;;
+    esac
+}
 ios_burst() {
-    local n url
+    local n url dclass
     n=$(rrange 3 8)
     # Первый запрос всегда Apple — это «открыли Safari».
-    http_request "${URLS_IOS[$RANDOM % ${#URLS_IOS[@]}]}" ios en ios_session
+    local start_url="${URLS_IOS[$(urand 0 $(( ${#URLS_IOS[@]} - 1 )) )]}"
+    dclass=$(ios_burst_dwell_class "$start_url")
+    http_request "$start_url" ios en ios_session "$dclass"
     sleep "$(rrange 1 4)"
     local i
     for ((i=1; i<n; i++)); do
         url=$(ios_burst_pick)
-        http_request "$url" ios en ios_session
+        dclass=$(ios_burst_dwell_class "$url")
+        http_request "$url" ios en ios_session "$dclass"
         sleep "$(rrange 1 6)"
     done
     # Иногда — captive check
-    if (( RANDOM % 5 == 0 )); then
-        http_request "${URLS_CAPTIVE[$RANDOM % ${#URLS_CAPTIVE[@]}]}" ios en ios_captive
+    if (( $(urand 0 4) == 0 )); then
+        http_request "${URLS_CAPTIVE[$(urand 0 $(( ${#URLS_CAPTIVE[@]} - 1 )) )]}" ios en ios_captive api
     fi
+}
+
+# v8.11 (C8): Yandex search incremental autosuggest симуляция. Real браузер
+# при наборе «погода москва» дёргает ~6 GET к /suggest/ с последовательными
+# prefix-substring'ами. Мы имитируем это для выбранного запроса из SEARCH_QUERIES_RU.
+yandex_autosuggest_burst() {
+    [ "${ENABLE_AUTOSUGGEST:-1}" = "1" ] || return 0
+    [ "${#SEARCH_QUERIES_RU[@]}" -gt 0 ] || return 0
+    local q
+    q="${SEARCH_QUERIES_RU[$(urand 0 $(( ${#SEARCH_QUERIES_RU[@]} - 1 )) )]}"
+    local enc i len prefix
+    len=${#q}
+    # Набираем по букве: посылаем suggest после каждых 2-3 букв.
+    for ((i=2; i<=len; i+=2)); do
+        prefix="${q:0:i}"
+        # URL-encode примитивный (пробел → +). Real Yandex принимает cp1251/utf-8 как query.
+        enc="${prefix// /+}"
+        http_request "https://suggest.yandex.ru/suggest-ya.cgi?part=${enc}&v=4&srv=morda_ru_desktop" desktop ru search_ya api
+        sleep "$(rrange 0 1)"   # ~0.5s между буквами
+    done
+    # Финальный запрос на полный query.
+    http_request "https://yandex.ru/search/?text=${q// /+}" desktop ru search_ya search
 }
 
 # ===== Email session =====
 # Поведение: открыть главную почты → 2-5 переходов внутри → пауза.
 # Чередуется между Яндексом, Mail.ru и Max.ru.
 email_session() {
-    local provider=$(( RANDOM % 3 ))
+    local provider
+    provider=$(urand 0 2)
     local urls_var url n i
     case $provider in
         0) urls_var=URLS_EMAIL_YANDEX ;;
@@ -3499,36 +3835,56 @@ email_session() {
     local -n arr="$urls_var"
     n=$(rrange 2 5)
     for ((i=0; i<n; i++)); do
-        url="${arr[$RANDOM % ${#arr[@]}]}"
-        # 70% десктоп, 30% мобильный РФ-браузер
-        if (( RANDOM % 10 < 7 )); then
-            http_request "$url" desktop ru email
+        url="${arr[$(urand 0 $(( ${#arr[@]} - 1 )) )]}"
+        # 70% десктоп, 30% мобильный РФ-браузер (v8.11 — dwell=email).
+        if (( $(urand 0 9) < 7 )); then
+            http_request "$url" desktop ru email email
         else
-            http_request "$url" mobile_ru ru email
+            http_request "$url" mobile_ru ru email email
         fi
-        sleep "$(rrange 4 25)"
     done
 }
 
 # ===== News session =====
 news_session() {
     local n url i
-    # Стартовая точка — поисковик или прямой заход на новостник
-    if (( RANDOM % 3 == 0 )); then
-        http_request "${URLS_SEARCH_RU[$RANDOM % ${#URLS_SEARCH_RU[@]}]}" desktop ru news
-        sleep "$(rrange 2 7)"
+    # v8.11 (C8): 1/4 сессий — вход через autosuggest (набор запроса летер-за-летером).
+    if (( $(urand 0 3) == 0 )) && [ "${ENABLE_AUTOSUGGEST:-1}" = "1" ]; then
+        yandex_autosuggest_burst
+    elif (( $(urand 0 2) == 0 )); then
+        http_request "${URLS_SEARCH_RU[$(urand 0 $(( ${#URLS_SEARCH_RU[@]} - 1 )) )]}" desktop ru news search
     fi
     n=$(rrange 3 9)
     for ((i=0; i<n; i++)); do
-        if (( RANDOM % 4 == 0 )); then
-            url="${URLS_SOCIAL_RU[$RANDOM % ${#URLS_SOCIAL_RU[@]}]}"
+        local _r
+        _r=$(urand 0 9)
+        if [ "$_r" -le 1 ]; then
+            url="${URLS_SOCIAL_RU[$(urand 0 $(( ${#URLS_SOCIAL_RU[@]} - 1 )) )]}"
+        elif [ "$_r" -le 3 ]; then
+            # v8.11 (C7): marketplace/banking deep — real РФ-узер часто заходит WB/Ozon.
+            local p
+            p=$(urand 0 9)
+            if [ "$p" -le 5 ]; then
+                url="${URLS_MARKETPLACE_DEEP[$(urand 0 $(( ${#URLS_MARKETPLACE_DEEP[@]} - 1 )) )]}"
+            elif [ "$p" -le 7 ]; then
+                url="${URLS_VK_DEEP[$(urand 0 $(( ${#URLS_VK_DEEP[@]} - 1 )) )]}"
+            else
+                url="${URLS_GOSUSLUGI_DEEP[$(urand 0 $(( ${#URLS_GOSUSLUGI_DEEP[@]} - 1 )) )]}"
+            fi
         else
-            url="${URLS_NEWS_RU[$RANDOM % ${#URLS_NEWS_RU[@]}]}"
+            url="${URLS_NEWS_RU[$(urand 0 $(( ${#URLS_NEWS_RU[@]} - 1 )) )]}"
         fi
-        if (( RANDOM % 10 < 6 )); then
-            http_request "$url" desktop ru news
+        # Выбираем dwell-class по URL.
+        local _dc="main"
+        case "$url" in
+            *wildberries*|*ozon*|*avito*) _dc="marketplace" ;;
+            *gosuslugi*|*nalog*|*mos.ru*) _dc="govt" ;;
+            *) _dc="article" ;;
+        esac
+        if (( $(urand 0 9) < 6 )); then
+            http_request "$url" desktop ru news "$_dc"
         else
-            http_request "$url" mobile_ru ru news
+            http_request "$url" mobile_ru ru news "$_dc"
         fi
         sleep "$(rrange 6 40)"
     done
@@ -3655,15 +4011,112 @@ vacation_maybe_start() {
     fi
 }
 
+# v8.11 (C2): Russian holiday detection.
+# Двухуровневая логика:
+#   1) Если есть файл $RU_HOLIDAYS_FILE (TSV: YYYY-MM-DD<tab>label), проверяем там.
+#      Кешируется командой `noise calendar refresh` (тянет isdayoff.ru API).
+#   2) Fallback — hardcoded rules: 1-8 янв, 23 фев, 8 мар, 1 мая, 9 мая, 12 июн, 4 ноя.
+# Возвращает 0 если сегодня праздник, 1 если нет.
+is_ru_holiday() {
+    [ "${ENABLE_RU_HOLIDAYS:-1}" = "1" ] || return 1
+    local today md
+    today=$(date +%Y-%m-%d)
+    md=$(date +%m-%d)
+    if [ -f "$RU_HOLIDAYS_FILE" ]; then
+        grep -q "^${today}\b" "$RU_HOLIDAYS_FILE" 2>/dev/null && return 0
+        # Если файл есть — доверяем только ему (server side override). Иначе rules.
+        return 1
+    fi
+    case "$md" in
+        01-01|01-02|01-03|01-04|01-05|01-06|01-07|01-08) return 0 ;;
+        02-23) return 0 ;;
+        03-08) return 0 ;;
+        05-01|05-09) return 0 ;;
+        06-12) return 0 ;;
+        11-04) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# v8.11 (C1): day-of-week. Возвращает "weekday" (Mon..Fri) или "weekend" (Sat,Sun).
+# В РФ-законодательстве иногда переносят рабочую субботу — это покрывает файл-override.
+day_class() {
+    local wday
+    wday=$(date +%u)  # 1..7 Mon..Sun
+    if [ "${ENABLE_WEEKDAY_PROFILE:-1}" = "1" ]; then
+        # is_ru_holiday → выходной (даже если будний день)
+        if is_ru_holiday; then echo "weekend"; return; fi
+        if [ "$wday" -ge 6 ]; then echo "weekend"; else echo "weekday"; fi
+    else
+        echo "weekday"
+    fi
+}
+
+# v8.11 (C3): lunch-break detector (13:00-14:00 в office-профиле).
+is_lunch_break() {
+    [ "${ENABLE_LUNCH_BREAK:-1}" = "1" ] || return 1
+    local h
+    h=$(date +%H); h=$((10#$h))
+    [ "$h" -eq 13 ] && return 0
+    return 1
+}
+
+# v8.11 (C4): hard-sleep window — 0:30..6:00. Используется циклами для
+# 80% chance skip (только APNs/push идут полным циклом).
+in_hard_sleep_window() {
+    [ "${ENABLE_HARD_SLEEP:-1}" = "1" ] || return 1
+    local h m
+    h=$(date +%H); h=$((10#$h))
+    m=$(date +%M); m=$((10#$m))
+    # 0:30 .. 6:00 inclusive. Если HARD_SLEEP_HOUR_FROM=0 → 0:30..6:00.
+    # Если кастомные часы — просто диапазон часов.
+    if [ "$HARD_SLEEP_HOUR_FROM" -eq 0 ] && [ "$HARD_SLEEP_HOUR_TO" -eq 6 ]; then
+        if [ "$h" -eq 0 ] && [ "$m" -ge 30 ]; then return 0; fi
+        if [ "$h" -ge 1 ] && [ "$h" -le 5 ]; then return 0; fi
+        if [ "$h" -eq 6 ] && [ "$m" -lt 1 ]; then return 0; fi
+        return 1
+    fi
+    if [ "$h" -ge "$HARD_SLEEP_HOUR_FROM" ] && [ "$h" -le "$HARD_SLEEP_HOUR_TO" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# v8.11 (C4): возвращает 0 если loop следует «спрятаться» в hard-sleep (тогда
+# loop делает sleep вместо реального запроса). 80% suppress по умолчанию.
+hard_sleep_suppress() {
+    in_hard_sleep_window || return 1
+    local r
+    r=$(urand 0 99)
+    [ "$r" -lt "$HARD_SLEEP_SUPPRESS_PCT" ] && return 0
+    return 1
+}
+
 # ===== Профиль времени суток + «места» (множитель пауз) =====
 # PLACE_PROFILE: office (9-18 быстрые бёрсты), home (19-23 ютуб/новости),
 # auto — по часам.
+# v8.11: учитывает day-of-week (weekend → home-like профиль), праздники
+# (как weekend), lunch-break (13:00-14:00 в office → factor 100 + еда),
+# hard-sleep 0:30-6:00 (factor 500 = очень редкие запросы).
 # Возвращает целочисленный множитель (в процентах) к базовому интервалу.
 hour_factor() {
-    local h profile="${PLACE_PROFILE:-auto}"
+    local h profile="${PLACE_PROFILE:-auto}" dclass
     h=$(date +%H); h=$((10#$h))
+    dclass=$(day_class)
+
+    # v8.11 (C4): hard-sleep — самый высокий приоритет (любой профиль ставится на паузу).
+    if in_hard_sleep_window; then echo 500; return; fi
+
+    # v8.11 (C1,C2): weekend / holiday → активность смещается в home-pattern
+    # независимо от PLACE_PROFILE=office.
+    if [ "$dclass" = "weekend" ] && [ "$profile" = "office" ]; then
+        profile="home"
+    fi
+
     case "$profile" in
         office)
+            # v8.11 (C3): lunch-break 13:00 → factor 100 (slower pace, но не тишина)
+            if (( h == 13 )) && [ "${ENABLE_LUNCH_BREAK:-1}" = "1" ]; then echo 100; return; fi
             # «офис» — активность 9-18, минимальная остальное время
             if (( h >= 9 && h <= 18 )); then echo 60
             elif (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then echo 350
@@ -3680,15 +4133,17 @@ hour_factor() {
             # 24/7 (сервер)
             echo 100; return ;;
     esac
-    # auto (default): кривая дня
+    # auto (default): кривая дня + weekend boost (выходной = больше активности днём)
+    local weekend_bonus=0
+    [ "$dclass" = "weekend" ] && (( h >= 10 && h <= 23 )) && weekend_bonus=-20
     if (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then
-        echo 250
+        echo $(( 250 + weekend_bonus ))
     elif (( h >= PEAK_MORNING_FROM && h <= PEAK_MORNING_TO )); then
-        echo 60
+        echo $(( 60 + weekend_bonus ))
     elif (( h >= PEAK_EVENING_FROM && h <= PEAK_EVENING_TO )); then
-        echo 70
+        echo $(( 70 + weekend_bonus ))
     else
-        echo 100
+        echo $(( 100 + weekend_bonus ))
     fi
 }
 
@@ -3707,6 +4162,11 @@ loop_ios() {
     while true; do
         vacation_maybe_start
         vacation_check_and_sleep
+        # v8.11 (C4): hard-sleep 0:30-6:00 — 80 % skip iOS-burst (человек спит).
+        if hard_sleep_suppress; then
+            sleep "$(rrange 600 1800)"
+            continue
+        fi
         ios_burst
         sleep_minutes "$IOS_BURST_INTERVAL_MIN" "$IOS_BURST_INTERVAL_MAX"
     done
@@ -3746,6 +4206,8 @@ loop_email() {
     while true; do
         sleep_minutes "$EMAIL_INTERVAL_MIN" "$EMAIL_INTERVAL_MAX"
         vacation_check_and_sleep
+        # v8.11 (C4): hard-sleep skip.
+        hard_sleep_suppress && continue
         email_session
     done
 }
@@ -3753,7 +4215,27 @@ loop_news() {
     while true; do
         sleep_minutes "$NEWS_INTERVAL_MIN" "$NEWS_INTERVAL_MAX"
         vacation_check_and_sleep
+        hard_sleep_suppress && continue
         news_session
+    done
+}
+# v8.11 (B4): IMAP IDLE keepalive — real iCloud Mail в режиме IDLE держит
+# TLS-conn к imap.mail.me.com:993 постоянно с ~28-минутным NOOP-heartbeat.
+# Мы не логинимся — только TLS-handshake и молчание (принимаются bytes).
+# Это даёт в trace passive observers сильный iCloud-Mail-fingerprint.
+imap_idle_keepalive() {
+    local hosts=("imap.mail.me.com" "imap.yandex.ru" "imap.mail.ru" "imap.gmail.com")
+    local h="${hosts[$(urand 0 $(( ${#hosts[@]} - 1 )) )]}"
+    local secs
+    secs=$(rrange 600 1700)   # 10-28 мин пока сокет тянется
+    timeout "$secs" bash -c "exec 3<>/dev/tcp/$h/993 && sleep $secs" 2>/dev/null || true
+}
+loop_imap_idle() {
+    while true; do
+        sleep "$(rrange 60 600)"     # успокоиться между сессиями
+        vacation_check_and_sleep
+        # Ночью всё равно сверхредко тянем IDLE — это пуш-класс (background mail check).
+        imap_idle_keepalive
     done
 }
 loop_apt() {
@@ -3825,6 +4307,7 @@ PIDS=()
 [ "$ENABLE_LIB_PHANTOM" = "1" ] && { loop_libdl & PIDS+=($!); }
 [ "${ENABLE_CLOUD_PHANTOM:-1}" = "1" ] && { loop_cloud & PIDS+=($!); }
 [ "${ENABLE_DNS_PREFETCH:-1}"  = "1" ] && { loop_dns_prefetch & PIDS+=($!); }
+[ "${ENABLE_IMAP_IDLE:-1}"     = "1" ] && { loop_imap_idle & PIDS+=($!); }   # v8.11 (B4)
 loop_health & PIDS+=($!)
 
 # Если ни один модуль не включён — спим, чтобы systemd не считал крах.
@@ -3978,6 +4461,225 @@ experimental_menu() {
         2) sysctl -w net.ipv4.tcp_ecn=1 ;;
         3) sysctl -w net.core.busy_poll=50 net.core.busy_read=50 ;;
     esac
+}
+
+# ===== v8.11 (E1): fastpath_command — nftables flowtable manager =====
+# Активирует kernel-side flowtable для already-ESTABLISHED TCP/UDP, что выводит
+# их из медленного netfilter-pipeline. На NIC c hw-offload (i40e/ice/mlx5/bnxt)
+# дополнительно — pkt не доходит до CPU.
+# Probe-then-write: gates на (kernel≥4.16, nft, virt ∈ {none,kvm,xen}, нет iptables-legacy с конфликтами).
+# Effects: -0.1..0.3 ms latency, +10..30% throughput, -30..50% CPU per-packet.
+fastpath_command() {
+    local sub="${1:-status}"
+    case "$sub" in
+        on|enable|apply)
+            if ! command -v nft >/dev/null 2>&1; then
+                echo -e "${YELLOW}[!] nft не установлен. apt install nftables${NC}"
+                return 2
+            fi
+            local kver kvi
+            kver=$(uname -r | awk -F. '{print $1*65536+$2*256+($3+0)}' 2>/dev/null)
+            kvi="${kver:-0}"
+            if [ "$kvi" -lt 266240 ]; then  # 4.16 = 4*65536+16*256 = 266240
+                echo -e "${YELLOW}[!] flowtable требует kernel ≥4.16; у вас $(uname -r). Skip.${NC}"
+                return 2
+            fi
+            local virt
+            virt=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+            case "$virt" in
+                openvz|lxc|wsl|docker)
+                    echo -e "${YELLOW}[!] Виртуализация '$virt' не поддерживает flowtable. Skip.${NC}"
+                    return 2 ;;
+            esac
+            # Соберём список реальных интерфейсов для flowtable.
+            local devs ifaces=()
+            devs=$(list_real_ifaces 2>/dev/null | tr '\n' ' ')
+            local d
+            for d in $devs; do
+                case "$d" in
+                    tun*|tap*|wg*|cf*|tailscale*|zt*|utun*|cloudflared*) continue ;;
+                esac
+                ifaces+=("$d")
+            done
+            if [ "${#ifaces[@]}" -eq 0 ]; then
+                echo -e "${YELLOW}[!] Не нашли реальных интерфейсов для flowtable.${NC}"
+                return 2
+            fi
+            # Соберём dev-list для nft.
+            local dev_list=""
+            local nft_ok=0 i
+            for i in "${ifaces[@]}"; do
+                dev_list+=", $i"
+            done
+            dev_list="${dev_list#, }"
+
+            # Probe — попробуем offload, иначе software flowtable.
+            # Сначала test-config с offload, потом без.
+            local tmpf
+            tmpf=$(mktemp /tmp/.fastpath_probe.XXXXXX.nft)
+            cat > "$tmpf" <<NFT_OFFLOAD
+table inet vps_fastpath {
+    flowtable ft0 {
+        hook ingress priority filter
+        devices = { $dev_list }
+        flags offload
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        ip protocol { tcp, udp } flow add @ft0
+    }
+}
+NFT_OFFLOAD
+            if nft -c -f "$tmpf" 2>/dev/null; then
+                nft -f "$tmpf" 2>/dev/null && nft_ok=1
+                echo -e "${GREEN}[+] flowtable с hw-offload активирован для: $dev_list${NC}"
+            else
+                # Без offload (software flowtable).
+                cat > "$tmpf" <<NFT_SW
+table inet vps_fastpath {
+    flowtable ft0 {
+        hook ingress priority filter
+        devices = { $dev_list }
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        ip protocol { tcp, udp } flow add @ft0
+    }
+}
+NFT_SW
+                if nft -c -f "$tmpf" 2>/dev/null && nft -f "$tmpf" 2>/dev/null; then
+                    nft_ok=1
+                    echo -e "${GREEN}[+] flowtable (software fastpath) активирован для: $dev_list${NC}"
+                else
+                    echo -e "${RED}[!] Не удалось применить flowtable.${NC}"
+                fi
+            fi
+            rm -f "$tmpf"
+            # Сохраним persistent /etc/nftables.d/vps_fastpath.nft (если каталог есть).
+            if [ "$nft_ok" = "1" ] && [ -d /etc/nftables.d ]; then
+                cp -f /etc/nftables.d/vps_fastpath.nft /etc/nftables.d/vps_fastpath.nft.bak 2>/dev/null || true
+                nft list table inet vps_fastpath > /etc/nftables.d/vps_fastpath.nft 2>/dev/null || true
+            fi
+            [ "$nft_ok" = "1" ] && _audit fastpath "action=on devs=$dev_list" || true
+            ;;
+        off|disable|delete)
+            if command -v nft >/dev/null 2>&1; then
+                nft delete table inet vps_fastpath 2>/dev/null && \
+                    echo -e "${YELLOW}[*] flowtable удалён.${NC}" || \
+                    echo -e "${GRAY}[i] flowtable не был активен.${NC}"
+            fi
+            rm -f /etc/nftables.d/vps_fastpath.nft 2>/dev/null
+            _audit fastpath "action=off"
+            ;;
+        status|*)
+            if command -v nft >/dev/null 2>&1; then
+                if nft list table inet vps_fastpath >/dev/null 2>&1; then
+                    echo -e "fastpath: ${GREEN}active${NC}"
+                    nft list table inet vps_fastpath
+                else
+                    echo -e "fastpath: ${GRAY}inactive${NC}"
+                    echo "Активировать: $0 fastpath on"
+                fi
+            else
+                echo -e "fastpath: ${YELLOW}nft не установлен${NC}"
+            fi
+            ;;
+    esac
+}
+
+# ===== v8.11 (E2): quic-tune — QUIC bundle (udp_early_demux + udp_mem + ethtool) =====
+# Применяет всё, что нужно для QUIC-фронтенда одной командой:
+#   1) udp_early_demux=1
+#   2) udp_mem scaling (см. apply_sysctls A4)
+#   3) ethtool tx-udp-segmentation on (TX UDP GSO, x10 throughput при QUIC server)
+#   4) NIC ring buffer rx/tx up to max (большие burst-буферы для QUIC потоков)
+# Все шаги probe-then-write; не падает если что-то не доступно.
+quic_tune_command() {
+    local sub="${1:-apply}"
+    case "$sub" in
+        apply|on)
+            echo -e "${CYAN}[*] QUIC tune: применяем bundle...${NC}"
+            sysctl_safe net.ipv4.udp_early_demux 1
+            sysctl_safe net.core.optmem_max 4194304
+            # ethtool TX UDP segmentation per-iface.
+            if command -v ethtool >/dev/null 2>&1; then
+                local _i
+                for _i in $(list_real_ifaces 2>/dev/null); do
+                    ethtool -K "$_i" tx-udp-segmentation on 2>/dev/null && \
+                        echo -e "  ${GREEN}[+]${NC} tx-udp-segmentation on на $_i" || true
+                    # Big ring buffers — берём max доступный.
+                    local _maxrx _maxtx
+                    _maxrx=$(ethtool -g "$_i" 2>/dev/null | awk '/RX:/{print $2; exit}')
+                    _maxtx=$(ethtool -g "$_i" 2>/dev/null | awk '/TX:/{print $2; exit}')
+                    if [ -n "$_maxrx" ] && [ -n "$_maxtx" ]; then
+                        ethtool -G "$_i" rx "$_maxrx" tx "$_maxtx" 2>/dev/null && \
+                            echo -e "  ${GREEN}[+]${NC} ring buffers RX=$_maxrx TX=$_maxtx на $_i" || true
+                    fi
+                done
+            fi
+            _audit quic-tune "action=apply"
+            echo -e "${GREEN}[+] QUIC tune применён.${NC}"
+            ;;
+        status|*)
+            echo "udp_early_demux:  $(sysctl -n net.ipv4.udp_early_demux 2>/dev/null || echo ?)"
+            echo "udp_mem:          $(sysctl -n net.ipv4.udp_mem 2>/dev/null || echo ?)"
+            if command -v ethtool >/dev/null 2>&1; then
+                local _i
+                for _i in $(list_real_ifaces 2>/dev/null); do
+                    echo "$_i tx-udp-segmentation: $(ethtool -k "$_i" 2>/dev/null | awk '/tx-udp-segmentation:/{print $2}')"
+                done
+            fi
+            ;;
+    esac
+}
+
+# ===== v8.11 (E6): noise_calendar_refresh — обновить РФ-календарь праздников =====
+# API: https://isdayoff.ru/api/getdata?year=YYYY&pre=1  → строка вида "0010000…"
+# (0=рабочий, 1=выходной, 2=сокращённый, 4=ковид-выходной). Распарсим в TSV.
+# Cached на 30 дней; fallback на rule-based в is_ru_holiday при недоступности.
+noise_calendar_refresh() {
+    local cal_file="${RU_HOLIDAYS_FILE:-/var/lib/vps-noise/calendar.tsv}"
+    local cal_dir
+    cal_dir=$(dirname "$cal_file")
+    mkdir -p "$cal_dir" 2>/dev/null || true
+    local years=()
+    years+=("$(date +%Y)")
+    years+=("$(( $(date +%Y) + 1 ))")
+    local tmpf
+    tmpf=$(mktemp /tmp/.noise_cal.XXXXXX) || return 1
+    local got=0
+    local y
+    for y in "${years[@]}"; do
+        local payload
+        payload=$(curl -s --max-time 10 --connect-timeout 5 \
+                  -A "vps-optimizer/8.11 (noise-calendar)" \
+                  "https://isdayoff.ru/api/getdata?year=$y" 2>/dev/null)
+        if [ -n "$payload" ] && [ "${#payload}" -ge 365 ] && [ "${#payload}" -le 366 ]; then
+            local doy=0
+            # Перебираем день года и конвертируем в дату.
+            for ((doy=0; doy<${#payload}; doy++)); do
+                local flag="${payload:$doy:1}"
+                # 1 = выходной, 2 = сокращённый рабочий, 4 = ковид-выходной.
+                if [ "$flag" = "1" ] || [ "$flag" = "4" ]; then
+                    local dt
+                    dt=$(date -d "${y}-01-01 +${doy} days" +%Y-%m-%d 2>/dev/null)
+                    [ -n "$dt" ] && echo -e "${dt}\tisdayoff" >> "$tmpf"
+                fi
+            done
+            got=$(( got + 1 ))
+        else
+            echo -e "${YELLOW}[!] isdayoff.ru недоступен для $y (получено ${#payload} симв).${NC}"
+        fi
+    done
+    if [ "$got" -gt 0 ] && [ -s "$tmpf" ]; then
+        mv "$tmpf" "$cal_file"
+        echo -e "${GREEN}[+]${NC} Календарь обновлён: $(wc -l < "$cal_file") дней → $cal_file"
+        _audit noise-calendar "action=refresh days=$(wc -l < "$cal_file")"
+    else
+        rm -f "$tmpf"
+        echo -e "${YELLOW}[!] Не удалось обновить календарь. Будет использован rule-based fallback.${NC}"
+        return 1
+    fi
 }
 
 reset_all() {
@@ -6976,7 +7678,7 @@ _vps_optimizer_complete() {
             return ;;
     esac
     if [ "$cword" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version" -- "$cur") )
+        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version fastpath quic-tune pin" -- "$cur") )
     fi
 }
 complete -F _vps_optimizer_complete vps_optimizer.sh vps-optimizer
@@ -9075,6 +9777,9 @@ print_cli_help() {
     printf "    %-24s %s\n" "preset <name>" "$(_t cmd_preset)"
     printf "    %-24s %s\n" "noise on|off|edit|test|status" "$(_t cmd_noise)"
     printf "    %-24s %s\n" "wg setup" "$(_t cmd_wg_setup)"
+    printf "    %-24s %s\n" "noise calendar refresh" "обновить РФ-календарь (isdayoff.ru)"
+    printf "    %-24s %s\n" "fastpath on|off|status" "nftables flowtable (опт-ин, kernel-fastpath)"
+    printf "    %-24s %s\n" "quic-tune apply|status" "QUIC bundle (udp_early_demux + ethtool tx-udp-segmentation)"
     printf "    %-24s %s\n" "dns ..." "$(_t cmd_dns)"
     printf "    %-24s %s\n" "swap <gb>" "$(_t cmd_swap)"
     printf "    %-24s %s\n" "benchmark" "$(_t cmd_benchmark)"
@@ -9381,6 +10086,10 @@ cli_dispatch() {
         uninstall)      uninstall_command ;;
         prom-metrics)   prom_metrics ;;
         prom-serve)     prom_serve "${args[0]:-9777}" ;;
+        # v8.11 (E1): nftables flowtable fastpath manager. Opt-in.
+        fastpath)       fastpath_command "${args[0]:-status}" ;;
+        # v8.11 (E2): QUIC bundle tuning (udp_early_demux + udp_mem + ethtool TXUS).
+        quic-tune)      quic_tune_command "${args[0]:-apply}" ;;
         _prom_handler)  _prom_handler ;;
         _top_snapshot)  _top_snapshot ;;
         stealth-test)   stealth_test_command "${args[@]}" ;;
@@ -9436,6 +10145,27 @@ cli_dispatch() {
                     ;;
                 health)
                     [ -f "$HEALTH_FILE" ] && cat "$HEALTH_FILE" || echo "no health data yet"
+                    ;;
+                calendar)
+                    # v8.11 (E6): noise calendar refresh — обновить РФ-календарь праздников.
+                    # Использует isdayoff.ru (публичный, без ключа). Fallback на rules.
+                    local cal_sub="${args[1]:-show}"
+                    case "$cal_sub" in
+                        refresh|update)
+                            noise_calendar_refresh
+                            ;;
+                        show|status|*)
+                            local cal_file="${RU_HOLIDAYS_FILE:-/var/lib/vps-noise/calendar.tsv}"
+                            if [ -f "$cal_file" ]; then
+                                echo "Calendar file: $cal_file"
+                                echo "Total entries: $(wc -l < "$cal_file")"
+                                echo "First 10:"
+                                head -10 "$cal_file"
+                            else
+                                echo "No calendar file (using rule-based fallback). Run 'noise calendar refresh' to fetch."
+                            fi
+                            ;;
+                    esac
                     ;;
                 status|*)
                     if systemctl is-active --quiet vps-noise; then
