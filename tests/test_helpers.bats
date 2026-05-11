@@ -1113,8 +1113,8 @@ setup() {
 
 # ===== v8.12 (X1-X10) tests =====
 
-@test "v8.12: version bumped to 8.12" {
-    run grep 'SCRIPT_VERSION="8.12"' "$SCRIPT"
+@test "v8.12: version is at least 8.12" {
+    run grep -E 'SCRIPT_VERSION="8\.(1[2-9]|[2-9][0-9])"' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
 
@@ -1235,4 +1235,217 @@ setup() {
     run "$SCRIPT" masque help
     [ "$status" -eq 0 ]
     echo "$output" | grep -q 'snippet-singbox'
+}
+
+# ============================================================
+#  v8.13 — Y-pack: idealnyy RU-user profile (Y1-Y21)
+# ============================================================
+
+@test "v8.13: version bumped to 8.13" {
+    run grep -E '^SCRIPT_VERSION="8\.13"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y1: per-preset tcp_rto_min_us" {
+    run grep 'PRESET_TCP_RTO_MIN_US' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'PRESET_TCP_RTO_MIN_US=20000' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y2: tcp_user_timeout per-preset" {
+    run grep 'PRESET_TCP_USER_TIMEOUT_MS' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'net.ipv4.tcp_user_timeout' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y7: gro_normal_batch gated kernel 6.6+" {
+    run grep 'gro_normal_batch' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'kvi.*-ge.*60600' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y9: HTTP/3 priority frames dynamic urgency" {
+    run grep 'Priority: \$_prio' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E 'u=4|u=5|u=2, i' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y10: Apple FindMy/HomeKit/iCloud Time (no Vision Pro)" {
+    run grep 'URLS_APPLE_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'gateway.icloud.com/findmy' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -i 'visionos' "$SCRIPT"
+    [ "$status" -ne 0 ]
+}
+
+@test "v8.13 Y11-MAX: Max messenger pool exists" {
+    run grep 'URLS_MAX=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'web.max.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'api.max.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'UA_MAX_APP=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_max\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ENABLE_MAX_MESSENGER' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y12: banking deep-flows pool" {
+    run grep 'URLS_BANKING_DEEP=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'online.sberbank.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'online.vtb.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'alfabank.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_banking\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y13: per-timezone helper exists" {
+    run grep '_local_hour_ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'PERFECT_RU_TZ_OFFSET' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y14: profile fade-in implemented" {
+    run grep '^profile_fade_in_prep\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -- '--smooth' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y16: RuStore/AppGallery pool" {
+    run grep 'URLS_APP_STORE_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'rustore.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'appgallery' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_appstore\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y17: SBP/MirPay payment endpoints" {
+    run grep 'URLS_PAYMENT_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'sbp.nspk.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'mirpay' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_payment\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y18: RU streaming pool (no Netflix)" {
+    run grep 'URLS_STREAMING_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'kion.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'wink.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'kinopoisk.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'okko.tv' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'premier.one' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_streaming\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y19: RU music pool" {
+    run grep 'URLS_MUSIC_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'zvuk.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'music.vk.com' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_music\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y20: RU travel pool" {
+    run grep 'URLS_TRAVEL_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'tutu.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'aviasales' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'russpass.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'rzd.ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_travel\(\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y21: Apple ID RU region" {
+    run grep 'apps.apple.com/ru' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13: PERFECT_RU_USER toggle" {
+    run grep 'ENABLE_PERFECT_RU_USER' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y5: l4s opt-in command" {
+    run grep '^l4s_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+l4s\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y6: dscp opt-in command" {
+    run grep '^dscp_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+dscp\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13 Y8: ech opt-in command" {
+    run grep '^ech_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+ech\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.13: l4s status read-only without root" {
+    run "$SCRIPT" l4s help
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'L4S'
+}
+
+@test "v8.13: dscp status read-only without root" {
+    run "$SCRIPT" dscp help
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'DSCP'
+}
+
+@test "v8.13: ech status read-only without root" {
+    run "$SCRIPT" ech help
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'ECH'
+}
+
+@test "v8.13: no Telegram user-trace (only webhook for notifications)" {
+    # Telegram-as-noise-source endpoints НЕ должны быть в pools.
+    run grep -E '"https://web\.telegram\.org|"https://t\.me' "$SCRIPT"
+    [ "$status" -ne 0 ]
+}
+
+@test "v8.13: no Vision Pro / Apple AI endpoints" {
+    run grep -i 'visionos\.apple\.com\|model-server\.apple\.com\|apple-ai' "$SCRIPT"
+    [ "$status" -ne 0 ]
 }

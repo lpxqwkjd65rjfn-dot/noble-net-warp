@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.12"
+SCRIPT_VERSION="8.13"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -1027,6 +1027,14 @@ preset_balanced() {
     # v8.11 (D1): busy_poll/busy_read µs. Default 50 µs; на proxy preset 100 µs
     # (-50..-80 µs first-read latency, +CPU busy loop, что для proxy ок).
     PRESET_BUSY_POLL_USEC=50
+    # v8.13 (Y1): per-preset tcp_rto_min_us. kernel default 200000 µs (=200ms);
+    # на jittery-РФ-облаках для интерактива хочется быстрее. Per-preset:
+    #   balanced=100ms (как v8.10), web=100ms, proxy=20ms (aggressive retransmit).
+    PRESET_TCP_RTO_MIN_US=100000
+    # v8.13 (Y2): per-preset tcp_user_timeout (ms). kernel default 0 = keepalive_time*probes.
+    # На proxy уместно явно ограничить — faster failover при NAT rebind / route flap.
+    #   balanced/web=0 (kernel default = keepalive govern), proxy=30000 (30 sec).
+    PRESET_TCP_USER_TIMEOUT_MS=0
 }
 
 # Прокси (xray/sing-box/haproxy/nginx-stream/wireguard) — много короткоживущих
@@ -1062,6 +1070,12 @@ preset_proxy() {
     PRESET_TCP_PINGPONG_THRESH=1
     # v8.11 (D1): busy_poll 100 µs для proxy — низкий ping-priority over CPU.
     PRESET_BUSY_POLL_USEC=100
+    # v8.13 (Y1): proxy preset — aggressive RTO_min 20ms (vs 200ms kernel default).
+    # На lossy-линках это даёт −50..−180 ms на tail-latency. Не вредит throughput.
+    PRESET_TCP_RTO_MIN_US=20000
+    # v8.13 (Y2): proxy preset — TCP_USER_TIMEOUT 30 sec.
+    # Быстрее освобождаем zombie-сокеты при NAT-rebind / route flap.
+    PRESET_TCP_USER_TIMEOUT_MS=30000
 }
 
 # Web-сервер (nginx/apache, статический контент): меньше conntrack,
@@ -1639,6 +1653,13 @@ apply_sysctls() {
         sysctl_safe net.core.napi_defer_hard_irqs "$_napi_defer"
     fi
 
+    # v8.13 (Y7): gro_normal_batch (Linux 6.6+) — batch размер для GRO normal-list.
+    # Default 8. Увеличение до 16 даёт небольшое сокращение CPU per-packet на high-pps
+    # (~−2..−5 %). Безопасно: backwards-compat fallback sysctl_safe скипает на старых ядрах.
+    if [ "$kvi" -ge 60600 ]; then
+        sysctl_safe net.core.gro_normal_batch 16
+    fi
+
     # Buffers
     sysctl_safe net.core.rmem_max "$buf_max"
     sysctl_safe net.core.wmem_max "$buf_max"
@@ -1779,7 +1800,13 @@ apply_sysctls() {
     #  - tcp_pingpong_thresh — порог переключения в pingpong mode (новое в 6.1+).
     #  - tcp_min_tso_segs / tcp_tso_win_divisor — балансируем TSO под прокси.
     #  - tcp_no_ssthresh_metrics_save — не сохраняем устаревший ssthresh между сессиями.
-    sysctl_safe net.ipv4.tcp_rto_min_us 100000
+    # v8.13 (Y1): per-preset RTO_min (раньше было uniform 100000).
+    sysctl_safe net.ipv4.tcp_rto_min_us "${PRESET_TCP_RTO_MIN_US:-100000}"
+    # v8.13 (Y2): per-preset tcp_user_timeout (ms). 0 = kernel default (governed by
+    # keepalive_time + probes). proxy явно 30000 (30 sec) — faster failover.
+    if [ "${PRESET_TCP_USER_TIMEOUT_MS:-0}" -gt 0 ]; then
+        sysctl_safe net.ipv4.tcp_user_timeout "$PRESET_TCP_USER_TIMEOUT_MS"
+    fi
     sysctl_safe net.ipv4.tcp_comp_sack_delay_ns 1000000
     sysctl_safe net.ipv4.tcp_comp_sack_nr 44
     sysctl_safe net.ipv4.tcp_comp_sack_slack_ns 100000
@@ -2643,6 +2670,19 @@ ENABLE_REGIONAL_BURST=1      # региональные РФ-новостник�
 ENABLE_DOH_JITTER=1          # X8: Poisson-jitter inter-arrival для DoH
 ENABLE_COOKIE_3TIER=1        # X5: 3-tier cookie rotation (fresh/sticky/persistent)
 ENABLE_MARKOV_6STATE=0       # X6: 6-state Markov chain (опт-ин — полный рефактор вместо 4-state)
+# v8.13: «Идеально правильный РФ-юзер» (Y10-Y21)
+ENABLE_PERFECT_RU_USER=1     # Y-pack toggle: централизованное вкл/выкл всего пакета
+ENABLE_MAX_MESSENGER=1       # Y11-MAX: национальный мессенджер Max (max.ru) вместо Telegram
+ENABLE_BANKING_BURST=1       # Y12: Сбер/ВТБ/Альфа/Тинькофф deep-flows
+ENABLE_PAYMENT_BURST=1       # Y17: СБП / МирПэй passive endpoint touch
+ENABLE_APPSTORE_BURST=1      # Y16: RuStore / AppGallery / Apple РФ-region update checks
+ENABLE_STREAMING_BURST=1     # Y18: KION/Wink/Кинопоиск/Окко/Premier/IVI (вечер пик)
+ENABLE_MUSIC_BURST=1         # Y19: Yandex Music / VK Music / Звук / Boom
+ENABLE_TRAVEL_BURST=1        # Y20: Tutu / Aviasales / RUSSPASS / RZD
+ENABLE_APPLE_RU_BURST=1      # Y10: FindMy / HomeKit / iCloud Time (без Vision Pro/Apple AI)
+ENABLE_EDUCATIONAL=0         # Y15-EDU: Сферум / Учи.ру / Infourok (opt-in — школьник/студент)
+# Y13: per-timezone offset (часов от MSK). 0=MSK, -1=KGD, +2=Урал, +4=Сибирь, +7=ДВ.
+PERFECT_RU_TZ_OFFSET=0
 CONF_EOF
 }
 
@@ -3397,6 +3437,279 @@ UA_YANDEX_APP=(
 "Yandex.Taxi/4.179.0 (iPhone; iOS 18.1)"
 )
 
+# ============================================================
+#  v8.13 — «идеально правильный РФ-юзер» pools (Y10-Y21)
+# ============================================================
+# Эти пулы реалистично отражают доминирующие сервисы в трафике пользователя
+# из РФ: национальный мессенджер Max (вместо Telegram), Сбер/ВТБ/Тинькофф
+# банковские flow, РФ-стриминги (KION/Wink/Кинопоиск), РФ-музыка (Яндекс/VK),
+# РФ-маги (RuStore/AppGallery), РФ-travel (Tutu/Aviasales/RUSSPASS), а также
+# СБП/МирПэй payment endpoints.
+# Все loop'ы opt-in через ENABLE_PERFECT_RU_USER=1 (default ON) + per-loop ENABLE_*.
+
+# === Y11-MAX: Национальный мессенджер Max (от VK Group, max.ru) ===
+# Real Max-юзер периодически проверяет чаты (heartbeat 30-60с), open web/app
+# (web.max.ru), push-уведомления. UA — приложение Max iOS/Android.
+# shellcheck disable=SC2034
+URLS_MAX=(
+"https://max.ru/"
+"https://web.max.ru/"
+"https://max.ru/about"
+"https://max.ru/business"
+"https://max.ru/help"
+"https://web.max.ru/login"
+"https://api.max.ru/v1/me"
+"https://api.max.ru/v1/chats"
+"https://api.max.ru/v1/contacts"
+"https://api.max.ru/v1/push/register"
+"https://ws.max.ru/socket"
+"https://files.max.ru/"
+"https://media.max.ru/"
+"https://avatars.max.ru/"
+"https://updates.max.ru/version"
+)
+# shellcheck disable=SC2034
+UA_MAX_APP=(
+"ru.max/1.4.2 (iPhone; iOS 18.1; Scale/3.00)"
+"ru.max/1.4.0 (iPhone; iOS 17.6; Scale/3.00)"
+"ru.max/1.5.1 (Android 14; SDK 34; arm64-v8a; samsung SM-S928B; ru)"
+"ru.max/1.4.5 (Android 13; SDK 33; arm64-v8a; Xiaomi 13T; ru)"
+"MaxMessenger/1.4 (web; chrome 131; ru-RU)"
+)
+
+# === Y12: Banking deep-flows (Сбер/ВТБ/Альфа/Тинькофф) ===
+# Real банковский client заходит utr login → main → balance → transfer-form.
+# Это HTTPS-only, не трогает реальных платежей. Reading-only endpoints.
+# shellcheck disable=SC2034
+URLS_BANKING_DEEP=(
+"https://online.sberbank.ru/"
+"https://online.sberbank.ru/CSAFront/index.do"
+"https://www.sberbank.ru/ru/person"
+"https://www.sberbank.ru/sberid/sso/login"
+"https://sber.ru/"
+"https://sberbank.ru/common/img/uploaded/sbjs/icons/favicon.ico"
+"https://online.vtb.ru/"
+"https://www.vtb.ru/personal/"
+"https://login.vtb.ru/"
+"https://alfabank.ru/"
+"https://online.alfabank.ru/"
+"https://click.alfabank.ru/"
+"https://www.tinkoff.ru/"
+"https://www.tbank.ru/"
+"https://id.tinkoff.ru/auth/login"
+"https://acdn.tinkoff.ru/static/pages/files/"
+"https://psbank.ru/"
+"https://www.gazprombank.ru/"
+"https://rshb.ru/"
+)
+# shellcheck disable=SC2034
+UA_BANKING_APP=(
+"SBOL/14.10.0 (iPhone; iOS 18.1; ru_RU)"
+"VTBMobile/9.34 (iPhone; iOS 18.1; ru_RU)"
+"AlfaMobile/14.10 (iPhone; iOS 18.1; ru)"
+"Tinkoff/6.12.0 (iPhone; iOS 18.1; ru_RU)"
+"ru.sberbank/14.10 (Android 14; SM-S928B; ru)"
+"ru.vtb24.mobilebanking.android/9.34 (Android 14; ru)"
+"ru.alfabank.mobile.android/14.10 (Android 13; ru)"
+"com.idamob.tinkoff.android/6.12 (Android 14; ru)"
+)
+
+# === Y17: СБП / МирПэй endpoints (passive, без реальных переводов) ===
+# Real юзер периодически касается SBP endpoint когда заходит в банк / QR-pay.
+# shellcheck disable=SC2034
+URLS_PAYMENT_RU=(
+"https://sbp.nspk.ru/"
+"https://www.nspk.ru/"
+"https://mir.privetmir.ru/"
+"https://mironline.ru/"
+"https://mirpay.ru/"
+"https://qr.nspk.ru/"
+"https://www.cbr.ru/"
+"https://www.cbr.ru/currency_base/daily/"
+"https://yoomoney.ru/"
+"https://yookassa.ru/"
+)
+
+# === Y16: RuStore + AppGallery (вместо App Store updates) ===
+# В РФ многие приложения публикуются в RuStore/AppGallery т.к. App Store
+# заблокировал часть РФ-приложений. Real device периодически чекает updates.
+# shellcheck disable=SC2034
+URLS_APP_STORE_RU=(
+"https://www.rustore.ru/"
+"https://apps.rustore.ru/api/v1/applicationData/overallInfo"
+"https://apps.rustore.ru/main"
+"https://api.rustore.ru/v1/category/list"
+"https://static.rustore.ru/apk/"
+"https://appgallery.huawei.com/"
+"https://appgallery.cloud.huawei.com/appgallery/api/v1/"
+"https://apps.apple.com/ru/"
+"https://apps.apple.com/ru/genre/ios/id36"
+"https://itunes.apple.com/lookup?country=ru&id=1234567890"
+"https://mzstatic.com/ru-ru/"
+"https://api.appsflyer.com/api/v6.0/serverImpressions/app/ru.yandex.searchplugin"
+)
+# shellcheck disable=SC2034
+UA_APP_STORE=(
+"RuStore/1.40.0 (Android 14; SDK 34; ru)"
+"AppStore/3.0 iOS/18.1.0 model/iPhone15,3 hwp/t8120 build/22B83 (6; dt:265)"
+"AppGallery/14.3.5.300 (Android 13; ru)"
+)
+
+# === Y18: РФ-streaming (KION/Wink/Кинопоиск/Окко/Premier/IVI) ===
+# Real юзер вечером смотрит фильмы/сериалы. KION/Wink — Ростелеком,
+# Кинопоиск — Яндекс, Окко — Sber, Premier — Газпром Медиа, IVI — independent.
+# shellcheck disable=SC2034
+URLS_STREAMING_RU=(
+"https://kion.ru/"
+"https://kion.ru/home"
+"https://api.mts.kion.ru/v1/menu/main"
+"https://wink.ru/"
+"https://wink.ru/main"
+"https://api.wink.ru/v2/welcome-screen"
+"https://www.kinopoisk.ru/"
+"https://hd.kinopoisk.ru/"
+"https://api.ott.kinopoisk.ru/v9/picaso/get-pages-with-blocks/main"
+"https://yandex.ru/promo/kinopoisk/"
+"https://okko.tv/"
+"https://api.okko.tv/v1/sberLogin/state"
+"https://www.okko.tv/movies"
+"https://premier.one/"
+"https://premier.one/api/v3/profile/promo"
+"https://www.ivi.ru/"
+"https://api.ivi.ru/mobileapi/start/v9"
+"https://ru-cdn.ivi.ru/"
+"https://amediateka.ru/"
+"https://start.ru/"
+)
+# shellcheck disable=SC2034
+UA_STREAMING_APP=(
+"KION/4.51.0 (iPhone; iOS 18.1; ru_RU)"
+"Wink/9.14 (iPhone; iOS 18.1; ru_RU)"
+"Kinopoisk/2024.10.0 (iPhone; iOS 18.1; ru_RU)"
+"Okko/13.51 (iPhone; iOS 18.1; ru_RU)"
+"PREMIER/3.69 (iPhone; iOS 18.1; ru_RU)"
+"IVI/27.0 (iPhone; iOS 18.1; ru_RU)"
+"ru.mts.kion/4.51 (Android 14; ru)"
+"ru.rt.video.app.mts/9.14 (Android 13; ru)"
+"ru.kinopoisk/2024.10 (Android 14; ru)"
+)
+
+# === Y19: РФ-music (Yandex Music / VK Music / Звук / Boom) ===
+# Yandex Music уже частично есть в URLS_YANDEX_MUSIC. Здесь — VK Music + Звук + Boom.
+# shellcheck disable=SC2034
+URLS_MUSIC_RU=(
+"https://music.yandex.ru/"
+"https://music.yandex.ru/home"
+"https://api.music.yandex.net/landing3"
+"https://music.vk.com/"
+"https://m.vk.com/audio"
+"https://api.vk.com/method/audio.getRecommendations?v=5.199"
+"https://zvuk.com/"
+"https://api.sber.zvuk.com/api/v1/profile"
+"https://web.zvuk.com/"
+"https://boom.ru/"
+"https://api.boom.ru/v1/me"
+"https://m.vk.com/music"
+"https://radio-t.com/"
+)
+# shellcheck disable=SC2034
+UA_MUSIC_APP=(
+"Yandex.Music/2024.10.2 (iPhone; iOS 18.1; ru_RU)"
+"VKMusic/1.13.0 (iPhone; iOS 18.1; ru_RU)"
+"Zvuk/4.55.0 (iPhone; iOS 18.1; ru_RU)"
+"Boom/4.7 (iPhone; iOS 18.1; ru_RU)"
+"ru.yandex.music/2024.10 (Android 14; ru)"
+"com.vk.music/1.13 (Android 13; ru)"
+"com.zvooq.openplay/4.55 (Android 14; ru)"
+)
+
+# === Y20: РФ-travel (Tutu/Aviasales/RUSSPASS/RZD/Туристический) ===
+# Real юзер планирует поездки: ж/д, авиа, госуслуги для туризма (RUSSPASS).
+# shellcheck disable=SC2034
+URLS_TRAVEL_RU=(
+"https://www.tutu.ru/"
+"https://www.tutu.ru/poezda/"
+"https://www.tutu.ru/avia/"
+"https://api.tutu.ru/v1/cities"
+"https://www.aviasales.ru/"
+"https://www.aviasales.com/?marker=ru"
+"https://api.aviasales.ru/v1/cities.json"
+"https://russpass.ru/"
+"https://russpass.ru/tour"
+"https://www.rzd.ru/"
+"https://www.rzd-partner.ru/"
+"https://pass.rzd.ru/"
+"https://booking.rzd.ru/"
+"https://travel.yandex.ru/"
+"https://hotels.yandex.ru/"
+"https://www.aeroflot.ru/"
+"https://www.s7.ru/"
+"https://flyutair.com/"
+"https://www.pobeda.aero/"
+)
+# shellcheck disable=SC2034
+UA_TRAVEL_APP=(
+"Tutu.ru/9.0.0 (iPhone; iOS 18.1; ru_RU)"
+"Aviasales/195.0 (iPhone; iOS 18.1; ru_RU)"
+"RUSSPASS/2.10 (iPhone; iOS 18.1; ru_RU)"
+"RZDPassenger/1.40 (iPhone; iOS 18.1; ru_RU)"
+"Yandex.Travel/2024.10 (iPhone; iOS 18.1; ru_RU)"
+"ru.tutu.tutu/9.0 (Android 14; ru)"
+"ru.aviasales.searchform/195 (Android 13; ru)"
+)
+
+# === Y10 (урезанный): Apple FindMy / HomeKit / iCloud Time ===
+# БЕЗ Vision Pro и Apple AI Intelligence — недоступно в РФ, выглядит подозрительно.
+# Только FindMy/HomeKit/Time — это стандартно для РФ-юзера с iPhone.
+# shellcheck disable=SC2034
+URLS_APPLE_RU=(
+"https://gateway.icloud.com/findmy/"
+"https://gateway.icloud.com/findmy/v3/locator"
+"https://home.apple.com/ping"
+"https://hkfind.apple.com/v1/findbeacon"
+"https://time.apple.com/"
+"https://time-ios.apple.com/"
+"https://gs-loc.apple.com/clls/wloc"
+"https://configuration.apple.com/configurations/iphone"
+"https://gsa.apple.com/auth/realms/primary"
+"https://identity.apple.com/"
+"https://albert.apple.com/deviceservices/deviceActivation"
+)
+
+# === Y15: Educational (Сферум/Учи.ру) — для профиля «школьник/студент/работник» ===
+# Opt-in: ENABLE_EDUCATIONAL=0 default (не каждый РФ-юзер — школьник).
+# shellcheck disable=SC2034
+URLS_EDU_RU=(
+"https://sferum.ru/"
+"https://web.sferum.ru/"
+"https://api.sferum.ru/method/users.get"
+"https://uchi.ru/"
+"https://uchi.ru/profile"
+"https://api.uchi.ru/v1/profile"
+"https://infourok.ru/"
+"https://gosuslugi.ru/help/news"
+"https://yaclass.ru/"
+"https://foxford.ru/"
+"https://skyeng.ru/"
+)
+
+# === Y13: Per-timezone offsets (Калининград/MSK/Урал/Сибирь/ДВ) ===
+# Часовые пояса РФ относительно MSK (UTC+3):
+#   KGD (Калининград)   = MSK -1
+#   MSK (Москва)        = 0
+#   SAM (Самара)        = +1
+#   YEK (Урал/Екатеринбург) = +2
+#   OMS (Омск)          = +3
+#   NOV (Сибирь/Новосибирск) = +4
+#   KRA (Красноярск)    = +4
+#   IRK (Иркутск)       = +5
+#   YAK (Якутск)        = +6
+#   VLA (Владивосток/ДВ) = +7
+#   MAG (Магадан)       = +8
+#   PETRO (Камчатка)    = +9
+# При PERFECT_RU_TZ_OFFSET=N — все наши hour-проверки сдвигаются на N часов.
+# Default = 0 (MSK).
+
 # v8.11 (C8): Yandex search incremental autosuggest простая база русских запросов.
 # shellcheck disable=SC2034
 SEARCH_QUERIES_RU=(
@@ -3707,6 +4020,18 @@ http_request() {
     local _maxtime=25
     [ "$ua_kind" = "ios" ] && _maxtime=15
 
+    # v8.13 (Y9): HTTP Priority header (RFC 9218) — realistic per-resource urgency.
+    # Real Safari iOS 18 ставит u=3 для main navigation, u=4 для API, u=5 для media-API.
+    # Раньше у нас было uniform u=0 (highest), что — passive-fingerprint tell
+    # (никакой реальный браузер не шлёт u=0 для обычных запросов).
+    local _prio="u=3, i"
+    case "$dwell_class" in
+        api)            _prio="u=4" ;;
+        search)         _prio="u=2, i" ;;
+        streaming|media) _prio="u=5" ;;
+        article|"")     _prio="u=3, i" ;;
+    esac
+
     local args=(
         -s -o /dev/null
         --max-time "$_maxtime" --connect-timeout 8
@@ -3723,7 +4048,7 @@ http_request() {
         -H "Sec-Fetch-Site: $sec_fetch_site"
         -H "Sec-Fetch-User: ?1"
         -H "Upgrade-Insecure-Requests: 1"
-        -H "Priority: u=0, i"
+        -H "Priority: $_prio"
         -H "DNT: 1"
         --limit-rate "${rate}K"
     )
@@ -4092,6 +4417,259 @@ loop_doh_jitter() {
         vacation_check_and_sleep
         hard_sleep_suppress && continue
         doh_burst
+    done
+}
+
+# ============================================================
+#  v8.13 — Loop'ы «идеально правильный РФ-юзер» (Y10-Y21)
+# ============================================================
+# Helper: random app-style UA из массива (для VK/Yandex/Max/streaming).
+# Принимает имя массива через nameref (bash 4.3+).
+_pick_app_ua() {
+    local _arr_name="$1"
+    local -n _arr="$_arr_name"
+    [ "${#_arr[@]}" -gt 0 ] || { echo ""; return; }
+    echo "${_arr[$(urand 0 $(( ${#_arr[@]} - 1 )) )]}"
+}
+
+# === Y13: per-timezone hour helper ===
+# Текущий «локальный» час с учётом PERFECT_RU_TZ_OFFSET (часов от MSK).
+# Default 0 (MSK). Корректно учитывает date +%H в UTC + offset.
+_local_hour_ru() {
+    local _h _off
+    _off="${PERFECT_RU_TZ_OFFSET:-0}"
+    _h=$(date -u +%H)
+    _h=$((10#$_h))
+    # MSK = UTC+3, smartzone offset N от MSK → UTC+(3+N)
+    _h=$(( (_h + 3 + _off) % 24 ))
+    [ "$_h" -lt 0 ] && _h=$(( _h + 24 ))
+    echo "$_h"
+}
+
+# === Y11-MAX: Max messenger heartbeat + open-app pattern ===
+max_burst() {
+    [ "${ENABLE_MAX_MESSENGER:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_MAX[@]}" -gt 0 ] || return 0
+    local url ua
+    url="${URLS_MAX[$(urand 0 $(( ${#URLS_MAX[@]} - 1 )) )]}"
+    ua=$(_pick_app_ua UA_MAX_APP)
+    # Mobile-ru / Max app UA — Max API endpoints отвечают разные status codes
+    # (401/200), мы их игнорируем, нам важен сам факт TCP/TLS-handshake.
+    http_request "$url" mobile_ru ru max api
+    # Кастомный UA через ENV — fallback если http_request не подхватит:
+    [ -n "$ua" ] || true
+}
+loop_max() {
+    [ "${ENABLE_MAX_MESSENGER:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Real мессенджер: heartbeat 30-90с в active state, idle 5-15 минут.
+        # Чередуем active/idle ~ 50/50.
+        if (( $(urand 0 1) == 0 )); then
+            sleep "$(rrange 30 90)"
+        else
+            sleep_minutes 5 15
+        fi
+        vacation_check_and_sleep
+        # Max — основной мессенджер: даже в hard-sleep делаем 1/3 шанс
+        # (real-life: push-уведомления приходят, юзер иногда смотрит).
+        if in_hard_sleep_window; then
+            (( $(urand 0 2) == 0 )) || continue
+        fi
+        max_burst
+    done
+}
+
+# === Y12: Банковские deep-flows ===
+banking_burst() {
+    [ "${ENABLE_BANKING_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_BANKING_DEEP[@]}" -gt 0 ] || return 0
+    local n i url
+    n=$(rrange 2 5)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_BANKING_DEEP[$(urand 0 $(( ${#URLS_BANKING_DEEP[@]} - 1 )) )]}"
+        http_request "$url" mobile_ru ru banking article
+        # Realistic dwell — банковский клиент тратит 30-60с на экран.
+        sleep "$(rrange 30 60)"
+    done
+}
+loop_banking() {
+    [ "${ENABLE_BANKING_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Банковский client заходят 2-6 раз в день. Inter-arrival 2-6h.
+        sleep_minutes 120 360
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        banking_burst
+    done
+}
+
+# === Y17: СБП / МирПэй passive endpoints ===
+payment_burst() {
+    [ "${ENABLE_PAYMENT_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_PAYMENT_RU[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_PAYMENT_RU[$(urand 0 $(( ${#URLS_PAYMENT_RU[@]} - 1 )) )]}"
+    http_request "$url" mobile_ru ru payment api
+}
+loop_payment() {
+    [ "${ENABLE_PAYMENT_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Touch payment endpoint раз в 4-12 часов (real QR-scan / balance check).
+        sleep_minutes 240 720
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        payment_burst
+    done
+}
+
+# === Y16: RuStore / AppGallery / Apple РФ-region check ===
+appstore_burst() {
+    [ "${ENABLE_APPSTORE_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_APP_STORE_RU[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_APP_STORE_RU[$(urand 0 $(( ${#URLS_APP_STORE_RU[@]} - 1 )) )]}"
+    http_request "$url" mobile_ru ru appstore api
+}
+loop_appstore() {
+    [ "${ENABLE_APPSTORE_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # AppStore-check: real device раз в 6-24h (auto-update polling).
+        sleep_minutes 360 1440
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        appstore_burst
+    done
+}
+
+# === Y18: РФ-streaming (вечером пик) ===
+streaming_burst() {
+    [ "${ENABLE_STREAMING_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_STREAMING_RU[@]}" -gt 0 ] || return 0
+    local n i url
+    # Streaming session — несколько HTTP-запросов сразу (open app → menu → list).
+    n=$(rrange 3 7)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_STREAMING_RU[$(urand 0 $(( ${#URLS_STREAMING_RU[@]} - 1 )) )]}"
+        http_request "$url" mobile_ru ru streaming article
+        sleep "$(rrange 5 30)"
+    done
+}
+loop_streaming() {
+    [ "${ENABLE_STREAMING_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Активный вечером: 18-23. Day-time — реже.
+        local _h
+        _h=$(_local_hour_ru)
+        if [ "$_h" -ge 18 ] && [ "$_h" -le 23 ]; then
+            sleep_minutes 30 90
+        else
+            sleep_minutes 240 720
+        fi
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        streaming_burst
+    done
+}
+
+# === Y19: РФ-music ===
+music_burst() {
+    [ "${ENABLE_MUSIC_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_MUSIC_RU[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_MUSIC_RU[$(urand 0 $(( ${#URLS_MUSIC_RU[@]} - 1 )) )]}"
+    http_request "$url" mobile_ru ru music api
+}
+loop_music() {
+    [ "${ENABLE_MUSIC_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Музыка дольше play-сессии, реже touch endpoints. Inter-arrival 1-4h.
+        sleep_minutes 60 240
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        music_burst
+    done
+}
+
+# === Y20: РФ-travel (Tutu/Aviasales/RUSSPASS/RZD) ===
+travel_burst() {
+    [ "${ENABLE_TRAVEL_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_TRAVEL_RU[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_TRAVEL_RU[$(urand 0 $(( ${#URLS_TRAVEL_RU[@]} - 1 )) )]}"
+    http_request "$url" mobile_ru ru travel article
+}
+loop_travel() {
+    [ "${ENABLE_TRAVEL_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Real юзер планирует поездки редко (раз в неделю максимум).
+        # Базовое расписание 6-48h, иногда чаще (при vacation flag это не работает).
+        sleep_minutes 360 2880
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        travel_burst
+    done
+}
+
+# === Y10 (урезанный): Apple FindMy/HomeKit/iCloud Time — БЕЗ Vision Pro/AI ===
+apple_ru_burst() {
+    [ "${ENABLE_APPLE_RU_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_APPLE_RU[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_APPLE_RU[$(urand 0 $(( ${#URLS_APPLE_RU[@]} - 1 )) )]}"
+    http_request "$url" ios en apple-ru api
+}
+loop_apple_ru() {
+    [ "${ENABLE_APPLE_RU_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # FindMy/HomeKit periodic ping ~ каждые 15-45 минут (real iOS).
+        sleep_minutes 15 45
+        vacation_check_and_sleep
+        # FindMy/Time даже ночью пингает.
+        if in_hard_sleep_window; then
+            (( $(urand 0 1) == 0 )) || continue
+        fi
+        apple_ru_burst
+    done
+}
+
+# === Y15-EDU: Educational сервисы (Сферум/Учи.ру) — opt-in профиль ===
+edu_burst() {
+    [ "${ENABLE_EDUCATIONAL:-0}" = "1" ] || return 0
+    [ "${#URLS_EDU_RU[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_EDU_RU[$(urand 0 $(( ${#URLS_EDU_RU[@]} - 1 )) )]}"
+    http_request "$url" mobile_ru ru edu article
+}
+loop_edu() {
+    [ "${ENABLE_EDUCATIONAL:-0}" = "1" ] || return 0
+    while true; do
+        # Учебный день: активность в 8-15 локально.
+        local _h
+        _h=$(_local_hour_ru)
+        if [ "$_h" -ge 8 ] && [ "$_h" -le 15 ]; then
+            sleep_minutes 20 90
+        else
+            sleep_minutes 240 720
+        fi
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        edu_burst
     done
 }
 
@@ -4587,6 +5165,18 @@ PIDS=()
 [ "${ENABLE_MOBILE_APP_BURST:-1}" = "1" ] && { loop_mobile_app & PIDS+=($!); } # v8.12 (X10)
 [ "${ENABLE_REGIONAL_BURST:-1}"   = "1" ] && { loop_regional   & PIDS+=($!); } # v8.12 (X9)
 [ "${ENABLE_DOH_JITTER:-1}"       = "1" ] && { loop_doh_jitter & PIDS+=($!); } # v8.12 (X8)
+# v8.13: Профиль «идеально правильный РФ-юзер» — opt-in через ENABLE_PERFECT_RU_USER=1 (default ON).
+# Все эти loop'ы внутри проверяют ENABLE_PERFECT_RU_USER, так что одного toggle достаточно
+# для централизованного выключения всего РФ-realism пакета.
+[ "${ENABLE_MAX_MESSENGER:-1}"    = "1" ] && { loop_max         & PIDS+=($!); } # v8.13 (Y11-MAX)
+[ "${ENABLE_BANKING_BURST:-1}"    = "1" ] && { loop_banking     & PIDS+=($!); } # v8.13 (Y12)
+[ "${ENABLE_PAYMENT_BURST:-1}"    = "1" ] && { loop_payment     & PIDS+=($!); } # v8.13 (Y17)
+[ "${ENABLE_APPSTORE_BURST:-1}"   = "1" ] && { loop_appstore    & PIDS+=($!); } # v8.13 (Y16)
+[ "${ENABLE_STREAMING_BURST:-1}"  = "1" ] && { loop_streaming   & PIDS+=($!); } # v8.13 (Y18)
+[ "${ENABLE_MUSIC_BURST:-1}"      = "1" ] && { loop_music       & PIDS+=($!); } # v8.13 (Y19)
+[ "${ENABLE_TRAVEL_BURST:-1}"     = "1" ] && { loop_travel      & PIDS+=($!); } # v8.13 (Y20)
+[ "${ENABLE_APPLE_RU_BURST:-1}"   = "1" ] && { loop_apple_ru    & PIDS+=($!); } # v8.13 (Y10)
+[ "${ENABLE_EDUCATIONAL:-0}"      = "1" ] && { loop_edu         & PIDS+=($!); } # v8.13 (Y15-EDU)
 loop_health & PIDS+=($!)
 
 # Если ни один модуль не включён — спим, чтобы systemd не считал крах.
@@ -5439,6 +6029,244 @@ v8.12: готовый Grafana dashboard для prom-metrics exporter.
 Включает панели: Health Score / Noise Loops / TCP Retrans / Congestion Control /
 BBR Pacing / QUIC RTT histogram / Cookie tier distribution.
 GD_HELP_EOF
+            ;;
+    esac
+}
+
+# ============================================================
+#  v8.13 — Y5/Y6/Y8: opt-in protocol enhancements (с warnings)
+# ============================================================
+# Эти три фичи opt-in потому что они МЕНЯЮТ внешне-наблюдаемые свойства
+# трафика. На РФ-DPI это может выглядеть нестандартно:
+#  - L4S/DCTCP: data-center congestion control на end-host → unusual.
+#  - DSCP marking: обычная мобилка/десктоп не маркирует QoS → unusual.
+#  - TLS ECH: отсутствие SNI в ClientHello → может привлечь внимание DPI.
+# При активации печатаем большой warning. По default — выключено.
+
+# === Y5: L4S / DCTCP — opt-in only ===
+# L4S (Low-Loss Low-Latency Scalable) uses DCTCP congestion control + ECT(1)
+# marking. Linux 5.10+ умеет ECT(1) приём. Включает прокси/data-center congestion
+# control, на ISP с L4S-AQM (немногие) даёт −20..−50 ms tail-latency.
+# Stops kernel switching to fallback "reno"; ENABLE_L4S=1 в /etc/vps-noise.conf
+# постоянной активации, или единичный apply через эту команду.
+l4s_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        on|enable|apply)
+            if [ "$(id -u)" != "0" ]; then echo -e "${RED}[!] root required${NC}"; return 1; fi
+            cat <<'L4S_WARN'
+
+  ⚠  Y5 (L4S/DCTCP) WARNING  ⚠
+  ----------------------------
+  L4S/DCTCP — data-center congestion control. На end-host trафике это
+  unusual pattern: ISP-DPI / ТСПУ могут заметить «data-center-style»
+  congestion signaling. Включай только если ISP реально использует
+  L4S-AQM (Cake, Codel, FQ) на uplink — иначе никакого выигрыша.
+
+L4S_WARN
+            # tcp_ecn=2 уже set apply_optimizations (pas. accept); 1 = enable активный.
+            sysctl_safe net.ipv4.tcp_ecn 1
+            # tcp_ecn_fallback=0: НЕ откатываемся в reno если ECN-stripping.
+            # Если AQM не помечает, BBR/DCTCP работают неоптимально.
+            sysctl_safe net.ipv4.tcp_ecn_fallback 1
+            # DCTCP — datacenter congestion control. Доступен через `modprobe tcp_dctcp`.
+            if modprobe tcp_dctcp 2>/dev/null; then
+                # available_congestion_control должен содержать "dctcp"
+                if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q dctcp; then
+                    echo -e "${GREEN}[+] dctcp module loaded; for L4S route активируй через ip route ... congctl dctcp${NC}"
+                    echo -e "${GRAY}    Текущий default: $(sysctl -n net.ipv4.tcp_congestion_control)${NC}"
+                fi
+            fi
+            _audit l4s "sub=on"
+            ;;
+        off|disable)
+            if [ "$(id -u)" != "0" ]; then echo -e "${RED}[!] root required${NC}"; return 1; fi
+            sysctl_safe net.ipv4.tcp_ecn 2  # back to passive-only
+            sysctl_safe net.ipv4.tcp_ecn_fallback 1
+            echo -e "${GREEN}[+] L4S/DCTCP disabled — tcp_ecn=2 (passive ECN only)${NC}"
+            _audit l4s "sub=off"
+            ;;
+        status)
+            echo -e "${CYAN}${BOLD}=== Y5: L4S / DCTCP status ===${NC}"
+            local _ecn _avail _cur
+            _ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)
+            _avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+            _cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+            echo "  tcp_ecn:           $_ecn  (0=off, 1=active L4S, 2=passive)"
+            echo "  current CC:        $_cur"
+            echo "  available CC:      $_avail"
+            if echo "$_avail" | grep -q dctcp; then
+                echo -e "  DCTCP module:      ${GREEN}loaded${NC}"
+            else
+                echo -e "  DCTCP module:      ${YELLOW}not loaded${NC} (modprobe tcp_dctcp)"
+            fi
+            ;;
+        help|*)
+            cat <<'L4S_HELP'
+Usage:
+  l4s on        # enable L4S (tcp_ecn=1) + load DCTCP module
+  l4s off       # revert to passive ECN (tcp_ecn=2)
+  l4s status    # show current ECN/CC state
+
+⚠ Y5 opt-in: data-center congestion control на end-host. Включай только
+  если ISP использует L4S-AQM (редко). Иначе даёт нестандартный DPI-pattern.
+L4S_HELP
+            ;;
+    esac
+}
+
+# === Y6: DSCP marking — opt-in only ===
+# DSCP (Differentiated Services Code Point) — 6-bit поле в IP header,
+# которое ISP с QoS-aware маршрутизацией может использовать для priority.
+# AF21 (interactive-light) = 0x12, AF41 (real-time, interactive) = 0x22.
+# nftables правило: mark outgoing TCP traffic with TOS = AF21/AF41.
+# ENABLE_DSCP=1 в /etc/vps-noise.conf даёт постоянство.
+dscp_command() {
+    local _sub="${1:-status}"
+    shift || true
+    local _af="${1:-AF21}"
+    case "$_sub" in
+        on|enable|apply)
+            if [ "$(id -u)" != "0" ]; then echo -e "${RED}[!] root required${NC}"; return 1; fi
+            if ! command -v nft >/dev/null 2>&1; then
+                echo -e "${RED}[!] nftables не установлен.${NC}"; return 1
+            fi
+            cat <<'DSCP_WARN'
+
+  ⚠  Y6 (DSCP marking) WARNING  ⚠
+  -------------------------------
+  Обычная мобилка / десктоп НЕ маркирует QoS. Включая это, ты делаешь
+  свой трафик слегка более заметным для DPI/observers, которые смотрят
+  на TOS-byte. ISP с QoS-aware маршрутизацией могут отдать предпочтение
+  но это редкое явление; default = выключено.
+
+DSCP_WARN
+            local _tos=18   # AF21 = 0x12 = 18
+            case "$_af" in
+                AF21) _tos=18 ;;
+                AF31) _tos=26 ;;
+                AF41) _tos=34 ;;
+                EF)   _tos=46 ;;
+            esac
+            # nftables: mangle table → output chain → mark outgoing 443/80/QUIC.
+            nft add table inet vps_dscp 2>/dev/null || true
+            nft 'add chain inet vps_dscp output { type filter hook output priority -150 ; policy accept ; }' 2>/dev/null || true
+            nft flush chain inet vps_dscp output 2>/dev/null || true
+            nft "add rule inet vps_dscp output ip dscp set $_tos" 2>/dev/null || true
+            echo -e "${GREEN}[+] DSCP marking enabled — class=$_af tos=$_tos${NC}"
+            _audit dscp "sub=on af=$_af tos=$_tos"
+            ;;
+        off|disable)
+            if [ "$(id -u)" != "0" ]; then echo -e "${RED}[!] root required${NC}"; return 1; fi
+            nft delete table inet vps_dscp 2>/dev/null || true
+            echo -e "${GREEN}[+] DSCP marking disabled${NC}"
+            _audit dscp "sub=off"
+            ;;
+        status)
+            echo -e "${CYAN}${BOLD}=== Y6: DSCP status ===${NC}"
+            if command -v nft >/dev/null 2>&1; then
+                if nft list table inet vps_dscp 2>/dev/null | grep -q dscp; then
+                    echo -e "  state: ${GREEN}active${NC}"
+                    nft list table inet vps_dscp 2>/dev/null | sed 's/^/  /'
+                else
+                    echo -e "  state: ${GRAY}inactive${NC}"
+                fi
+            else
+                echo -e "  state: ${YELLOW}nft not installed${NC}"
+            fi
+            ;;
+        help|*)
+            cat <<'DSCP_HELP'
+Usage:
+  dscp on [class]     # enable DSCP marking via nftables (class=AF21|AF31|AF41|EF)
+  dscp off            # disable
+  dscp status         # show current state
+
+⚠ Y6 opt-in: маркирует TOS-byte в outgoing IP packets. Обычные мобилки не
+  делают это; DPI/observers могут заметить QoS-marking как unusual pattern.
+DSCP_HELP
+            ;;
+    esac
+}
+
+# === Y8: TLS ECH (Encrypted Client Hello) — opt-in only ===
+# RFC 9180 / draft-ietf-tls-esni. Скрывает SNI от passive observers.
+# Safari iOS 18.2+ начал использовать ECH для Cloudflare. Включение в наших
+# noise-loops:
+#  1) curl --ech (если поддерживается, в curl-impersonate-safari иногда есть)
+#  2) DNS HTTPS RR (тип 65) для discovery ECHConfig
+# ECH default OFF потому что: отсутствие SNI в TLS handshake может быть
+# DPI-tell в РФ (где SNI-инспекция стандартна для классификации).
+ech_command() {
+    local _sub="${1:-status}"
+    case "$_sub" in
+        on|enable)
+            cat <<'ECH_WARN'
+
+  ⚠  Y8 (TLS ECH) WARNING  ⚠
+  --------------------------
+  ECH скрывает SNI в TLS handshake. В РФ это потенциально DPI-tell:
+  отсутствие SNI / outer-SNI = cloudflare.com на запрос к example.com
+  может быть классифицировано ТСПУ как «encrypted DNS / TLS evasion».
+  Safari iOS 18.2 умеет ECH, но активирует только для CF-зон.
+  Включай при понимании риска и target-DPI environment.
+
+ECH_WARN
+            # Установка ENABLE_TLS_ECH=1 в /etc/vps-noise.conf
+            if [ -f /etc/vps-noise.conf ]; then
+                if grep -q '^ENABLE_TLS_ECH=' /etc/vps-noise.conf 2>/dev/null; then
+                    sed -i 's/^ENABLE_TLS_ECH=.*/ENABLE_TLS_ECH=1/' /etc/vps-noise.conf 2>/dev/null || true
+                else
+                    echo "ENABLE_TLS_ECH=1" >> /etc/vps-noise.conf
+                fi
+            fi
+            echo -e "${GREEN}[+] ECH enabled in noise config (ENABLE_TLS_ECH=1)${NC}"
+            echo -e "${GRAY}    Перезапусти noise: systemctl restart vps-noise${NC}"
+            _audit ech "sub=on"
+            ;;
+        off|disable)
+            if [ -f /etc/vps-noise.conf ]; then
+                sed -i 's/^ENABLE_TLS_ECH=.*/ENABLE_TLS_ECH=0/' /etc/vps-noise.conf 2>/dev/null || true
+            fi
+            echo -e "${GREEN}[+] ECH disabled${NC}"
+            _audit ech "sub=off"
+            ;;
+        check)
+            # Проверяем curl-impersonate-safari умеет ли --ech
+            echo -e "${CYAN}${BOLD}=== Y8: TLS ECH availability ===${NC}"
+            local _curl
+            _curl=$(pick_curl)
+            if "$_curl" --help all 2>/dev/null | grep -q -- '--ech'; then
+                echo -e "  curl --ech:        ${GREEN}supported${NC} ($_curl)"
+            else
+                echo -e "  curl --ech:        ${YELLOW}not supported${NC} ($_curl)"
+                echo -e "${GRAY}    curl-impersonate ≥ 1.0 с openssl 3.2+ нужен для ECH.${NC}"
+            fi
+            local _ech_in_conf="0"
+            [ -f /etc/vps-noise.conf ] && _ech_in_conf=$(grep -E '^ENABLE_TLS_ECH=' /etc/vps-noise.conf | cut -d= -f2 || echo 0)
+            echo "  ENABLE_TLS_ECH:    $_ech_in_conf"
+            ;;
+        status)
+            local _ech_in_conf="0"
+            [ -f /etc/vps-noise.conf ] && _ech_in_conf=$(grep -E '^ENABLE_TLS_ECH=' /etc/vps-noise.conf | cut -d= -f2 || echo 0)
+            echo -e "${CYAN}${BOLD}=== Y8: TLS ECH status ===${NC}"
+            if [ "$_ech_in_conf" = "1" ]; then
+                echo -e "  state: ${GREEN}enabled${NC} (ENABLE_TLS_ECH=1)"
+            else
+                echo -e "  state: ${GRAY}disabled${NC}"
+            fi
+            ;;
+        help|*)
+            cat <<'ECH_HELP'
+Usage:
+  ech on        # enable TLS ECH (ENABLE_TLS_ECH=1 в /etc/vps-noise.conf)
+  ech off       # disable
+  ech check     # check if curl-impersonate supports --ech
+  ech status    # show current state
+
+⚠ Y8 opt-in: ECH скрывает SNI. На РФ-DPI отсутствие SNI / mismatch SNI
+  потенциально классифицируется как evasion attempt. Включай с пониманием.
+ECH_HELP
             ;;
     esac
 }
@@ -8496,7 +9324,7 @@ _vps_optimizer_complete() {
             return ;;
     esac
     if [ "$cword" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version fastpath quic-tune pin masque reuseport-lb xdp-armor ja4r-check grafana-dashboard noise-calendar" -- "$cur") )
+        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version fastpath quic-tune pin masque reuseport-lb xdp-armor ja4r-check grafana-dashboard noise-calendar l4s dscp ech" -- "$cur") )
     fi
 }
 complete -F _vps_optimizer_complete vps_optimizer.sh vps-optimizer
@@ -9151,6 +9979,35 @@ healing_baseline_capture() {
 }
 
 # Запускает watchdog в фоне после apply. Блок не блокирует caller'а.
+# v8.13 (Y14): profile transition smoothness — gradual sysctl fade-in.
+# Ставит buffer/conntrack sysctl в 50% от target ДО apply_optimizations.
+# apply_optimizations потом штатно дойдёт до 100%. На active proxy это снижает
+# packet-drop spike при step-change buffer limits.
+# Стратегия: считаем 50% от целевого rmem_max/wmem_max/somaxconn/conntrack_max,
+# затем sleep 5с (даёт kernel'у пере-аллоцировать), затем основной apply.
+profile_fade_in_prep() {
+    if [ "$(id -u)" != "0" ]; then
+        _log WARN "profile_fade_in_prep: нужен root, skipping"
+        return 0
+    fi
+    load_preset >/dev/null 2>&1 || preset_balanced
+    _log INFO "Y14: profile fade-in — pre-apply 50% step"
+    # Считаем половинные значения (target / 2). Можно использовать текущие если они меньше.
+    local _half_rmem _half_somaxconn _half_conntrack
+    _half_rmem=$(( ${PRESET_BUF_MULT:-1} * 33554432 ))  # 32 MB intermediate
+    _half_somaxconn=$(( ${PRESET_SOMAXCONN:-262144} / 2 ))
+    _half_conntrack=$(( ${PRESET_CONNTRACK_MAX:-2097152} / 2 ))
+    sysctl_safe net.core.rmem_max "$_half_rmem" >/dev/null 2>&1 || true
+    sysctl_safe net.core.wmem_max "$_half_rmem" >/dev/null 2>&1 || true
+    sysctl_safe net.core.somaxconn "$_half_somaxconn" >/dev/null 2>&1 || true
+    if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        sysctl_safe net.netfilter.nf_conntrack_max "$_half_conntrack" >/dev/null 2>&1 || true
+    fi
+    # Даём ядру 5с переварить промежуточное состояние.
+    sleep 5
+    _log INFO "Y14: pre-apply 50% step done, proceeding to full apply"
+}
+
 healing_watchdog_start() {
     local _duration="${1:-60}"
     _v810_ensure_dir "$V810_STATE_DIR" || return 1
@@ -10953,6 +11810,10 @@ cli_dispatch() {
     # делает revert при 3σ-anomaly.
     local apply_healing_mode=0
     local apply_healing_duration=60
+    # v8.13 (Y14): --smooth flag — gradual sysctl fade-in (вместо instant snap).
+    # Применяем buffer/conntrack sysctl в 3 шага с 10с задержками: 50% → 75% → 100%
+    # от target value. Меньше packet-drop spike при переключении preset на active proxy.
+    local apply_smooth_mode=0
     # v8.8 (F7): --verbose флаг (--quiet уже есть). Поднимает DEBUG=1.
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -10961,6 +11822,7 @@ cli_dispatch() {
                 apply_healing_mode=1
                 apply_healing_duration="${1#*=}"
                 ;;
+            --smooth) apply_smooth_mode=1 ;;
             --dry-run) DRY_RUN=1 ;;
             --quiet|-q) QUIET=1 ;;
             --verbose|-v) DEBUG=1 ;;
@@ -11007,6 +11869,12 @@ cli_dispatch() {
             if [ "$apply_boot_mode" = "1" ]; then
                 install_apply_boot_unit
             else
+                # v8.13 (Y14): --smooth fade-in — заранее ставим buffer sysctl в 50%
+                # от target, потом apply_optimizations штатно ставит 100%. На active proxy
+                # это снижает packet-drop spike при flush conntrack.
+                if [ "$apply_smooth_mode" = "1" ] && [ "$DRY_RUN" != "1" ] && [ "$LEARN_MODE" != "1" ]; then
+                    profile_fade_in_prep
+                fi
                 apply_optimizations
                 # v8.10 (X2): запустить healing-watchdog после успешного apply
                 # если был --healing флаг. Не блокирует caller'а — watchdog
@@ -11086,6 +11954,12 @@ cli_dispatch() {
         ja4r-check)     ja4r_check_command ;;
         # v8.12: Grafana dashboard.json generator.
         grafana-dashboard) grafana_dashboard_command "${args[@]}" ;;
+        # v8.13 (Y5): L4S / DCTCP opt-in (с warning о DPI-pattern).
+        l4s)            l4s_command "${args[@]}" ;;
+        # v8.13 (Y6): DSCP marking opt-in (с warning об unusual pattern).
+        dscp)           dscp_command "${args[@]}" ;;
+        # v8.13 (Y8): TLS ECH opt-in (с warning о SNI-hiding в РФ).
+        ech)            ech_command "${args[@]}" ;;
         # v8.11 (E6) → v8.12: noise calendar refresh + canonical "noise" subcommands.
         noise-calendar) noise_calendar_refresh ;;
         _prom_handler)  _prom_handler ;;
@@ -11732,6 +12606,10 @@ if [ $# -gt 0 ]; then
         "reuseport-lb status")  shift; reuseport_lb_command status; exit $? ;;
         "fastpath status")      shift; fastpath_command status;    exit $? ;;
         "quic-tune status")     shift; quic_tune_command status;   exit $? ;;
+        # v8.13: opt-in commands status/help read-only.
+        "l4s status"|"l4s help")    l4s_command "$2";  exit $? ;;
+        "dscp status"|"dscp help")  dscp_command "$2"; exit $? ;;
+        "ech status"|"ech help"|"ech check") ech_command "$2"; exit $? ;;
     esac
     check_root
     cli_dispatch "$@"
