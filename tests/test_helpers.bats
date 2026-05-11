@@ -1110,3 +1110,129 @@ setup() {
     run grep -E '^[[:space:]]+quic-tune\)' "$SCRIPT"
     [ "$status" -eq 0 ]
 }
+
+# ===== v8.12 (X1-X10) tests =====
+
+@test "v8.12: version bumped to 8.12" {
+    run grep 'SCRIPT_VERSION="8.12"' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X1: io_uring per-binary capability probe in doctor" {
+    run grep -F 'liburing' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'io_uring_setup\|io_uring_register' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X2: masque_command implemented" {
+    run grep '^masque_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'MASQUE_SINGBOX_EOF\|snippet-singbox' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X3: reuseport_lb_command implemented" {
+    run grep '^reuseport_lb_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '99-reuseport-lb.conf' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X4: xdp_armor_command implemented" {
+    run grep '^xdp_armor_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'xdp-loader\|xdp-filter' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X5: cookie_jar_for_tag selector (3-tier)" {
+    run grep '^cookie_jar_for_tag()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'COOKIE_PERSIST_DIR' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ENABLE_COOKIE_3TIER' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X6: 6-state Markov chain (_noise_mc_step_6state)" {
+    run grep '_noise_mc_step_6state' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'MORNING_CHECK\|DEEP_SLEEP' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ENABLE_MARKOV_6STATE' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X7: ja4r_check_command implemented" {
+    run grep '^ja4r_check_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'tls.handshake.ja4' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X8: poisson_delay + loop_doh_jitter" {
+    run grep '^poisson_delay()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_doh_jitter()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ENABLE_DOH_JITTER' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X9: regional RU URL pool" {
+    run grep 'URLS_REGIONAL_RU=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^loop_regional()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ENABLE_REGIONAL_BURST' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12 X10: VK/Yandex mobile app pools" {
+    run grep 'URLS_VK_APP=\|URLS_YANDEX_APP=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'UA_VK_APP=\|UA_YANDEX_APP=' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep '^mobile_app_burst()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'ENABLE_MOBILE_APP_BURST' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12: grafana_dashboard_command implemented" {
+    run grep '^grafana_dashboard_command()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep 'GRAFANA_JSON_EOF\|vps-optimizer-main' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12: RU cloud providers in detect_provider" {
+    run grep 'yandex-cloud)\|vk-cloud)\|selectel)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12: cli_dispatch routes new commands" {
+    run grep -E '^[[:space:]]+masque\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+reuseport-lb\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+xdp-armor\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+ja4r-check\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+grafana-dashboard\)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
+@test "v8.12: grafana-dashboard json outputs valid JSON" {
+    run "$SCRIPT" grafana-dashboard json
+    [ "$status" -eq 0 ]
+    echo "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["uid"]=="vps-optimizer-main"' || return 1
+}
+
+@test "v8.12: masque help outputs usage" {
+    run "$SCRIPT" masque help
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'snippet-singbox'
+}

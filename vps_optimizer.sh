@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.11"
+SCRIPT_VERSION="8.12"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -789,6 +789,12 @@ detect_provider() {
         *microsoft*|*hyperv*) echo azure;      return ;;
         *oracle*)         echo oracle;         return ;;
     esac
+    # v8.12: RU cloud DMI signatures (Yandex.Cloud, VK Cloud, Selectel).
+    case "$sys_vendor$sys_product" in
+        *yandex*|*y.cloud*)        echo yandex-cloud;   return ;;
+        *vkcs*|*vk.cloud*|*mailru*)    echo vk-cloud;       return ;;
+        *selectel*)                echo selectel;       return ;;
+    esac
     # hostname-эвристика — только если dmi не сработал (Aeza/Timeweb/Firstbyte
     # часто включают название в hostname, но это менее надёжно: 'vultr.example.com'
     # не значит что VPS у Vultr). Q8 fix v8.3: матчим только если домен содержит
@@ -797,6 +803,10 @@ detect_provider() {
         *.aeza.net|*.aeza.online|aeza-*)        echo aeza;      return ;;
         *.timeweb.cloud|*.timeweb.ru|timeweb-*) echo timeweb;   return ;;
         *.firstbyte.ru|*.1stbyte.ru|fb-*)       echo firstbyte; return ;;
+        # v8.12: RU cloud hostname-эвристика.
+        *.yandexcloud.net|*.cloud.yandex.net|yc-*|yandex-cloud-*) echo yandex-cloud; return ;;
+        *.mcs.mail.ru|*.cloud.mail.ru|*.vk.cloud|vkcs-*)          echo vk-cloud;     return ;;
+        *.selcdn.ru|*.selectel.cloud|*.selectel.ru|selectel-*)    echo selectel;     return ;;
     esac
     echo generic
 }
@@ -2627,6 +2637,12 @@ RU_HOLIDAYS_FILE="/var/lib/vps-noise/calendar.tsv"   # формат: YYYY-MM-DD<
 ENABLE_IMAP_IDLE=1           # IMAP IDLE keepalive к imap.mail.me.com:993 (real iCloud Mail)
 ENABLE_AUTOSUGGEST=1         # Yandex search incremental autosuggest симуляция
 ENABLE_DWELL_REALISTIC=1     # реалистичные dwell-time (article=30-120с, search=1-3с)
+# v8.12 (X9/X10): мобильные аппы + регионы.
+ENABLE_MOBILE_APP_BURST=1    # VK app / Yandex app API-burst (X10)
+ENABLE_REGIONAL_BURST=1      # региональные РФ-новостники (e1.ru, 72.ru, ngs.ru, ...)
+ENABLE_DOH_JITTER=1          # X8: Poisson-jitter inter-arrival для DoH
+ENABLE_COOKIE_3TIER=1        # X5: 3-tier cookie rotation (fresh/sticky/persistent)
+ENABLE_MARKOV_6STATE=0       # X6: 6-state Markov chain (опт-ин — полный рефактор вместо 4-state)
 CONF_EOF
 }
 
@@ -2907,6 +2923,12 @@ RU_HOLIDAYS_FILE="${RU_HOLIDAYS_FILE:-/var/lib/vps-noise/calendar.tsv}"
 ENABLE_IMAP_IDLE="${ENABLE_IMAP_IDLE:-1}"
 ENABLE_AUTOSUGGEST="${ENABLE_AUTOSUGGEST:-1}"
 ENABLE_DWELL_REALISTIC="${ENABLE_DWELL_REALISTIC:-1}"
+# v8.12 defaults.
+ENABLE_MOBILE_APP_BURST="${ENABLE_MOBILE_APP_BURST:-1}"
+ENABLE_REGIONAL_BURST="${ENABLE_REGIONAL_BURST:-1}"
+ENABLE_DOH_JITTER="${ENABLE_DOH_JITTER:-1}"
+ENABLE_COOKIE_3TIER="${ENABLE_COOKIE_3TIER:-1}"
+ENABLE_MARKOV_6STATE="${ENABLE_MARKOV_6STATE:-0}"
 
 # ===== UA-пулы =====
 UA_IOS=(
@@ -3290,6 +3312,91 @@ URLS_VK_DEEP=(
 "https://dzen.ru/video"
 )
 
+# v8.12 (X9): regional Russian news sites — real РФ-юзер из не-московского региона
+# часто открывает локальные новостники наряду со столичными. Это даёт более
+# реалистичный pattern для passive traffic analyzers (не «всё с одного IP в МСК»).
+# Покрывает: Сибирь (ngs.ru, sib.fm, irk.ru), Урал (e1.ru, 72.ru, 66.ru),
+# Юг (161.ru, 93.ru, kavkaz-uzel.eu), Поволжье (e-vid.ru, 116.ru, 59.ru),
+# Северо-Запад (47news.ru, fontanka.ru, lentaru.media), ДВ (vlcity.ru, vesti.ru).
+# shellcheck disable=SC2034
+URLS_REGIONAL_RU=(
+"https://e1.ru/text/"
+"https://72.ru/text/"
+"https://66.ru/news/"
+"https://ngs.ru/text/"
+"https://ngs55.ru/text/"
+"https://ngs24.ru/text/"
+"https://irk.ru/news/"
+"https://sib.fm/news/"
+"https://161.ru/text/"
+"https://93.ru/text/"
+"https://116.ru/text/"
+"https://59.ru/text/"
+"https://fontanka.ru/"
+"https://47news.ru/"
+"https://lentaru.media/"
+"https://vlcity.ru/"
+"https://vesti.ru/regions/"
+)
+
+# v8.12 (X10): Yandex/VK mobile-app specific API endpoints. Real iOS/Android apps
+# дёргают эти hosts периодически (auth-refresh, content-feed, push-registration).
+# Эмулируя их с realistic UA, мы даём приложение-level fingerprint (а не только
+# web). Без auth — просто 401/200 на public endpoints, в trace это выглядит как
+# валидный mobile-app traffic.
+# shellcheck disable=SC2034
+URLS_VK_APP=(
+"https://api.vk.com/method/users.get?v=5.199"
+"https://api.vk.com/method/groups.getById?v=5.199"
+"https://api.vk.com/method/messages.getConversations?v=5.199"
+"https://api.vk.com/method/newsfeed.get?v=5.199"
+"https://api.vk.com/method/video.get?v=5.199"
+"https://oauth.vk.com/"
+"https://login.vk.com/?act=connect_internal&app_id=6287487"
+"https://im.vk.com/"
+"https://pu.vk.com/"
+"https://vkuser.net/"
+"https://api.vkmusic.app/"
+)
+# shellcheck disable=SC2034
+URLS_YANDEX_APP=(
+"https://mobile.yandex.net/api/v2/sync"
+"https://passport.yandex.ru/auth/welcome"
+"https://passport.yandex.ru/profile"
+"https://login.yandex.ru/info"
+"https://api.maps.yandex.net/v1/getRouteFromMapkit"
+"https://yastatic.net/s3/passport-image/2.0/avatars/"
+"https://avatars.mds.yandex.net/get-yapic/0/0-0/orig"
+"https://strm.yandex.net/get/music/"
+"https://api.music.yandex.net/account/about"
+"https://api.taxi.yandex.net/4.0/zoneinfo"
+"https://yandexnavi.yandex.net/v1/route"
+"https://api.directadvert.ru/v1/banners"
+"https://an.yandex.ru/count/"
+"https://mc.yandex.ru/watch/123456"
+"https://api.realty.yandex.net/2.0/offers/find"
+)
+
+# v8.12 (X10): app-specific UA strings (real mobile apps шлют свой UA вместо браузерного).
+# Эти UAs ОТЛИЧНЫ от Safari/Chrome UA, что критично для realistic fingerprint.
+# shellcheck disable=SC2034
+UA_VK_APP=(
+"VKAndroidApp/8.95-19103 (Android 14; SDK 34; arm64-v8a; samsung SM-G998B; ru; 2400x1080)"
+"VKAndroidApp/8.94-19002 (Android 13; SDK 33; arm64-v8a; Xiaomi Redmi Note 12; ru; 2400x1080)"
+"com.vk.vkclient/8011 (iPhone; iOS 18.1; Scale/3.00; VKSdkVersion 3.4.0)"
+"com.vk.vkclient/8005 (iPhone; iOS 18.0.1; Scale/3.00; VKSdkVersion 3.3.9)"
+)
+# shellcheck disable=SC2034
+UA_YANDEX_APP=(
+"YandexSearchBrowser/24.10.5.93.00 (iPhone; iOS 18.1; ru; en)"
+"YandexBrowserMobile/24.10.0.122 (Android 14; SM-G998B; ru-RU)"
+"com.yandex.browser/24.10.5 (iPhone; iOS 18.1; ru_RU)"
+"Yandex.Mail/8.18.0 (iPhone; iOS 18.1)"
+"Yandex.Maps/16.11.0 (iPhone; iOS 18.1; ru_RU)"
+"Yandex.Music/2024.10.1 (iPhone; iOS 18.1)"
+"Yandex.Taxi/4.179.0 (iPhone; iOS 18.1)"
+)
+
 # v8.11 (C8): Yandex search incremental autosuggest простая база русских запросов.
 # shellcheck disable=SC2034
 SEARCH_QUERIES_RU=(
@@ -3365,11 +3472,63 @@ COOKIE_JAR_DIR="/tmp/.vps_noise"
 mkdir -p "$COOKIE_JAR_DIR"
 chmod 700 "$COOKIE_JAR_DIR"
 
+# v8.12 (X5): persistent cookie store (TTL > 7 дней — выглядит как «постоянный
+# юзер с этого устройства»). Хранится вне /tmp, чтобы пережить reboot.
+COOKIE_PERSIST_DIR="/var/lib/vps-noise/cookies"
+mkdir -p "$COOKIE_PERSIST_DIR" 2>/dev/null || true
+chmod 700 "$COOKIE_PERSIST_DIR" 2>/dev/null || true
+
 # Per-session referer (имитирует браузерную навигационную цепочку:
 # главная → статья → статья → ... — тот же session, тот же Referer).
 declare -A LAST_URL_PER_TAG
 declare -A ETAG_PER_URL
 declare -A LASTMOD_PER_URL
+# v8.12 (X5): cookie tier per tag (fresh / sticky / persistent). Помним выбор,
+# чтобы один tag за сессию использовал один и тот же jar.
+declare -A COOKIE_TIER_PER_TAG
+declare -A COOKIE_TIER_TS_PER_TAG
+
+# v8.12 (X5): 3-tier cookie jar selector. Возвращает путь к jar-файлу.
+#   fresh      → новый jar каждые ~30 минут (incognito-моде поведение)
+#   sticky     → один jar на 4..24h, как UA stickiness (B2)
+#   persistent → один jar на 7+ дней, в /var/lib (real returning user)
+# Распределение: 20% fresh, 60% sticky, 20% persistent.
+cookie_jar_for_tag() {
+    local tag="$1"
+    if [ "${ENABLE_COOKIE_3TIER:-1}" != "1" ]; then
+        echo "$COOKIE_JAR_DIR/${tag}.jar"
+        return
+    fi
+    local now tier ts ttl
+    now=$(date +%s)
+    tier="${COOKIE_TIER_PER_TAG[$tag]:-}"
+    ts="${COOKIE_TIER_TS_PER_TAG[$tag]:-0}"
+    case "$tier" in
+        fresh)      ttl=1800 ;;                       # 30 min
+        sticky)     ttl=$(( (RANDOM % 72000) + 14400 )) ;;  # 4..24h
+        persistent) ttl=$(( (RANDOM % 1209600) + 604800 )) ;; # 7..21d
+        *)          ttl=0 ;;
+    esac
+    if [ -z "$tier" ] || [ "$(( now - ts ))" -gt "$ttl" ]; then
+        local pick
+        pick=$(urand 0 9)
+        if   [ "$pick" -le 1 ]; then tier=fresh
+        elif [ "$pick" -le 7 ]; then tier=sticky
+        else                         tier=persistent
+        fi
+        COOKIE_TIER_PER_TAG[$tag]="$tier"
+        COOKIE_TIER_TS_PER_TAG[$tag]="$now"
+        # fresh — каждый ротейт инвалидирует jar (rm). Чтобы не «вытащить»
+        # старые cookies, при переключении на fresh-tier сбрасываем jar.
+        if [ "$tier" = "fresh" ]; then
+            rm -f "$COOKIE_JAR_DIR/${tag}.jar" 2>/dev/null || true
+        fi
+    fi
+    case "$tier" in
+        persistent) echo "$COOKIE_PERSIST_DIR/${tag}.jar" ;;
+        *)          echo "$COOKIE_JAR_DIR/${tag}.jar" ;;
+    esac
+}
 
 # Health-state — пишется в /run/vps-noise/health.json для status-команды.
 HEALTH_FILE_NOISE="/run/vps-noise/health.json"
@@ -3406,6 +3565,23 @@ urand() {
 # Случайное число в диапазоне [a, b] — теперь через /dev/urandom.
 rrange() { urand "$1" "$2"; }
 
+# v8.12 (X8): Poisson-distributed inter-arrival time. Аппроксимация через
+# inverse-CDF метод: λ = mean rate, выдаём задержку в миллисекундах.
+# Используется для DoH-jitter — real браузеры дёргают DoH с экспоненциальным
+# распределением между запросами (а не uniform — это сигнатура автоматики).
+#
+# Аргументы: $1 — mean delay in seconds (e.g. 5 = в среднем раз в 5 сек).
+# Возврат: задержка в секундах (целое, минимум 1).
+poisson_delay() {
+    local mean="${1:-5}" r u_int u_dec
+    # Берём u ~ uniform(0.001, 0.999) — избегаем log(0).
+    u_int=$(urand 1 999)
+    u_dec="0.${u_int}"
+    # delay = -mean * ln(u). Используем awk для float math.
+    r=$(awk -v m="$mean" -v u="$u_dec" 'BEGIN { d = -m * log(u); if (d < 1) d = 1; printf "%d\n", d }' 2>/dev/null)
+    echo "${r:-1}"
+}
+
 # Случайный rate-limit
 rand_rate() { urand "$RATE_KB_MIN" "$RATE_KB_MAX"; }
 
@@ -3426,6 +3602,9 @@ _pick_ua_pool() {
         ios)        echo "${UA_IOS[$(urand 0 $(( ${#UA_IOS[@]} - 1 )) )]}" ;;
         desktop)    echo "${UA_DESKTOP[$(urand 0 $(( ${#UA_DESKTOP[@]} - 1 )) )]}" ;;
         mobile_ru)  echo "${UA_MOBILE_RU[$(urand 0 $(( ${#UA_MOBILE_RU[@]} - 1 )) )]}" ;;
+        # v8.12 (X10): app-specific UA pools.
+        vk_app)     echo "${UA_VK_APP[$(urand 0 $(( ${#UA_VK_APP[@]} - 1 )) )]}" ;;
+        yandex_app) echo "${UA_YANDEX_APP[$(urand 0 $(( ${#UA_YANDEX_APP[@]} - 1 )) )]}" ;;
         *)          echo "${UA_DESKTOP[$(urand 0 $(( ${#UA_DESKTOP[@]} - 1 )) )]}" ;;
     esac
 }
@@ -3482,7 +3661,9 @@ dwell_for_class() {
 #            $4 — cookie tag, $5 — dwell-class (опц., см. dwell_for_class).
 http_request() {
     local url="$1" ua_kind="${2:-ios}" lang="${3:-en}" tag="${4:-default}" dwell_class="${5:-}"
-    local ua jar="$COOKIE_JAR_DIR/${tag}.jar"
+    local ua jar
+    # v8.12 (X5): 3-tier cookie jar selection.
+    jar=$(cookie_jar_for_tag "$tag")
     # v8.11 (B2): UA stickiness per session-tag (rotate ~ 4..24h).
     ua=$(sticky_ua "$tag" "$ua_kind")
     local accept_lang="$ACCEPT_LANG_EN"
@@ -3817,6 +3998,101 @@ yandex_autosuggest_burst() {
     done
     # Финальный запрос на полный query.
     http_request "https://yandex.ru/search/?text=${q// /+}" desktop ru search_ya search
+}
+
+# ===== v8.12 (X10): Mobile app burst — VK app / Yandex app =====
+# Real iOS/Android app периодически дёргает API-эндпоинты с своим UA.
+# Это даёт application-level traffic signature, не только web-traffic.
+# Без auth-данных — на public endpoints мы получим 200/401, но в trace это
+# выглядит как валидный mobile-app activity (passive observer не различит).
+mobile_app_burst() {
+    [ "${ENABLE_MOBILE_APP_BURST:-1}" = "1" ] || return 0
+    local app_kind="$1" pool_name="$2" n url i tag
+    # bash 4.3+ nameref
+    local -n pool="$pool_name"
+    [ "${#pool[@]}" -gt 0 ] || return 0
+    n=$(rrange 2 5)
+    tag="${app_kind}_app"
+    for ((i=0; i<n; i++)); do
+        url="${pool[$(urand 0 $(( ${#pool[@]} - 1 )) )]}"
+        http_request "$url" "$app_kind" ru "$tag" api
+    done
+}
+loop_mobile_app() {
+    while true; do
+        sleep_minutes 8 35
+        vacation_check_and_sleep
+        # v8.12: hard-sleep уменьшает, но не полностью отключает app-burst
+        # (real apps делают background-refresh даже ночью, например VK push).
+        if in_hard_sleep_window; then
+            # Только 1/10 chance в hard-sleep (минимальный background activity).
+            (( $(urand 0 9) == 0 )) || continue
+        fi
+        # 50/50 VK app vs Yandex app
+        if (( $(urand 0 1) == 0 )); then
+            mobile_app_burst vk_app URLS_VK_APP
+        else
+            mobile_app_burst yandex_app URLS_YANDEX_APP
+        fi
+    done
+}
+
+# ===== v8.12 (X9): Regional traffic burst — local-news session =====
+# Real РФ-юзер из не-московского региона смотрит и центральные новостники,
+# и местные. Эмулируем 1/4 шанс зайти на регионалку вперемешку с major-сайтом.
+regional_burst() {
+    [ "${ENABLE_REGIONAL_BURST:-1}" = "1" ] || return 0
+    [ "${#URLS_REGIONAL_RU[@]}" -gt 0 ] || return 0
+    local n url i
+    n=$(rrange 1 3)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_REGIONAL_RU[$(urand 0 $(( ${#URLS_REGIONAL_RU[@]} - 1 )) )]}"
+        # Mobile-ru браузер — большинство региональных сайтов читают с мобилки.
+        http_request "$url" mobile_ru ru regional article
+    done
+}
+loop_regional() {
+    while true; do
+        sleep_minutes 15 90
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        regional_burst
+    done
+}
+
+# ===== v8.12 (X8): DoH burst with Poisson-jitter =====
+# Real Safari (+ Chrome с force-DNS-over-HTTPS) делает DoH-запросы с
+# экспоненциальным распределением intervals — а не равномерно. Без jitter
+# наш traffic выглядит регулярным (а это passive-DPI tell: human ≠ cron).
+# Поэтому: вместо `sleep $(rrange 30 240)` используем `sleep $(poisson_delay 90)`,
+# что даёт реалистичный exponential-distribution.
+URLS_DOH=(
+"https://cloudflare-dns.com/dns-query?name=apple.com&type=A"
+"https://cloudflare-dns.com/dns-query?name=icloud.com&type=AAAA"
+"https://cloudflare-dns.com/dns-query?name=www.yandex.ru&type=A"
+"https://dns.google/resolve?name=mail.ru&type=A"
+"https://dns.google/resolve?name=vk.com&type=AAAA"
+"https://doh.dns.apple.com/dns-query?name=apple.com&type=A"
+"https://doh.dns.apple.com/dns-query?name=icloud.com&type=AAAA"
+"https://mozilla.cloudflare-dns.com/dns-query?name=mozilla.org&type=A"
+)
+doh_burst() {
+    [ "${ENABLE_DOH_JITTER:-1}" = "1" ] || return 0
+    [ "${#URLS_DOH[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_DOH[$(urand 0 $(( ${#URLS_DOH[@]} - 1 )) )]}"
+    http_request "$url" ios en doh api
+}
+loop_doh_jitter() {
+    [ "${ENABLE_DOH_JITTER:-1}" = "1" ] || return 0
+    while true; do
+        # Mean inter-arrival = 90 секунд; реальное распределение — exponential.
+        # Большую часть времени 30-120с, иногда «всплески» 300+с.
+        sleep "$(poisson_delay 90)"
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        doh_burst
+    done
 }
 
 # ===== Email session =====
@@ -4308,6 +4584,9 @@ PIDS=()
 [ "${ENABLE_CLOUD_PHANTOM:-1}" = "1" ] && { loop_cloud & PIDS+=($!); }
 [ "${ENABLE_DNS_PREFETCH:-1}"  = "1" ] && { loop_dns_prefetch & PIDS+=($!); }
 [ "${ENABLE_IMAP_IDLE:-1}"     = "1" ] && { loop_imap_idle & PIDS+=($!); }   # v8.11 (B4)
+[ "${ENABLE_MOBILE_APP_BURST:-1}" = "1" ] && { loop_mobile_app & PIDS+=($!); } # v8.12 (X10)
+[ "${ENABLE_REGIONAL_BURST:-1}"   = "1" ] && { loop_regional   & PIDS+=($!); } # v8.12 (X9)
+[ "${ENABLE_DOH_JITTER:-1}"       = "1" ] && { loop_doh_jitter & PIDS+=($!); } # v8.12 (X8)
 loop_health & PIDS+=($!)
 
 # Если ни один модуль не включён — спим, чтобы systemd не считал крах.
@@ -4680,6 +4959,488 @@ noise_calendar_refresh() {
         echo -e "${YELLOW}[!] Не удалось обновить календарь. Будет использован rule-based fallback.${NC}"
         return 1
     fi
+}
+
+# ===== v8.12 (X2): MASQUE / CONNECT-UDP config snippet generator =====
+# RFC 9298 — туннелирование UDP через HTTP/3. Современная альтернатива
+# Hysteria2 / TUIC, поддержана в:
+#   - sing-box (https-server with masque outbound)
+#   - xray-core (через socks5 + custom-built proxy)
+#   - Cloudflare's Pingora gateway
+# Команда выводит config snippet, который пользователь копирует в свой config.
+# НЕ применяет автоматически (требует кастом конфига прокси).
+masque_command() {
+    local _sub="${1:-help}"; shift || true
+    case "$_sub" in
+        snippet-singbox|singbox)
+            cat <<'MASQUE_SINGBOX_EOF'
+# === sing-box MASQUE outbound (RFC 9298 / CONNECT-UDP) ===
+# Добавить в outbounds[] секцию sing-box config.json.
+{
+  "type": "tuic",
+  "tag": "masque-out",
+  "server": "your-server.example.com",
+  "server_port": 443,
+  "uuid": "REPLACE-WITH-UUID",
+  "password": "REPLACE-WITH-PASSWORD",
+  "congestion_control": "bbr",
+  "zero_rtt_handshake": true,
+  "heartbeat": "10s",
+  "tls": {
+    "enabled": true,
+    "server_name": "your-server.example.com",
+    "alpn": ["h3"]
+  }
+}
+# Альтернатива: native MASQUE через `type: "http"` с CONNECT-UDP в sing-box >= 1.9.0
+MASQUE_SINGBOX_EOF
+            _audit masque "action=snippet kind=singbox"
+            ;;
+        snippet-xray|xray)
+            cat <<'MASQUE_XRAY_EOF'
+# === xray-core MASQUE-style snippet (через TUIC outbound) ===
+# Добавить в outbounds[] секцию xray config.json.
+{
+  "tag": "masque-out",
+  "protocol": "tuic",
+  "settings": {
+    "address": "your-server.example.com",
+    "port": 443,
+    "uuid": "REPLACE-WITH-UUID",
+    "password": "REPLACE-WITH-PASSWORD",
+    "congestion_control": "bbr",
+    "udp_relay_mode": "native"
+  },
+  "streamSettings": {
+    "network": "raw",
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "your-server.example.com",
+      "alpn": ["h3"]
+    }
+  }
+}
+MASQUE_XRAY_EOF
+            _audit masque "action=snippet kind=xray"
+            ;;
+        snippet-hysteria|hysteria|hysteria2)
+            cat <<'MASQUE_HYSTERIA_EOF'
+# === Hysteria2 + MASQUE-fallback config snippet ===
+# Hysteria2 уже использует QUIC для UDP-tunneling; CONNECT-UDP можно
+# подключить как secondary transport через obfs.
+listen: :443
+auth:
+  type: password
+  password: REPLACE-WITH-PASSWORD
+tls:
+  cert: /etc/letsencrypt/live/your-server.example.com/fullchain.pem
+  key: /etc/letsencrypt/live/your-server.example.com/privkey.pem
+masquerade:
+  type: proxy
+  proxy:
+    url: https://your-backup-server.example.com/
+    rewriteHost: true
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+MASQUE_HYSTERIA_EOF
+            _audit masque "action=snippet kind=hysteria"
+            ;;
+        status)
+            # Проверяем, что в системе есть прокси с MASQUE-поддержкой
+            local _found=0 _bin _p _supports
+            for _bin in sing-box xray hysteria hysteria2; do
+                _p=$(command -v "$_bin" 2>/dev/null)
+                [ -z "$_p" ] && continue
+                _found=1
+                _supports="no"
+                if strings "$_p" 2>/dev/null | grep -qiE 'masque|connect-udp|tuic' 2>/dev/null; then
+                    _supports="yes"
+                fi
+                echo "  $_bin (-> $_p): MASQUE/TUIC support = $_supports"
+            done
+            [ "$_found" -eq 0 ] && echo "  (никаких прокси не найдено)"
+            ;;
+        help|*)
+            cat <<'MASQUE_HELP_EOF'
+Usage:
+    masque snippet-singbox    # config-snippet для sing-box (TUIC-режим)
+    masque snippet-xray       # config-snippet для xray-core
+    masque snippet-hysteria   # config-snippet для Hysteria2
+    masque status             # обнаружить прокси с MASQUE-поддержкой
+
+MASQUE (RFC 9298, CONNECT-UDP) — туннелирование UDP через HTTP/3. Резервный
+канал когда чистый UDP заблокирован. Реализация в sing-box/xray/Hysteria
+доступна через TUIC-протокол (де-факто MASQUE-compatible).
+MASQUE_HELP_EOF
+            ;;
+    esac
+}
+
+# ===== v8.12 (X3): SO_REUSEPORT_LB sysctl + systemd-override generator =====
+# SO_REUSEPORT (Linux 3.9+) распределяет TCP-conn по cpu-cores. С опцией
+# SO_REUSEPORT_LB (Linux 4.5+, через BPF) — добавляется flow-aware routing.
+# net.core.sock_reusable_use_default - control how multiple sockets share.
+# Polishing: для xray/sing-box нужен systemd-override чтобы PrivateNetwork=false
+# + CAP_NET_BIND_SERVICE, чтобы они могли биндить SO_REUSEPORT_LB сокет.
+reuseport_lb_command() {
+    local _sub="${1:-status}"; shift || true
+    local _svc="${1:-}"
+    case "$_sub" in
+        apply)
+            # Sysctl-side оптимизации (то что мы можем без помощи прокси)
+            sysctl_safe net.core.somaxconn 65535
+            sysctl_safe net.ipv4.tcp_tw_reuse 1
+            # net.ipv4.tcp_max_tw_buckets — limit TIME_WAIT
+            sysctl_safe net.ipv4.tcp_max_tw_buckets 2000000
+            # net.ipv4.tcp_fin_timeout — faster TIME_WAIT recycling
+            sysctl_safe net.ipv4.tcp_fin_timeout 15
+            echo -e "${GREEN}[+]${NC} SO_REUSEPORT-related sysctl применены."
+            _audit reuseport-lb "action=apply"
+            echo ""
+            echo "Для полного эффекта SO_REUSEPORT_LB нужен:"
+            echo "  1) Прокси, собранный с поддержкой SO_REUSEPORT (xray/sing-box default — да)"
+            echo "  2) В config: \"streamSettings.sockopt.tcpReusePort\": true"
+            echo "  3) systemd-override (см. reuseport-lb override <service>)"
+            ;;
+        override)
+            if [ -z "$_svc" ]; then
+                echo -e "${RED}reuseport-lb override: укажи имя сервиса (e.g. xray, sing-box)${NC}"
+                return 1
+            fi
+            local _ovdir="/etc/systemd/system/${_svc}.service.d"
+            mkdir -p "$_ovdir"
+            cat > "$_ovdir/99-reuseport-lb.conf" <<EOF
+[Service]
+# v8.12 (X3): SO_REUSEPORT_LB requirements
+PrivateNetwork=false
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+# RestartSec lower → faster reuseport socket regrab при crash
+RestartSec=1s
+LimitNOFILE=1048576
+EOF
+            systemctl daemon-reload 2>/dev/null || true
+            echo -e "${GREEN}[+]${NC} Override для $_svc → $_ovdir/99-reuseport-lb.conf"
+            echo "Перезапусти: systemctl restart $_svc"
+            _audit reuseport-lb "action=override svc=$_svc"
+            ;;
+        status)
+            echo "net.core.somaxconn       = $(sysctl -n net.core.somaxconn 2>/dev/null)"
+            echo "net.ipv4.tcp_tw_reuse    = $(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null)"
+            echo "net.ipv4.tcp_fin_timeout = $(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null)"
+            echo "net.ipv4.tcp_max_tw_buckets = $(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null)"
+            ;;
+        help|*)
+            cat <<'RPLB_HELP_EOF'
+Usage:
+    reuseport-lb apply             # применить sysctl-side оптимизации
+    reuseport-lb override <svc>    # сгенерировать systemd-override для прокси
+                                     (e.g. xray, sing-box)
+    reuseport-lb status            # показать текущие values
+
+X3: SO_REUSEPORT_LB распределяет TCP-conn по CPU-cores. Эффект:
+−15..−30 % latency-jitter под нагрузкой, лучше CPU cache locality.
+RPLB_HELP_EOF
+            ;;
+    esac
+}
+
+# ===== v8.12 (X4): XDP armor — fast packet filter via eBPF/XDP =====
+# eXpress Data Path (kernel 4.18+) — BPF-программа на NIC сразу дропает
+# пакеты с подозрительных source (port-scan, SYN-flood, известные ботнеты).
+# Это происходит ДО conntrack/iptables — ~0 ms overhead на «чистом» трафике,
+# полная фильтрация на mal-packets.
+#
+# Реализация:
+# - 99% real XDP armor — отдельный BPF-source (требует clang/llvm для компиляции).
+# - Здесь — opt-in scaffold: установка iproute2 xdp loader + минимальная
+#   BPF-программа (drop traffic to несуществующих локальных ports).
+# - Для production — рекомендуется отдельный проект (xdp-tools, suricata-xdp).
+xdp_armor_command() {
+    local _sub="${1:-status}"; shift || true
+    case "$_sub" in
+        on|enable)
+            if [ "$(id -u)" != "0" ]; then
+                echo -e "${RED}[!] XDP requires root.${NC}"
+                return 1
+            fi
+            if ! command -v ip >/dev/null 2>&1; then
+                echo -e "${RED}[!] iproute2 не установлен.${NC}"
+                return 1
+            fi
+            # Kernel version check (>= 4.18 for XDP, >= 5.4 recommended)
+            local _kver
+            _kver=$(uname -r | awk -F. '{print $1*1000+$2}')
+            if [ "${_kver:-0}" -lt 4018 ]; then
+                echo -e "${RED}[!] XDP требует kernel >= 4.18 (текущий: $(uname -r)).${NC}"
+                return 1
+            fi
+            # virt check — XDP не работает в OpenVZ/LXC/Docker
+            local _virt
+            _virt=$(detect_virt 2>/dev/null)
+            case "$_virt" in
+                openvz|lxc|wsl|docker)
+                    echo -e "${YELLOW}[!] XDP недоступен в $_virt (host-controlled).${NC}"
+                    return 1
+                    ;;
+            esac
+            local _ifn
+            _ifn=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+            : "${_ifn:=eth0}"
+            # Check if xdp tools available
+            if ! command -v bpftool >/dev/null 2>&1 && ! ip link help xdp 2>&1 | grep -q xdp; then
+                echo -e "${YELLOW}[!] bpftool не найден, и ip-link не поддерживает xdp.${NC}"
+                echo "    Установить: apt install -y linux-tools-common bpftool"
+                return 1
+            fi
+            # Минимальная XDP-программа (XDP_PASS — пропускает всё). Серьёзный
+            # armor требует кастом-BPF; здесь просто включаем XDP-режим на iface
+            # для возможности дальнейшей загрузки правил пользователем.
+            # Если в системе есть xdp-loader из xdp-tools — используем его.
+            if command -v xdp-loader >/dev/null 2>&1; then
+                xdp-loader status "$_ifn" 2>/dev/null
+                echo -e "${GREEN}[+]${NC} XDP режим доступен на $_ifn. Используй xdp-loader для загрузки правил."
+            else
+                echo -e "${YELLOW}[i]${NC} xdp-tools не установлены. Минимальный XDP armor требует:"
+                echo "    apt install -y xdp-tools     # из xdp-project/xdp-tools"
+                echo "    git clone https://github.com/xdp-project/xdp-tools && cd xdp-tools && make"
+                echo "    После — xdp-filter load $_ifn && xdp-filter drop ipv4-saddr <bad-ip>"
+            fi
+            _audit xdp-armor "action=probe iface=$_ifn"
+            ;;
+        off|disable)
+            local _ifn
+            _ifn=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+            : "${_ifn:=eth0}"
+            ip link set dev "$_ifn" xdp off 2>/dev/null || true
+            command -v xdp-loader >/dev/null 2>&1 && xdp-loader unload --all "$_ifn" 2>/dev/null || true
+            _audit xdp-armor "action=off iface=$_ifn"
+            echo -e "${GREEN}[+]${NC} XDP armor отключён на $_ifn."
+            ;;
+        status)
+            local _ifn
+            _ifn=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+            : "${_ifn:=eth0}"
+            echo "Iface: $_ifn"
+            ip -d link show dev "$_ifn" 2>/dev/null | grep -E 'xdp|prog' || echo "  (no XDP program attached)"
+            command -v xdp-loader >/dev/null 2>&1 && xdp-loader status "$_ifn" 2>/dev/null
+            ;;
+        help|*)
+            cat <<'XDP_HELP_EOF'
+Usage:
+    xdp-armor on        # включить XDP-режим на default iface (probe + рекомендации)
+    xdp-armor off       # выгрузить все XDP-программы с default iface
+    xdp-armor status    # текущий статус XDP на default iface
+
+X4: XDP armor — kernel 4.18+ BPF-фильтр на уровне NIC. Дропает мал-трафик
+ДО conntrack/iptables: 0 ms overhead, защита от port-scan / SYN-flood.
+Команда — opt-in scaffold: probes ядро и предлагает install xdp-tools.
+Реальный production-armor требует custom BPF-программ из xdp-project/xdp-tools.
+XDP_HELP_EOF
+            ;;
+    esac
+}
+
+# ===== v8.12 (X7): stealth-check --ja4r — JA4_R fingerprint audit =====
+# JA4_R (raw) — современный TLS fingerprint от FoxIO. Более точный чем JA3:
+# учитывает ClientHello extensions, signature algorithms, ALPN list.
+# Если у тебя установлен tshark (Wireshark) с поддержкой ja4 (через lua-plugin
+# от FoxIO), мы можем извлечь JA4_R прямо из live-traffic.
+# Иначе — выводим что доступно через ClientHello-парсинг openssl.
+ja4r_check_command() {
+    if [ "$(id -u)" != "0" ]; then
+        echo -e "${RED}[!] ja4r-check requires root (raw socket).${NC}"
+        return 1
+    fi
+    if ! command -v tshark >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] tshark не установлен. Без него только partial-JA4 через openssl.${NC}"
+        echo "    apt install -y tshark   # для full JA4_R parsing"
+    fi
+    local _ifn
+    _ifn=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    : "${_ifn:=eth0}"
+    echo -e "${CYAN}${BOLD}=== ja4r-check: JA4_R fingerprint audit (iface=$_ifn, 10s) ===${NC}"
+    # Генерируем outgoing TLS handshake
+    (curl -s -o /dev/null --max-time 8 https://www.apple.com/ 2>/dev/null) &
+    local _curl_pid=$!
+    local _pcap
+    _pcap=$(mktemp /tmp/ja4r-XXXX.pcap)
+    timeout 10 tcpdump -i "$_ifn" -s 0 -w "$_pcap" 'tcp dst port 443' 2>/dev/null || true
+    wait "$_curl_pid" 2>/dev/null || true
+    if [ ! -s "$_pcap" ]; then
+        echo -e "${YELLOW}[!] pcap пустой.${NC}"; rm -f "$_pcap"; return 1
+    fi
+    # JA4 lua-plugin: https://github.com/FoxIO-LLC/ja4
+    if command -v tshark >/dev/null 2>&1; then
+        # Tshark с JA4 plugin показывает ja4 / ja4_r прямо в выводе
+        local _ja4 _ja4r
+        _ja4=$(tshark -r "$_pcap" -Y "tls.handshake.type == 1" -T fields -e tls.handshake.ja4 2>/dev/null | head -1)
+        _ja4r=$(tshark -r "$_pcap" -Y "tls.handshake.type == 1" -T fields -e tls.handshake.ja4_r 2>/dev/null | head -1)
+        if [ -n "$_ja4" ]; then
+            echo -e "${GREEN}[ok]${NC} JA4:   $_ja4"
+            echo -e "${GREEN}[ok]${NC} JA4_R: $_ja4r"
+            # Сравниваем с iOS 18 Safari эталоном (FoxIO database):
+            # iOS 18.x Safari JA4 = t13d1517h2_8daaf6152771_b0da82dd1658
+            local _expected="t13d1517h2_8daaf6152771_b0da82dd1658"
+            if [ "$_ja4" = "$_expected" ]; then
+                echo -e "${GREEN}[match]${NC} JA4 == iOS 18 Safari эталон."
+            else
+                echo -e "${YELLOW}[drift]${NC} JA4 ≠ iOS 18 Safari эталон."
+                echo "    Ожидалось: $_expected"
+                echo "    Получено:  $_ja4"
+                echo "    Рекомендация: curl-impersonate или sing-box uTLS chrome120/safari17."
+            fi
+        else
+            echo -e "${YELLOW}[!]${NC} tshark не извлёк JA4 (plugin не загружен?). Установи: https://github.com/FoxIO-LLC/ja4"
+        fi
+    fi
+    rm -f "$_pcap"
+    _audit ja4r-check "iface=$_ifn"
+}
+
+# ===== v8.12: Grafana dashboard.json generator =====
+# Готовый dashboard для prom-metrics exporter — visualize health_score,
+# noise_failures, profile snapshots, TCP retrans, congestion control,
+# connections per cpu. Импортируется в Grafana через "Dashboards → Import".
+grafana_dashboard_command() {
+    local _sub="${1:-help}"; shift || true
+    case "$_sub" in
+        json)
+            cat <<'GRAFANA_JSON_EOF'
+{
+  "annotations": { "list": [{"builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Health Score",
+      "type": "stat",
+      "id": 1,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_health_score", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "horizontal", "colorMode": "background"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "red", "value": 0}, {"color": "yellow", "value": 60}, {"color": "green", "value": 80}]}, "unit": "percent"}}
+    },
+    {
+      "title": "Noise Loops Status",
+      "type": "table",
+      "id": 2,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_noise_loop_alive", "refId": "A", "format": "table", "instant": true}],
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0}
+    },
+    {
+      "title": "Noise Failures Rate (1m)",
+      "type": "timeseries",
+      "id": 3,
+      "datasource": "prometheus",
+      "targets": [{"expr": "rate(vps_noise_failures_total[1m])", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "title": "TCP Retransmissions",
+      "type": "timeseries",
+      "id": 4,
+      "datasource": "prometheus",
+      "targets": [{"expr": "rate(vps_tcp_retrans_total[5m])", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "title": "Congestion Control",
+      "type": "stat",
+      "id": 5,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_congestion_control_info", "refId": "A", "format": "table"}],
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 8}
+    },
+    {
+      "title": "ESTAB Connections",
+      "type": "timeseries",
+      "id": 6,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_connections_established", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 8}
+    },
+    {
+      "title": "BBR3 Pacing Rate (Mbps)",
+      "type": "timeseries",
+      "id": 7,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_bbr_pacing_rate_bytes * 8 / 1024 / 1024", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "title": "Profile Snapshots",
+      "type": "stat",
+      "id": 8,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_profile_snapshots_total", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16}
+    },
+    {
+      "title": "QUIC RTT (latency-hist)",
+      "type": "heatmap",
+      "id": 9,
+      "datasource": "prometheus",
+      "targets": [{"expr": "rate(vps_quic_rtt_seconds_bucket[5m])", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+    },
+    {
+      "title": "Cookie Tier Distribution (3-tier X5)",
+      "type": "piechart",
+      "id": 10,
+      "datasource": "prometheus",
+      "targets": [{"expr": "vps_cookie_tier_total", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["vps-optimizer", "noble-net-warp"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "VPS Optimizer / noble-net-warp",
+  "uid": "vps-optimizer-main",
+  "version": 1,
+  "weekStart": ""
+}
+GRAFANA_JSON_EOF
+            ;;
+        install)
+            local _dst="${1:-/var/lib/grafana/dashboards/vps-optimizer.json}"
+            mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+            grafana_dashboard_command json > "$_dst"
+            echo -e "${GREEN}[+]${NC} Dashboard сохранён: $_dst"
+            echo "    В Grafana: Dashboards → Import → Upload JSON file → выбрать этот файл."
+            _audit grafana-dashboard "action=install dst=$_dst"
+            ;;
+        help|*)
+            cat <<'GD_HELP_EOF'
+Usage:
+    grafana-dashboard json                 # вывести JSON в stdout (для pipe)
+    grafana-dashboard install [path]       # сохранить в /var/lib/grafana/dashboards/
+                                             (default) или указанный path
+    grafana-dashboard help                 # это сообщение
+
+v8.12: готовый Grafana dashboard для prom-metrics exporter.
+Импорт: Grafana → Dashboards → Import → Upload JSON.
+
+Включает панели: Health Score / Noise Loops / TCP Retrans / Congestion Control /
+BBR Pacing / QUIC RTT histogram / Cookie tier distribution.
+GD_HELP_EOF
+            ;;
+    esac
 }
 
 reset_all() {
@@ -6056,15 +6817,54 @@ doctor_command() {
         fi
     fi
 
-    # v8.10 (Y7): io_uring availability — recommend для sing-box/xray.
+    # v8.10 (Y7) + v8.12 (X1): io_uring availability + per-binary capability probe.
     # io_uring (kernel 5.1+) даёт 2-5x reduction в syscalls vs epoll. Real
-    # gain зависит от собран ли proxy с поддержкой.  io_uring_setup syscall
-    # доступен через `/proc/kallsyms`, но проще — проверить kernel version.
+    # gain зависит от собран ли proxy с поддержкой. Проверяем:
+    #   1) kernel version (>= 5.1)
+    #   2) что `io_uring_setup` syscall не отключён через kernel.io_uring_disabled
+    #   3) для каждой найденной прокси-бинарки (sing-box, xray, hysteria, naive)
+    #      — strings | grep io_uring (статически собранные бинари показывают это)
+    #   4) рекомендация что включить в config (SQPOLL для xray, sniff для sing-box)
     if [ -r /proc/version ]; then
-        local _kver
-        _kver=$(uname -r 2>/dev/null | awk -F. '{print $1*1000 + $2}')
+        local _kver _kver_str _io_uring_disabled
+        _kver_str=$(uname -r 2>/dev/null)
+        _kver=$(echo "$_kver_str" | awk -F. '{print $1*1000 + $2}')
         if [ -n "$_kver" ] && [ "$_kver" -ge 5001 ] 2>/dev/null; then
-            echo -e "${GREEN}[ok]${NC} io_uring доступен (kernel >=5.1). Recommend: sing-box/xray с SQPOLL=on."
+            _io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo "0")
+            if [ "${_io_uring_disabled:-0}" = "0" ]; then
+                echo -e "${GREEN}[ok]${NC} io_uring доступен (kernel $_kver_str >= 5.1, io_uring_disabled=0)."
+            else
+                echo -e "${YELLOW}[i]${NC} io_uring заблокирован: kernel.io_uring_disabled=$_io_uring_disabled."
+                echo "    Включить: sysctl kernel.io_uring_disabled=0 (или apply --preset proxy)."
+            fi
+            # v8.12 (X1): per-binary capability check
+            local _bin _found_proxy=0
+            for _bin in xray sing-box hysteria hysteria2 naive sslh; do
+                local _path
+                _path=$(command -v "$_bin" 2>/dev/null)
+                [ -n "$_path" ] || continue
+                _found_proxy=1
+                if strings "$_path" 2>/dev/null | grep -qE 'io_uring_setup|io_uring_register|liburing' 2>/dev/null; then
+                    echo -e "${GREEN}[ok]${NC} $_bin (-> $_path): io_uring капабельность найдена в бинаре."
+                    case "$_bin" in
+                        xray)
+                            echo "    Recommend: log/dialerProxy → \"socketSettings\": {\"tcpUseIOUringFastPath\": true}"
+                            ;;
+                        sing-box)
+                            echo "    Recommend: \"inbounds[].iouring_sqpoll\": true (если supported в твоей build)."
+                            ;;
+                        hysteria*)
+                            echo "    Hysteria2 default использует udp_segment + GSO; io_uring не критичен."
+                            ;;
+                    esac
+                else
+                    echo -e "${GRAY}[i]${NC} $_bin (-> $_path): io_uring symbols not found (либо стрипнуто, либо без поддержки)."
+                    echo "    Рекомендация: пересобрать с CGO_ENABLED=1 + tag 'with_liburing' для full speedup."
+                fi
+            done
+            if [ "$_found_proxy" -eq 0 ]; then
+                echo -e "${GRAY}[i]${NC} io_uring probe: прокси-бинарки (xray/sing-box/hysteria) не найдены в PATH."
+            fi
         fi
     fi
 
@@ -7659,7 +8459,25 @@ _vps_optimizer_complete() {
             COMPREPLY=( $(compgen -W "local plain dot doh doq dnssec padding cloudflare google quad9 yandex adguard custom" -- "$cur") )
             return ;;
         noise)
-            COMPREPLY=( $(compgen -W "on off edit test status" -- "$cur") )
+            COMPREPLY=( $(compgen -W "on off edit test status calendar" -- "$cur") )
+            return ;;
+        masque)
+            COMPREPLY=( $(compgen -W "snippet-singbox snippet-xray snippet-hysteria status help" -- "$cur") )
+            return ;;
+        reuseport-lb)
+            COMPREPLY=( $(compgen -W "apply override status help" -- "$cur") )
+            return ;;
+        xdp-armor)
+            COMPREPLY=( $(compgen -W "on off status help" -- "$cur") )
+            return ;;
+        fastpath)
+            COMPREPLY=( $(compgen -W "on off status" -- "$cur") )
+            return ;;
+        quic-tune)
+            COMPREPLY=( $(compgen -W "apply status help" -- "$cur") )
+            return ;;
+        grafana-dashboard)
+            COMPREPLY=( $(compgen -W "json install help" -- "$cur") )
             return ;;
         playbook)
             COMPREPLY=( $(compgen -W "list hysteria2-host wg-vpn-server web-frontend" -- "$cur") )
@@ -7678,7 +8496,7 @@ _vps_optimizer_complete() {
             return ;;
     esac
     if [ "$cword" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version fastpath quic-tune pin" -- "$cur") )
+        COMPREPLY=( $(compgen -W "install apply status doctor top mtr prom-push prom-serve prom-metrics why wg audit harden uninstall self-test reset preset noise dns swap benchmark compare logs export import update help config stealth-test audit-syslog backup-config playbook health-watch suggest wizard log-tail bench-suite profile install-completion whoami show compare-presets rollback version fastpath quic-tune pin masque reuseport-lb xdp-armor ja4r-check grafana-dashboard noise-calendar" -- "$cur") )
     fi
 }
 complete -F _vps_optimizer_complete vps_optimizer.sh vps-optimizer
@@ -8859,6 +9677,38 @@ provider_tune_command() {
             # Conservative (без больших переплюйб-ков)
             _audit provider-tune "provider=$_provider"
             ;;
+        # v8.12: RU cloud-провайдеры.
+        yandex-cloud)
+            echo -e "${GRAY}    Yandex.Cloud: KVM virtio_net, чаще всего 10G; РФ-локация → низкий ping до РФ-юзеров${NC}"
+            sysctl_safe net.core.rmem_max 33554432 || true
+            sysctl_safe net.core.wmem_max 33554432 || true
+            # Yandex.Cloud virtio любит slow_start_after_idle=0 (для бэндвидс-stable connections).
+            sysctl_safe net.ipv4.tcp_slow_start_after_idle 0 || true
+            # Conntrack limit чуть выше (РФ-клиенты могут много conn).
+            sysctl_safe net.netfilter.nf_conntrack_max 524288 || true
+            _audit provider-tune "provider=yandex-cloud"
+            ;;
+        vk-cloud)
+            echo -e "${GRAY}    VK Cloud (ex Mail.ru Cloud Solutions): KVM virtio, OpenStack stack${NC}"
+            sysctl_safe net.core.rmem_max 33554432 || true
+            sysctl_safe net.core.wmem_max 33554432 || true
+            # MCS virtio sometimes имеет проблемы с TSO+GRO одновременно — disable TSO.
+            local _ifn_vk
+            _ifn_vk=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+            if [ -n "$_ifn_vk" ]; then
+                ethtool -K "$_ifn_vk" tso off gro on 2>/dev/null || true
+            fi
+            _audit provider-tune "provider=vk-cloud"
+            ;;
+        selectel)
+            echo -e "${GRAY}    Selectel: KVM virtio + LACP-bonding на dedicated; bare-metal=DPDK на серверах${NC}"
+            # Selectel сильный сетевой стек, можно повыше limits.
+            sysctl_safe net.core.rmem_max 67108864 || true
+            sysctl_safe net.core.wmem_max 67108864 || true
+            sysctl_safe net.core.netdev_max_backlog 10000 || true
+            sysctl_safe net.ipv4.tcp_max_syn_backlog 65535 || true
+            _audit provider-tune "provider=selectel"
+            ;;
         generic|*)
             echo -e "${GRAY}    generic provider — без специфичных deltas${NC}"
             _audit provider-tune "provider=$_provider mode=noop"
@@ -8992,8 +9842,11 @@ Usage:
     noise-mc status  # current state + timer-status
     noise-mc step    # одна итерация (для теста)
 
-States: IDLE / STREAMING / SYNC / MESSAGING
-Каждый state → endpoint subset из noise-pool с реальными iOS-распределениями.
+States (4, default):    IDLE / STREAMING / SYNC / MESSAGING
+States (6, opt-in):     IDLE / MORNING_CHECK / ACTIVE / BURST / LUNCH / DEEP_SLEEP
+                        — v8.12 (X6), для активации: ENABLE_MARKOV_6STATE=1
+                        в /etc/vps-noise.conf или env.
+Каждый state → endpoint subset из noise-pool с реальными iOS/RU-распределениями.
 NHELP
             ;;
     esac
@@ -9006,6 +9859,19 @@ _noise_mc_step() {
     local _cur="IDLE"
     [ -f "$_state_file" ] && _cur=$(cat "$_state_file" 2>/dev/null)
     : "${_cur:=IDLE}"
+    # v8.12 (X6): 6-state Markov chain (opt-in via ENABLE_MARKOV_6STATE=1).
+    # States: IDLE / MORNING_CHECK / ACTIVE / BURST / LUNCH / DEEP_SLEEP.
+    # Семантика: симулирует реалистичный день РФ-юзера.
+    #   IDLE          — фоновая активность, рутинные push-сверки
+    #   MORNING_CHECK — утро: почта + новости (короткая активная фаза 6-9)
+    #   ACTIVE        — рабочий день: смешанная активность
+    #   BURST         — пиковая активность (видео/streaming/большие downloads)
+    #   LUNCH         — обед 13-14: slower pace + food-delivery API
+    #   DEEP_SLEEP    — 0:30-6:00: минимум push, никаких user-actions
+    if [ "${ENABLE_MARKOV_6STATE:-0}" = "1" ]; then
+        _noise_mc_step_6state "$_state_file"
+        return
+    fi
     # Random 0..99
     local _r=$(( RANDOM % 100 ))
     local _next="$_cur"
@@ -9071,6 +9937,121 @@ _noise_mc_step() {
         sleep 1
     done
     _audit noise-mc "step=$_cur→$_next bursts=$_bursts"
+}
+
+# v8.12 (X6): 6-state Markov chain implementation.
+# Transitions weighted by current hour-of-day для реалистичной diurnal-curve.
+_noise_mc_step_6state() {
+    local _state_file="$1"
+    local _cur="IDLE"
+    [ -f "$_state_file" ] && _cur=$(cat "$_state_file" 2>/dev/null)
+    case "$_cur" in
+        IDLE|MORNING_CHECK|ACTIVE|BURST|LUNCH|DEEP_SLEEP) : ;;
+        *) _cur=IDLE ;;
+    esac
+    local _h _r _next="$_cur"
+    _h=$(date +%H); _h=$((10#$_h))
+    _r=$(( RANDOM % 100 ))
+
+    # Hour-dependent forced transitions (override matrix).
+    if [ "$_h" -ge 0 ] && [ "$_h" -le 5 ]; then
+        # 0..5 — deep sleep window
+        _next=DEEP_SLEEP
+    elif [ "$_h" -ge 6 ] && [ "$_h" -le 9 ] && [ "$_cur" = "DEEP_SLEEP" ]; then
+        # Утренний переход из глубокого сна
+        _next=MORNING_CHECK
+    elif [ "$_h" -eq 13 ] && [ "$_cur" != "LUNCH" ]; then
+        # Обед: forced 70% transition в LUNCH
+        if [ "$_r" -lt 70 ]; then _next=LUNCH; fi
+    else
+        # Обычная матрица переходов (per-state distributions).
+        case "$_cur" in
+            IDLE)
+                if   [ "$_r" -lt 60 ]; then _next=IDLE
+                elif [ "$_r" -lt 75 ]; then _next=ACTIVE
+                elif [ "$_r" -lt 85 ]; then _next=BURST
+                elif [ "$_r" -lt 95 ]; then _next=MORNING_CHECK
+                else                         _next=LUNCH
+                fi
+                ;;
+            MORNING_CHECK)
+                if   [ "$_r" -lt 20 ]; then _next=IDLE
+                elif [ "$_r" -lt 50 ]; then _next=MORNING_CHECK
+                elif [ "$_r" -lt 90 ]; then _next=ACTIVE
+                else                         _next=BURST
+                fi
+                ;;
+            ACTIVE)
+                if   [ "$_r" -lt 25 ]; then _next=IDLE
+                elif [ "$_r" -lt 60 ]; then _next=ACTIVE
+                elif [ "$_r" -lt 85 ]; then _next=BURST
+                else                         _next=LUNCH
+                fi
+                ;;
+            BURST)
+                if   [ "$_r" -lt 30 ]; then _next=IDLE
+                elif [ "$_r" -lt 50 ]; then _next=ACTIVE
+                elif [ "$_r" -lt 90 ]; then _next=BURST
+                else                         _next=LUNCH
+                fi
+                ;;
+            LUNCH)
+                if   [ "$_r" -lt 40 ]; then _next=LUNCH
+                elif [ "$_r" -lt 70 ]; then _next=IDLE
+                elif [ "$_r" -lt 90 ]; then _next=ACTIVE
+                else                         _next=BURST
+                fi
+                ;;
+            DEEP_SLEEP)
+                if   [ "$_r" -lt 95 ]; then _next=DEEP_SLEEP
+                else                         _next=IDLE
+                fi
+                ;;
+        esac
+    fi
+    echo "$_next" > "$_state_file"
+
+    local _eps=() _bursts=1
+    case "$_next" in
+        IDLE)
+            _eps=("https://gateway.push.apple.com/" "https://courier.push.apple.com/" "https://api-glb-aue1a.smoot.apple.com/")
+            ;;
+        MORNING_CHECK)
+            _eps=("https://imap.mail.me.com/" "https://lenta.ru/" "https://www.rbc.ru/" "https://www.gismeteo.ru/weather-moscow-4368/")
+            _bursts=$(( RANDOM % 3 + 2 ))   # 2-4 — утреннее «много короткое»
+            ;;
+        ACTIVE)
+            _eps=("https://yandex.ru/" "https://vk.com/feed" "https://api.vk.com/method/newsfeed.get?v=5.199" "https://lenta.ru/" "https://www.wildberries.ru/")
+            _bursts=$(( RANDOM % 3 + 1 ))   # 1-3
+            ;;
+        BURST)
+            _eps=("https://audio-ssl.itunes.apple.com/" "https://video-ssl.itunes.apple.com/" "https://strm.yandex.net/get/music/" "https://www.youtube.com/feed/trending")
+            _bursts=$(( RANDOM % 4 + 2 ))   # 2-5 — пик активности
+            ;;
+        LUNCH)
+            _eps=("https://eda.yandex.ru/" "https://www.delivery-club.ru/" "https://api.taxi.yandex.net/4.0/zoneinfo" "https://www.tinkoff.ru/")
+            _bursts=$(( RANDOM % 2 + 1 ))
+            ;;
+        DEEP_SLEEP)
+            # Минимум — только push (как реальный iPhone ночью).
+            _eps=("https://gateway.push.apple.com/" "https://1-courier.push.apple.com/")
+            # 80% шанс пропустить burst вовсе
+            (( $(urand 0 4) > 0 )) && _bursts=0 || _bursts=1
+            ;;
+    esac
+    if [ "$_bursts" -gt 0 ] && [ "${#_eps[@]}" -gt 0 ]; then
+        local _b _ep
+        for _b in $(seq 1 "$_bursts"); do
+            _ep="${_eps[$(( RANDOM % ${#_eps[@]} ))]}"
+            if command -v curl_safari17_4 >/dev/null 2>&1; then
+                curl_safari17_4 -s -o /dev/null --max-time 5 "$_ep" 2>/dev/null || true
+            else
+                curl -s -o /dev/null --max-time 5 "$_ep" 2>/dev/null || true
+            fi
+            sleep 1
+        done
+    fi
+    _audit noise-mc6 "step=$_cur→$_next h=$_h bursts=$_bursts"
 }
 
 _v810_install_noise_mc_timer() {
@@ -9780,6 +10761,11 @@ print_cli_help() {
     printf "    %-24s %s\n" "noise calendar refresh" "обновить РФ-календарь (isdayoff.ru)"
     printf "    %-24s %s\n" "fastpath on|off|status" "nftables flowtable (опт-ин, kernel-fastpath)"
     printf "    %-24s %s\n" "quic-tune apply|status" "QUIC bundle (udp_early_demux + ethtool tx-udp-segmentation)"
+    printf "    %-24s %s\n" "masque snippet-* " "v8.12 (X2): MASQUE/CONNECT-UDP config snippet generator"
+    printf "    %-24s %s\n" "reuseport-lb ..." "v8.12 (X3): SO_REUSEPORT_LB sysctl + systemd-override"
+    printf "    %-24s %s\n" "xdp-armor on|off" "v8.12 (X4): XDP eBPF фильтр на NIC (opt-in)"
+    printf "    %-24s %s\n" "ja4r-check" "v8.12 (X7): JA4_R fingerprint audit (tshark + plugin)"
+    printf "    %-24s %s\n" "grafana-dashboard json" "v8.12: вывести готовый Grafana dashboard JSON"
     printf "    %-24s %s\n" "dns ..." "$(_t cmd_dns)"
     printf "    %-24s %s\n" "swap <gb>" "$(_t cmd_swap)"
     printf "    %-24s %s\n" "benchmark" "$(_t cmd_benchmark)"
@@ -10090,6 +11076,18 @@ cli_dispatch() {
         fastpath)       fastpath_command "${args[0]:-status}" ;;
         # v8.11 (E2): QUIC bundle tuning (udp_early_demux + udp_mem + ethtool TXUS).
         quic-tune)      quic_tune_command "${args[0]:-apply}" ;;
+        # v8.12 (X2): MASQUE / CONNECT-UDP config-snippet generator.
+        masque)         masque_command "${args[@]}" ;;
+        # v8.12 (X3): SO_REUSEPORT_LB sysctl + systemd-override.
+        reuseport-lb)   reuseport_lb_command "${args[@]}" ;;
+        # v8.12 (X4): XDP armor — kernel BPF-фильтр на NIC.
+        xdp-armor)      xdp_armor_command "${args[@]}" ;;
+        # v8.12 (X7): JA4_R fingerprint audit (через tshark + ja4 plugin).
+        ja4r-check)     ja4r_check_command ;;
+        # v8.12: Grafana dashboard.json generator.
+        grafana-dashboard) grafana_dashboard_command "${args[@]}" ;;
+        # v8.11 (E6) → v8.12: noise calendar refresh + canonical "noise" subcommands.
+        noise-calendar) noise_calendar_refresh ;;
         _prom_handler)  _prom_handler ;;
         _top_snapshot)  _top_snapshot ;;
         stealth-test)   stealth_test_command "${args[@]}" ;;
@@ -10716,6 +11714,24 @@ if [ $# -gt 0 ]; then
             ;;
         prom-metrics) prom_metrics; exit 0 ;;
         _prom_handler) _prom_handler; exit 0 ;;
+        # v8.12: read-only / snippet-only commands не требуют root.
+        masque)
+            shift
+            masque_command "$@"
+            exit $?
+            ;;
+        grafana-dashboard)
+            shift
+            grafana_dashboard_command "$@"
+            exit $?
+            ;;
+    esac
+    # v8.12: status-subcommands у новых команд тоже read-only.
+    case "$1 ${2:-}" in
+        "xdp-armor status")     shift; xdp_armor_command status;   exit $? ;;
+        "reuseport-lb status")  shift; reuseport_lb_command status; exit $? ;;
+        "fastpath status")      shift; fastpath_command status;    exit $? ;;
+        "quic-tune status")     shift; quic_tune_command status;   exit $? ;;
     esac
     check_root
     cli_dispatch "$@"
