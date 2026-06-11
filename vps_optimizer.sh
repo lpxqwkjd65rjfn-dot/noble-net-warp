@@ -114,7 +114,7 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.13"
+SCRIPT_VERSION="8.16"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -205,7 +205,8 @@ I18N_EN[cmd_why]="Explain why a specific sysctl is set this way"
 I18N_EN[cmd_top]="TUI: live top-connections, conntrack util, retransmits"
 I18N_EN[cmd_mtr]="Bundled mtr with loss prediction (requires mtr)"
 I18N_EN[cmd_prom_push]="Push Prometheus metrics to a pushgateway"
-I18N_EN[cmd_stealth_test]="JA3-leak self-check via ja3er.com"
+I18N_EN[cmd_stealth_test]="JA3/JA4-leak self-check via tls.peet.ws"
+I18N_EN[cmd_fingerprint_audit]="Offline UA<->headers consistency audit"
 I18N_EN[cmd_audit_syslog]="Forward audit-log to remote syslog"
 I18N_EN[cmd_backup_config]="Snapshot configs to rclone-remote"
 I18N_EN[cmd_playbook]="Pre-baked roles: hysteria2-host|wg-vpn-server|web-frontend"
@@ -276,7 +277,8 @@ I18N_RU[cmd_why]="Объяснить почему конкретный sysctl т
 I18N_RU[cmd_top]="TUI: live топ-conn, conntrack, retransmits"
 I18N_RU[cmd_mtr]="Bundled mtr с прогнозом потерь (требует mtr)"
 I18N_RU[cmd_prom_push]="Push Prometheus метрик в pushgateway"
-I18N_RU[cmd_stealth_test]="Само-проверка JA3-leak'а через ja3er.com"
+I18N_RU[cmd_stealth_test]="Само-проверка JA3/JA4-leak'а через tls.peet.ws"
+I18N_RU[cmd_fingerprint_audit]="Офлайн-аудит консистентности UA и заголовков"
 I18N_RU[cmd_audit_syslog]="Пересылать audit-log в remote syslog"
 I18N_RU[cmd_backup_config]="Выгрузить конфиги в rclone-remote"
 I18N_RU[cmd_playbook]="Готовые роли: hysteria2-host|wg-vpn-server|web-frontend"
@@ -347,7 +349,8 @@ I18N_DE[cmd_why]="Erklären warum ein bestimmter sysctl so gesetzt ist"
 I18N_DE[cmd_top]="TUI: Live Top-Verbindungen, conntrack-Auslastung, retransmits"
 I18N_DE[cmd_mtr]="mtr mit Verlustvorhersage (benötigt mtr)"
 I18N_DE[cmd_prom_push]="Prometheus-Metriken zu Pushgateway senden"
-I18N_DE[cmd_stealth_test]="JA3-Leak-Selbstprüfung via ja3er.com"
+I18N_DE[cmd_stealth_test]="JA3/JA4-Leak-Selbstprüfung via tls.peet.ws"
+I18N_DE[cmd_fingerprint_audit]="Offline-Audit UA<->Header-Konsistenz"
 I18N_DE[cmd_audit_syslog]="audit-log an Remote-Syslog weiterleiten"
 I18N_DE[cmd_backup_config]="Konfig-Snapshots zu rclone-remote"
 I18N_DE[cmd_playbook]="Vorgefertigte Rollen: hysteria2-host|wg-vpn-server|web-frontend"
@@ -403,7 +406,8 @@ I18N_FR[cmd_why]="Expliquer pourquoi un sysctl est ainsi"
 I18N_FR[cmd_top]="TUI: top connexions live, conntrack, retransmits"
 I18N_FR[cmd_mtr]="mtr avec prévision de perte (nécessite mtr)"
 I18N_FR[cmd_prom_push]="Pousser métriques Prometheus vers pushgateway"
-I18N_FR[cmd_stealth_test]="Auto-test JA3-leak via ja3er.com"
+I18N_FR[cmd_stealth_test]="Auto-test JA3/JA4-leak via tls.peet.ws"
+I18N_FR[cmd_fingerprint_audit]="Audit hors-ligne cohérence UA<->en-têtes"
 I18N_FR[cmd_audit_syslog]="Transférer audit-log vers syslog distant"
 I18N_FR[cmd_backup_config]="Snapshot configs vers rclone-remote"
 I18N_FR[cmd_playbook]="Rôles prédéfinis: hysteria2-host|wg-vpn-server|web-frontend"
@@ -459,7 +463,8 @@ I18N_ZH[cmd_why]="解释某个 sysctl 为何如此设置"
 I18N_ZH[cmd_top]="TUI: 实时连接、conntrack、重传"
 I18N_ZH[cmd_mtr]="带丢包预测的 mtr (需要 mtr)"
 I18N_ZH[cmd_prom_push]="推送 Prometheus 指标到 pushgateway"
-I18N_ZH[cmd_stealth_test]="通过 ja3er.com 自检 JA3 泄漏"
+I18N_ZH[cmd_stealth_test]="通过 tls.peet.ws 自检 JA3/JA4 泄漏"
+I18N_ZH[cmd_fingerprint_audit]="离线审计 UA 与请求头一致性"
 I18N_ZH[cmd_audit_syslog]="将 audit-log 转发到远程 syslog"
 I18N_ZH[cmd_backup_config]="将配置快照到 rclone-remote"
 I18N_ZH[cmd_playbook]="预设角色: hysteria2-host|wg-vpn-server|web-frontend"
@@ -511,7 +516,8 @@ print_header() {
     clear
     echo -e "${MAGENTA}${BOLD}"
     echo "================================================================="
-    echo "       ULTRA VPS ACCELERATOR v8.2 (PHOENIX-Z++)                  "
+    # v8.16: версия в баннере берётся из SCRIPT_VERSION (раньше было захардкожено v8.2).
+    printf "       ULTRA VPS ACCELERATOR v%-6s (PHOENIX-Z++)\n" "$SCRIPT_VERSION"
     echo "================================================================="
     echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
     echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
@@ -568,21 +574,8 @@ _debug() {
     echo "[$(date -u +%FT%T.%3NZ)] $*" >> "$DEBUG_LOG" 2>/dev/null || true
 }
 
-# /dev/urandom-based случайное число в диапазоне [a, b]. Используем когда $RANDOM
-# даёт коллизии в параллельных bash-процессах (например loop_ios + loop_news запущены
-# одновременно — получают одинаковую seed, тянут одинаковые URL'ы → паттерн).
-urand_range() {
-    local lo="$1" hi="$2" span r
-    span=$(( hi - lo + 1 ))
-    [ "$span" -le 0 ] && { echo "$lo"; return; }
-    if [ -r /dev/urandom ]; then
-        r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
-        [ -z "$r" ] && r=$RANDOM
-        echo $(( r % span + lo ))
-    else
-        echo $(( RANDOM % span + lo ))
-    fi
-}
+# v8.16: urand_range() удалён из main-скрипта — он не использовался (noise-демон
+# имеет собственный urand внутри своего heredoc). Был мёртвым кодом.
 
 # Lock-файл для предотвращения одновременных apply/reset.
 acquire_lock() {
@@ -775,8 +768,8 @@ list_real_ifaces() {
 # Возвращает: hetzner|digitalocean|vultr|aws|gcp|azure|aeza|timeweb|firstbyte|generic
 detect_provider() {
     local sys_vendor sys_product hostname_lc
-    sys_vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    sys_product=$(cat /sys/class/dmi/id/product_name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    sys_vendor=$(tr '[:upper:]' '[:lower:]' < /sys/class/dmi/id/sys_vendor 2>/dev/null)
+    sys_product=$(tr '[:upper:]' '[:lower:]' < /sys/class/dmi/id/product_name 2>/dev/null)
     hostname_lc=$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')
 
     # DMI-сигнатуры провайдеров
@@ -1691,9 +1684,11 @@ apply_sysctls() {
     # По формуле (low/pressure/high) — 0.5 % / 0.66 % / 1 % от RAM-pages, х mult.
     local _ram_pages _udp_low _udp_pressure _udp_high
     _ram_pages=$(( mem_mb * 256 ))   # mem_mb × 1024 / 4 (4K page)
-    _udp_low=$(( _ram_pages / 200 * PRESET_BUF_MULT ))         # 0.5 %
-    _udp_pressure=$(( _ram_pages * 2 / 300 * PRESET_BUF_MULT )) # 0.66 %
-    _udp_high=$(( _ram_pages / 100 * PRESET_BUF_MULT ))        # 1 %
+    # v8.14: считаем умножение раньше деления (a*c/b вместо a/b*c) — выше точность,
+    # без потери младших бит на integer-делении. Значения остаются в пределах int64.
+    _udp_low=$(( _ram_pages * PRESET_BUF_MULT / 200 ))         # 0.5 %
+    _udp_pressure=$(( _ram_pages * PRESET_BUF_MULT * 2 / 300 )) # 0.66 %
+    _udp_high=$(( _ram_pages * PRESET_BUF_MULT / 100 ))        # 1 %
     [ "$_udp_low" -lt 786432 ] && _udp_low=786432
     [ "$_udp_pressure" -lt 1048576 ] && _udp_pressure=1048576
     [ "$_udp_high" -lt 1572864 ] && _udp_high=1572864
@@ -2235,7 +2230,7 @@ finalize_sysctl_conf() {
         cp "$SYSCTL_CONF" "$SYSCTL_BACKUP" 2>/dev/null || true
     fi
     {
-        echo "# === VPS Optimizer v8.2 PHOENIX-Z++ ==="
+        echo "# === VPS Optimizer v${SCRIPT_VERSION} PHOENIX-Z++ ==="
         echo "# Generated $(date -u +%FT%TZ)  preset=$PRESET_NAME  virt=$VIRT  kernel=$(uname -r)"
         echo "# Только параметры, которые ядро/гипервизор реально приняли."
         cat "$SYSCTL_TMP" 2>/dev/null
@@ -2972,11 +2967,19 @@ ENABLE_MARKOV_6STATE="${ENABLE_MARKOV_6STATE:-0}"
 
 # ===== UA-пулы =====
 UA_IOS=(
-# v8.9 (C2): iOS 18 UA pinning — обновлённые актуальные версии Safari/Mobile.
-# Реальная статистика StatCounter (2025-04): iOS 18.2/18.3 — top traffic share.
-# Раскладка по версиям: 18.3.x ~50%, 18.2.x ~25%, 18.1.x ~15%, 17.x ~10%.
-# Distribution в массиве примерно соответствует, чтобы random pick давал
-# реалистичный mix.
+# v8.15: обновлено под актуальный релизный поезд iOS на середину 2025.
+#   18.5  (build 22F76,  12 мая 2025)  — текущий публичный релиз.
+#   18.4.1(build 22E252, 16 апр 2025), 18.4 (build 22E240, 31 мар 2025).
+# Старые 18.3.x/18.2.x/18.1.x/17.x оставлены — на руках у пользователей реально
+# сосуществует несколько версий (часть откладывает обновление). Раскладка
+# смещена к свежим версиям (18.5/18.4 преобладают), но точные доли StatCounter
+# офлайн подтвердить нельзя — это разумная инженерная оценка, не «свежая» цифра.
+# Safari «Version/X.Y» трекает версию iOS; Mobile/15E148 — постоянный WebKit-токен.
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"
+"Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
@@ -3730,10 +3733,26 @@ SEARCH_QUERIES_RU=(
 "авито"
 )
 
+# Chromium-семейство (Chrome / YaBrowser / Android WebView). image/avif+webp в
+# Accept и client-hints — это Chromium-маркеры.
 ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 ACCEPT_LANG_RU="ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 ACCEPT_LANG_EN="en-US,en;q=0.9"
 ACCEPT_ENC="gzip, deflate, br"
+
+# v8.15: Safari/WebKit (iOS 18) шлёт ДРУГОЙ набор, чем Chromium. Подделка под
+# iOS без этого различия — пассивный fingerprint-tell для DPI/passive-анализа:
+#   • Accept навигации у Safari НЕ содержит image/avif,image/webp (это Chrome).
+#   • Accept-Language у Safari короче: ровно языки из Настроек, без длинного
+#     q-хвоста en-US/en, который добавляет именно Chrome.
+#   • Safari НЕ реализует Fetch-Metadata (Sec-Fetch-*), НЕ шлёт Priority-заголовок
+#     (RFC 9218 как HTTP-header) и давно НЕ шлёт DNT. Эти заголовки добавляются
+#     только в Chromium-ветке ниже.
+ACCEPT_SAFARI="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+ACCEPT_LANG_SAFARI_RU="ru-RU,ru;q=0.9"
+ACCEPT_LANG_SAFARI_EN="en-US,en;q=0.9"
+# Safari iOS 18 поддерживает Brotli, не поддерживает zstd (это Chrome 123+).
+ACCEPT_ENC_SAFARI="gzip, deflate, br"
 
 # v8.11 (F3): cache curl --help all output (used 4-5 раз per request).
 # Lazy-init на первый запрос, потом stick.
@@ -3918,6 +3937,15 @@ _pick_ua_pool() {
         # v8.12 (X10): app-specific UA pools.
         vk_app)     echo "${UA_VK_APP[$(urand 0 $(( ${#UA_VK_APP[@]} - 1 )) )]}" ;;
         yandex_app) echo "${UA_YANDEX_APP[$(urand 0 $(( ${#UA_YANDEX_APP[@]} - 1 )) )]}" ;;
+        # v8.15: ранее эти пулы были «мёртвым кодом» — loop'ы слали mobile_ru
+        # и реальные app-UA не использовались. Теперь loop'ы передают свой kind,
+        # и нативный трафик получает корректный app-UA + app-header-набор.
+        max_app)       echo "${UA_MAX_APP[$(urand 0 $(( ${#UA_MAX_APP[@]} - 1 )) )]}" ;;
+        banking_app)   echo "${UA_BANKING_APP[$(urand 0 $(( ${#UA_BANKING_APP[@]} - 1 )) )]}" ;;
+        appstore_app)  echo "${UA_APP_STORE[$(urand 0 $(( ${#UA_APP_STORE[@]} - 1 )) )]}" ;;
+        streaming_app) echo "${UA_STREAMING_APP[$(urand 0 $(( ${#UA_STREAMING_APP[@]} - 1 )) )]}" ;;
+        music_app)     echo "${UA_MUSIC_APP[$(urand 0 $(( ${#UA_MUSIC_APP[@]} - 1 )) )]}" ;;
+        travel_app)    echo "${UA_TRAVEL_APP[$(urand 0 $(( ${#UA_TRAVEL_APP[@]} - 1 )) )]}" ;;
         *)          echo "${UA_DESKTOP[$(urand 0 $(( ${#UA_DESKTOP[@]} - 1 )) )]}" ;;
     esac
 }
@@ -3948,6 +3976,9 @@ ua_class_rate() {
         ios)       urand 1500 6000 ;;
         desktop)   urand 5000 50000 ;;
         mobile_ru) urand 1000 4000 ;;
+        # v8.15: нативные мобильные приложения — мобильный bandwidth-класс.
+        vk_app|yandex_app|max_app|banking_app|appstore_app|streaming_app|music_app|travel_app|app)
+                   urand 1000 6000 ;;
         *)         rand_rate ;;
     esac
 }
@@ -3979,8 +4010,29 @@ http_request() {
     jar=$(cookie_jar_for_tag "$tag")
     # v8.11 (B2): UA stickiness per session-tag (rotate ~ 4..24h).
     ua=$(sticky_ua "$tag" "$ua_kind")
-    local accept_lang="$ACCEPT_LANG_EN"
-    [ "$lang" = "ru" ] && accept_lang="$ACCEPT_LANG_RU"
+
+    # v8.15: класс UA определяет, какой header-набор реалистичен.
+    #   safari  — iOS Safari/WebKit (ua_kind=ios): без Sec-Fetch/Priority/DNT,
+    #             Safari-Accept, короткий Accept-Language.
+    #   app     — нативное РФ/мобильное приложение (max/banking/vk/yandex/...):
+    #             Accept: */*, без браузерных security-заголовков и без Referer.
+    #   chromium — десктоп Chrome/YaBrowser/Android Chrome (desktop/mobile_ru):
+    #             полный Fetch-Metadata + Priority.
+    local hdr_class="chromium"
+    case "$ua_kind" in
+        ios) hdr_class="safari" ;;
+        vk_app|yandex_app|max_app|banking_app|appstore_app|streaming_app|music_app|travel_app|app)
+             hdr_class="app" ;;
+    esac
+
+    local accept_lang
+    if [ "$hdr_class" = "safari" ]; then
+        accept_lang="$ACCEPT_LANG_SAFARI_EN"
+        [ "$lang" = "ru" ] && accept_lang="$ACCEPT_LANG_SAFARI_RU"
+    else
+        accept_lang="$ACCEPT_LANG_EN"
+        [ "$lang" = "ru" ] && accept_lang="$ACCEPT_LANG_RU"
+    fi
 
     touch "$jar"
 
@@ -3989,7 +4041,8 @@ http_request() {
     local prev="${LAST_URL_PER_TAG[$tag]:-}"
     local sec_fetch_site="none"
     local referer_arg=()
-    if [ -n "$prev" ] && [ "$prev" != "$url" ]; then
+    # v8.15: нативные приложения не шлют браузерный Referer/навигационную цепочку.
+    if [ "$hdr_class" != "app" ] && [ -n "$prev" ] && [ "$prev" != "$url" ]; then
         referer_arg=(-H "Referer: $prev")
         if [ "$(url_origin "$prev")" = "$(url_origin "$url")" ]; then
             sec_fetch_site="same-origin"
@@ -4040,18 +4093,44 @@ http_request() {
         --cookie-jar "$jar" --cookie "$jar"
         -A "$ua"
         -D "$hdr_tmp"
-        -H "Accept: $ACCEPT"
-        -H "Accept-Language: $accept_lang"
-        -H "Accept-Encoding: $ACCEPT_ENC"
-        -H "Sec-Fetch-Dest: document"
-        -H "Sec-Fetch-Mode: navigate"
-        -H "Sec-Fetch-Site: $sec_fetch_site"
-        -H "Sec-Fetch-User: ?1"
-        -H "Upgrade-Insecure-Requests: 1"
-        -H "Priority: $_prio"
-        -H "DNT: 1"
         --limit-rate "${rate}K"
     )
+
+    # v8.15: header-набор по классу UA (см. hdr_class выше).
+    case "$hdr_class" in
+        safari)
+            # iOS Safari/WebKit: НЕТ Sec-Fetch-*/Priority/DNT (это Chromium).
+            args+=(
+                -H "Accept: $ACCEPT_SAFARI"
+                -H "Accept-Language: $accept_lang"
+                -H "Accept-Encoding: $ACCEPT_ENC_SAFARI"
+                -H "Upgrade-Insecure-Requests: 1"
+            )
+            ;;
+        app)
+            # Нативное приложение: API-style Accept, без браузерных заголовков.
+            args+=(
+                -H "Accept: */*"
+                -H "Accept-Language: $accept_lang"
+                -H "Accept-Encoding: gzip, deflate"
+            )
+            ;;
+        *)
+            # Chromium (desktop Chrome / YaBrowser / Android Chrome): полный
+            # Fetch-Metadata + Priority. DNT убран — современный Chrome его не шлёт.
+            args+=(
+                -H "Accept: $ACCEPT"
+                -H "Accept-Language: $accept_lang"
+                -H "Accept-Encoding: $ACCEPT_ENC"
+                -H "Sec-Fetch-Dest: document"
+                -H "Sec-Fetch-Mode: navigate"
+                -H "Sec-Fetch-Site: $sec_fetch_site"
+                -H "Sec-Fetch-User: ?1"
+                -H "Upgrade-Insecure-Requests: 1"
+                -H "Priority: $_prio"
+            )
+            ;;
+    esac
     args+=("${referer_arg[@]}")
     args+=("${cache_args[@]}")
 
@@ -4423,14 +4502,9 @@ loop_doh_jitter() {
 # ============================================================
 #  v8.13 — Loop'ы «идеально правильный РФ-юзер» (Y10-Y21)
 # ============================================================
-# Helper: random app-style UA из массива (для VK/Yandex/Max/streaming).
-# Принимает имя массива через nameref (bash 4.3+).
-_pick_app_ua() {
-    local _arr_name="$1"
-    local -n _arr="$_arr_name"
-    [ "${#_arr[@]}" -gt 0 ] || { echo ""; return; }
-    echo "${_arr[$(urand 0 $(( ${#_arr[@]} - 1 )) )]}"
-}
+# v8.16: helper _pick_app_ua удалён — после v8.15 loop'ы выбирают app-UA
+# напрямую через _pick_ua_pool с корректным kind, отдельный nameref-helper
+# больше не нужен (был мёртвым кодом).
 
 # === Y13: per-timezone hour helper ===
 # Текущий «локальный» час с учётом PERFECT_RU_TZ_OFFSET (часов от MSK).
@@ -4451,14 +4525,13 @@ max_burst() {
     [ "${ENABLE_MAX_MESSENGER:-1}" = "1" ] || return 0
     [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
     [ "${#URLS_MAX[@]}" -gt 0 ] || return 0
-    local url ua
+    local url
     url="${URLS_MAX[$(urand 0 $(( ${#URLS_MAX[@]} - 1 )) )]}"
-    ua=$(_pick_app_ua UA_MAX_APP)
-    # Mobile-ru / Max app UA — Max API endpoints отвечают разные status codes
-    # (401/200), мы их игнорируем, нам важен сам факт TCP/TLS-handshake.
-    http_request "$url" mobile_ru ru max api
-    # Кастомный UA через ENV — fallback если http_request не подхватит:
-    [ -n "$ua" ] || true
+    # v8.15: реальный Max-юзер почти всегда в приложении (heartbeat), изредка
+    # открывает web.max.ru в браузере. 85% app-UA, 15% мобильный браузер.
+    local _k=max_app
+    (( $(urand 0 99) < 15 )) && _k=mobile_ru
+    http_request "$url" "$_k" ru max api
 }
 loop_max() {
     [ "${ENABLE_MAX_MESSENGER:-1}" = "1" ] || return 0
@@ -4490,7 +4563,11 @@ banking_burst() {
     n=$(rrange 2 5)
     for ((i=0; i<n; i++)); do
         url="${URLS_BANKING_DEEP[$(urand 0 $(( ${#URLS_BANKING_DEEP[@]} - 1 )) )]}"
-        http_request "$url" mobile_ru ru banking article
+        # v8.15: банковский клиент в РФ — преимущественно приложение (СБОЛ/ВТБ/...),
+        # реже web-кабинет. 70% app-UA, 30% мобильный браузер.
+        local _k=banking_app
+        (( $(urand 0 9) < 3 )) && _k=mobile_ru
+        http_request "$url" "$_k" ru banking article
         # Realistic dwell — банковский клиент тратит 30-60с на экран.
         sleep "$(rrange 30 60)"
     done
@@ -4514,7 +4591,10 @@ payment_burst() {
     [ "${#URLS_PAYMENT_RU[@]}" -gt 0 ] || return 0
     local url
     url="${URLS_PAYMENT_RU[$(urand 0 $(( ${#URLS_PAYMENT_RU[@]} - 1 )) )]}"
-    http_request "$url" mobile_ru ru payment api
+    # v8.15: СБП/МирПэй — touch из банковского приложения.
+    local _k=banking_app
+    (( $(urand 0 9) < 2 )) && _k=mobile_ru
+    http_request "$url" "$_k" ru payment api
 }
 loop_payment() {
     [ "${ENABLE_PAYMENT_BURST:-1}" = "1" ] || return 0
@@ -4535,7 +4615,8 @@ appstore_burst() {
     [ "${#URLS_APP_STORE_RU[@]}" -gt 0 ] || return 0
     local url
     url="${URLS_APP_STORE_RU[$(urand 0 $(( ${#URLS_APP_STORE_RU[@]} - 1 )) )]}"
-    http_request "$url" mobile_ru ru appstore api
+    # v8.15: RuStore/AppGallery/AppStore polling — нативный store-client UA.
+    http_request "$url" appstore_app ru appstore api
 }
 loop_appstore() {
     [ "${ENABLE_APPSTORE_BURST:-1}" = "1" ] || return 0
@@ -4559,7 +4640,10 @@ streaming_burst() {
     n=$(rrange 3 7)
     for ((i=0; i<n; i++)); do
         url="${URLS_STREAMING_RU[$(urand 0 $(( ${#URLS_STREAMING_RU[@]} - 1 )) )]}"
-        http_request "$url" mobile_ru ru streaming article
+        # v8.15: KION/Wink/Кинопоиск — преимущественно приложение, иногда web.
+        local _k=streaming_app
+        (( $(urand 0 9) < 3 )) && _k=mobile_ru
+        http_request "$url" "$_k" ru streaming article
         sleep "$(rrange 5 30)"
     done
 }
@@ -4588,7 +4672,10 @@ music_burst() {
     [ "${#URLS_MUSIC_RU[@]}" -gt 0 ] || return 0
     local url
     url="${URLS_MUSIC_RU[$(urand 0 $(( ${#URLS_MUSIC_RU[@]} - 1 )) )]}"
-    http_request "$url" mobile_ru ru music api
+    # v8.15: Яндекс Музыка/VK Музыка/Звук — нативный плеер.
+    local _k=music_app
+    (( $(urand 0 9) < 2 )) && _k=mobile_ru
+    http_request "$url" "$_k" ru music api
 }
 loop_music() {
     [ "${ENABLE_MUSIC_BURST:-1}" = "1" ] || return 0
@@ -4609,7 +4696,10 @@ travel_burst() {
     [ "${#URLS_TRAVEL_RU[@]}" -gt 0 ] || return 0
     local url
     url="${URLS_TRAVEL_RU[$(urand 0 $(( ${#URLS_TRAVEL_RU[@]} - 1 )) )]}"
-    http_request "$url" mobile_ru ru travel article
+    # v8.15: Tutu/Aviasales/RZD — часть в приложении, часть в браузере.
+    local _k=travel_app
+    (( $(urand 0 9) < 4 )) && _k=mobile_ru
+    http_request "$url" "$_k" ru travel article
 }
 loop_travel() {
     [ "${ENABLE_TRAVEL_BURST:-1}" = "1" ] || return 0
@@ -4969,8 +5059,9 @@ hour_factor() {
 
     case "$profile" in
         office)
-            # v8.11 (C3): lunch-break 13:00 → factor 100 (slower pace, но не тишина)
-            if (( h == 13 )) && [ "${ENABLE_LUNCH_BREAK:-1}" = "1" ]; then echo 100; return; fi
+            # v8.11 (C3): lunch-break 13:00 → factor 100 (slower pace, но не тишина).
+            # v8.16: единый источник истины — is_lunch_break() (раньше дублировалось inline).
+            if is_lunch_break; then echo 100; return; fi
             # «офис» — активность 9-18, минимальная остальное время
             if (( h >= 9 && h <= 18 )); then echo 60
             elif (( h >= NIGHT_HOUR_FROM && h <= NIGHT_HOUR_TO )); then echo 350
@@ -5429,7 +5520,7 @@ NFT_SW
                 cp -f /etc/nftables.d/vps_fastpath.nft /etc/nftables.d/vps_fastpath.nft.bak 2>/dev/null || true
                 nft list table inet vps_fastpath > /etc/nftables.d/vps_fastpath.nft 2>/dev/null || true
             fi
-            [ "$nft_ok" = "1" ] && _audit fastpath "action=on devs=$dev_list" || true
+            [ "$nft_ok" = "1" ] && _audit fastpath "action=on devs=$dev_list"
             ;;
         off|disable|delete)
             if command -v nft >/dev/null 2>&1; then
@@ -5474,15 +5565,17 @@ quic_tune_command() {
             if command -v ethtool >/dev/null 2>&1; then
                 local _i
                 for _i in $(list_real_ifaces 2>/dev/null); do
-                    ethtool -K "$_i" tx-udp-segmentation on 2>/dev/null && \
-                        echo -e "  ${GREEN}[+]${NC} tx-udp-segmentation on на $_i" || true
+                    if ethtool -K "$_i" tx-udp-segmentation on 2>/dev/null; then
+                        echo -e "  ${GREEN}[+]${NC} tx-udp-segmentation on на $_i"
+                    fi
                     # Big ring buffers — берём max доступный.
                     local _maxrx _maxtx
                     _maxrx=$(ethtool -g "$_i" 2>/dev/null | awk '/RX:/{print $2; exit}')
                     _maxtx=$(ethtool -g "$_i" 2>/dev/null | awk '/TX:/{print $2; exit}')
                     if [ -n "$_maxrx" ] && [ -n "$_maxtx" ]; then
-                        ethtool -G "$_i" rx "$_maxrx" tx "$_maxtx" 2>/dev/null && \
-                            echo -e "  ${GREEN}[+]${NC} ring buffers RX=$_maxrx TX=$_maxtx на $_i" || true
+                        if ethtool -G "$_i" rx "$_maxrx" tx "$_maxtx" 2>/dev/null; then
+                            echo -e "  ${GREEN}[+]${NC} ring buffers RX=$_maxrx TX=$_maxtx на $_i"
+                        fi
                     fi
                 done
             fi
@@ -5806,7 +5899,9 @@ xdp_armor_command() {
             _ifn=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
             : "${_ifn:=eth0}"
             ip link set dev "$_ifn" xdp off 2>/dev/null || true
-            command -v xdp-loader >/dev/null 2>&1 && xdp-loader unload --all "$_ifn" 2>/dev/null || true
+            if command -v xdp-loader >/dev/null 2>&1; then
+                xdp-loader unload --all "$_ifn" 2>/dev/null || true
+            fi
             _audit xdp-armor "action=off iface=$_ifn"
             echo -e "${GREEN}[+]${NC} XDP armor отключён на $_ifn."
             ;;
@@ -5857,7 +5952,7 @@ ja4r_check_command() {
     (curl -s -o /dev/null --max-time 8 https://www.apple.com/ 2>/dev/null) &
     local _curl_pid=$!
     local _pcap
-    _pcap=$(mktemp /tmp/ja4r-XXXX.pcap)
+    _pcap=$(mktemp /tmp/ja4r-XXXXXXXXXX.pcap) || return 1
     timeout 10 tcpdump -i "$_ifn" -s 0 -w "$_pcap" 'tcp dst port 443' 2>/dev/null || true
     wait "$_curl_pid" 2>/dev/null || true
     if [ ! -s "$_pcap" ]; then
@@ -8549,6 +8644,92 @@ prom_push_command() {
 # Использует ja3er.com (JSON API). Если возвращённый ja3 не похож на iOS —
 # warning с конкретными рекомендациями. Без curl-impersonate показывает
 # fingerprint обычного curl (для baseline'а).
+# ============================================================
+#  v8.15: fingerprint-audit — ОФЛАЙН-самопроверка консистентности
+#  UA ↔ заголовков. Без единого сетевого запроса.
+# ============================================================
+# Зачем: самый частый способ «спалить» подделку — рассинхрон между User-Agent
+# и набором заголовков (например, iOS Safari-UA + Chromium-only Sec-Fetch-*).
+# Эта команда прогоняет каждый класс трафика через ту же классификацию, что и
+# http_request, печатает ожидаемый header-набор и помечает несоответствия.
+# Полезно после правок UA-пулов или header-логики (CI-friendly: --exit-fail).
+fingerprint_audit_command() {
+    local fail_on_warn=0
+    while [ $# -gt 0 ]; do
+        case "$1" in --exit-fail|--exit-fail-on-warn) fail_on_warn=1 ;; esac
+        shift
+    done
+    # Источник для анализа: задеплоенный noise-генератор, иначе — встроенный
+    # в этот скрипт исходник (между маркерами NOISE_EOF). Полностью офлайн.
+    local src warns=0
+    if [ -n "${NOISE_GEN_SCRIPT:-}" ] && [ -f "${NOISE_GEN_SCRIPT:-/nonexistent}" ]; then
+        src="$NOISE_GEN_SCRIPT"
+        echo -e "${CYAN}${BOLD}=== fingerprint-audit (источник: задеплоенный $src) ===${NC}"
+    else
+        src=$(mktemp /tmp/.vps_fpaudit.XXXXXX) || { echo "mktemp fail"; return 1; }
+        # Берём ровно первый heredoc-блок noise-генератора и больше не
+        # реагируем на повторные вхождения маркера (например, эту же строку).
+        awk 'state==2{next} /<<.NOISE_EOF./ && state==0 {state=1; next} /^NOISE_EOF$/ && state==1 {state=2; next} state==1' "$0" > "$src"
+        echo -e "${CYAN}${BOLD}=== fingerprint-audit (источник: встроенный noise-генератор) ===${NC}"
+    fi
+    [ -s "$src" ] || { echo -e "${RED}[!] не удалось получить исходник noise-генератора${NC}"; return 1; }
+
+    # Извлекаем тело функции http_request для прицельных проверок.
+    local hr
+    hr=$(awk '/^http_request\(\) \{/{f=1} f{print} /^\}/{if(f)exit}' "$src")
+
+    _fp_check() { # desc, condition_already_evaluated(0=ok), hint
+        if [ "$2" = "0" ]; then
+            echo -e "  ${GREEN}\xE2\x9C\x93${NC} $1"
+        else
+            echo -e "  ${YELLOW}\xE2\x9A\xA0${NC} $1 ${GRAY}($3)${NC}"; warns=$((warns+1))
+        fi
+    }
+
+    # Все проверки опираются на реальные строки отправки заголовков (-H "...")
+    # и на маппинг kind — это не цепляет комментарии (надёжно, без ложных срабатываний).
+    local hr_hdr
+    hr_hdr=$(echo "$hr" | grep -E '\-H "')
+
+    echo ""
+    echo -e "${BOLD}1. iOS Safari header-класс${NC}"
+    echo "$hr" | grep -q 'hdr_class="safari"' ; _fp_check "ua_kind=ios → класс safari" "$?" "нет ветки safari"
+    echo "$hr_hdr" | grep -q 'ACCEPT_SAFARI' ; _fp_check "Safari использует ACCEPT_SAFARI (Accept без image/avif,webp)" "$?" "Safari шлёт Chrome-Accept"
+    if echo "$hr_hdr" | grep -q '\-H "DNT'; then _fp_check "DNT не отправляется (Safari/совр. Chrome его не шлют)" 1 "есть -H DNT"; else _fp_check "DNT не отправляется (Safari/совр. Chrome его не шлют)" 0; fi
+    # Sec-Fetch/Priority шлёт только chromium-ветка → ровно по одному -H каждого.
+    local nsf npr
+    nsf=$(echo "$hr_hdr" | grep -c '\-H "Sec-Fetch-Mode')
+    npr=$(echo "$hr_hdr" | grep -c '\-H "Priority:')
+    if [ "$nsf" = "1" ]; then _fp_check "Sec-Fetch только в chromium-ветке (1 место)" 0; else _fp_check "Sec-Fetch только в chromium-ветке" 1 "найдено $nsf отправок"; fi
+    if [ "$npr" = "1" ]; then _fp_check "Priority только в chromium-ветке (1 место)" 0; else _fp_check "Priority только в chromium-ветке" 1 "найдено $npr отправок"; fi
+
+    echo ""
+    echo -e "${BOLD}2. Нативные приложения (app-класс)${NC}"
+    echo "$hr" | grep -q 'hdr_class="app"' ; _fp_check "app-UA → класс app" "$?" "нет ветки app"
+    echo "$hr" | grep -qE 'hdr_class"? != "app"|!= "app"' ; _fp_check "app-класс не шлёт браузерный Referer" "$?" "Referer не исключён для app"
+
+    echo ""
+    echo -e "${BOLD}3. Консистентность UA-пулов ↔ kind${NC}"
+    local k
+    for k in vk_app yandex_app max_app banking_app appstore_app streaming_app music_app travel_app; do
+        if grep -qE "^[[:space:]]*${k}\)" "$src"; then _fp_check "kind '$k' замаплен в _pick_ua_pool" 0; else _fp_check "kind '$k' замаплен в _pick_ua_pool" 1 "мёртвый app-UA пул"; fi
+    done
+
+    echo ""
+    echo -e "${BOLD}4. Свежесть iOS UA${NC}"
+    if grep -q 'iPhone OS 18_5' "$src"; then _fp_check "пул iOS содержит актуальную 18.5" 0; else _fp_check "пул iOS содержит актуальную 18.5" 1 "обнови UA_IOS"; fi
+
+    echo ""
+    if [ "$warns" -eq 0 ]; then
+        echo -e "${GREEN}${BOLD}Итог: 0 несоответствий — генератор консистентен.${NC}"
+    else
+        echo -e "${YELLOW}${BOLD}Итог: $warns предупреждение(й) — см. выше.${NC}"
+    fi
+    [ "$src" = "${NOISE_GEN_SCRIPT:-}" ] || rm -f "$src"
+    if [ "$fail_on_warn" = "1" ] && [ "$warns" -gt 0 ]; then return 2; fi
+    return 0
+}
+
 stealth_test_command() {
     # v8.6: разбор флагов. Глобальный --json уже распарсен в cli_dispatch (JSON=1),
     # поэтому здесь ловим из локальных args ещё --json (для прямых вызовов) +
@@ -8587,15 +8768,24 @@ stealth_test_command() {
         echo -e "${YELLOW}[i] curl-impersonate не установлен — JA3 будет «curl-default»${NC}"
         echo "    Установка: vps_optimizer.sh install (см. раздел curl-impersonate)"
     fi
-    local resp
-    resp=$("$CURL_BIN" -fsS --max-time 10 \
-        -A "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1" \
-        "https://ja3er.com/json" 2>/dev/null)
+    # v8.15: ja3er.com закрыт (сервис недоступен с ~2022-2023). Основной источник
+    # теперь tls.peet.ws/api/all — отдаёт и ja3_hash, и ja4. Старый ja3er.com
+    # оставлен как best-effort fallback (на случай зеркал/возврата).
+    local resp src=""
+    local _ios_ua="Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+    resp=$("$CURL_BIN" -fsS --max-time 10 -A "$_ios_ua" \
+        "https://tls.peet.ws/api/all" 2>/dev/null)
+    [ -n "$resp" ] && src="tls.peet.ws"
+    if [ -z "$resp" ]; then
+        resp=$("$CURL_BIN" -fsS --max-time 10 -A "$_ios_ua" \
+            "https://ja3er.com/json" 2>/dev/null)
+        [ -n "$resp" ] && src="ja3er.com"
+    fi
     if [ -z "$resp" ]; then
         if [ "$want_json" = "1" ]; then
-            printf '{"ok":false,"error":"ja3er.com unreachable","curl":"%s"}\n' "$CURL_BIN"
+            printf '{"ok":false,"error":"fingerprint service unreachable (tls.peet.ws/ja3er.com)","curl":"%s"}\n' "$CURL_BIN"
         else
-            echo -e "${RED}[!] ja3er.com недоступен — проверь сеть${NC}"
+            echo -e "${RED}[!] Сервис отпечатков недоступен (tls.peet.ws / ja3er.com) — проверь сеть${NC}"
         fi
         return 1
     fi
@@ -8628,7 +8818,12 @@ stealth_test_command() {
     # только если попросили --ja4 и есть подходящий curl. Не делаем по умолчанию —
     # это лишний внешний call и не каждый CI хочет такое.
     local ja4_hash=""
-    if [ "$want_ja4" = "1" ] && [ "$has_ja4_capable_curl" = "1" ]; then
+    # v8.15: если основной ответ уже от tls.peet.ws — ja4 берём прямо из него
+    # (без отдельного запроса). Иначе — best-effort через curl-impersonate-chrome.
+    if [ "$src" = "tls.peet.ws" ]; then
+        ja4_hash=$(echo "$resp" | grep -oE '"ja4"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
+    fi
+    if [ -z "$ja4_hash" ] && [ "$want_ja4" = "1" ] && [ "$has_ja4_capable_curl" = "1" ]; then
         local peet_resp
         peet_resp=$(curl-impersonate-chrome -fsS --max-time 10 "https://tls.peet.ws/api/clean" 2>/dev/null)
         ja4_hash=$(echo "$peet_resp" | grep -oE '"ja4"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
@@ -8638,11 +8833,12 @@ stealth_test_command() {
         printf '{"ok":true,"curl":"%s","ja3_md5":"%s","verdict":"%s","leak":%s,"ja4":"%s"}\n' \
             "$CURL_BIN" "${ja3_md5:-}" "$verdict" "$([ $leak = 1 ] && echo true || echo false)" "${ja4_hash:-}"
     else
-        echo "  Ответ ja3er.com:"
+        echo "  Ответ ${src:-сервиса отпечатков}:"
         if command -v jq >/dev/null 2>&1; then
             echo "$resp" | jq . 2>/dev/null | sed 's/^/    /'
         else
-            echo "$resp" | sed 's/^/    /'
+            # v8.14: indent без внешнего sed — параметрическая замена переводов строк.
+            printf '    %s\n' "${resp//$'\n'/$'\n'    }"
         fi
         if [ -n "$ja3_md5" ]; then
             echo ""
@@ -9041,7 +9237,7 @@ suggest_command() {
 wizard_command() {
     echo -e "${CYAN}${BOLD}=== vps-optimizer — first-run wizard (5 шагов) ===${NC}"
     echo ""
-    echo "$(_t wizard_intro 2>/dev/null || echo 'Этот мастер настроит оптимизатор за 5 шагов. Enter = default.')"
+    _t wizard_intro 2>/dev/null || echo 'Этот мастер настроит оптимизатор за 5 шагов. Enter = default.'
     echo ""
 
     # Шаг 1: язык
@@ -10040,8 +10236,8 @@ healing_check_internal() {
     healing_baseline_capture "$_post"
     # Парсим baseline и post в bash-vars
     local _b_rtt _b_loss _b_conn _b_load _p_rtt _p_loss _p_conn _p_load
-    eval "_b_$(cat "$_baseline" | tr ' ' '\n' | grep -E '^(rtt|loss|conn|load)=' | sed 's/=/=/' | sed 's/^/_b_/' | tr '\n' ' ')" 2>/dev/null || true
-    # Простая парсилка: для каждого ключа берём значение из файла
+    # v8.14: убран лишний eval над содержимым файла (code-injection риск + dead code).
+    # Парсинг ниже через grep|cut полностью покрывает все ключи безопасно.
     _b_rtt=$(grep -oE 'rtt=[0-9.]+' "$_baseline" | cut -d= -f2)
     _b_loss=$(grep -oE 'loss=[0-9.]+' "$_baseline" | cut -d= -f2)
     _b_conn=$(grep -oE 'conn=[0-9]+' "$_baseline" | cut -d= -f2)
@@ -10603,7 +10799,7 @@ stealth_check_command() {
     local _curl_pid=$!
     # Захват 10 секунд, фильтр на dst port 443 TCP с SYN-payload, отдача raw hex
     local _pcap
-    _pcap=$(mktemp /tmp/stealth-XXXX.pcap)
+    _pcap=$(mktemp /tmp/stealth-XXXXXXXXXX.pcap) || return 1
     timeout 10 tcpdump -i "$_ifn" -s 0 -w "$_pcap" 'tcp dst port 443' 2>/dev/null || true
     wait "$_curl_pid" 2>/dev/null || true
     if [ ! -s "$_pcap" ]; then
@@ -11575,6 +11771,7 @@ metrics_mtls_command() {
 #   _spin $! "Описание операции"
 _spin() {
     local pid="$1" msg="${2:-working}"
+    # shellcheck disable=SC1003  # spinner-кадры: literal | / - \ (backslash намеренный)
     local i=0 chars='|/-\'
     while kill -0 "$pid" 2>/dev/null; do
         printf "\r${CYAN}[%s]${NC} %s" "${chars:i++%${#chars}:1}" "$msg"
@@ -11589,11 +11786,11 @@ print_cli_help() {
     # пути файлов) остаются английскими — они одинаковы во всех локалях.
     echo -e "${BOLD}vps_optimizer.sh${NC} — $(_t help_title "$SCRIPT_VERSION") (lang=$SCRIPT_LANG)"
     echo ""
-    echo "$(_t help_usage)"
+    _t help_usage
     echo "    vps_optimizer.sh                          # interactive menu"
     echo "    vps_optimizer.sh <command> [options]      # CLI mode (no menu)"
     echo ""
-    echo "$(_t help_commands)"
+    _t help_commands
     printf "    %-24s %s\n" "install" "$(_t cmd_install)"
     printf "    %-24s %s\n" "apply [--preset NAME]" "$(_t cmd_apply)"
     printf "    %-24s %s\n" "status [--json]" "$(_t cmd_status)"
@@ -11605,6 +11802,7 @@ print_cli_help() {
     printf "    %-24s %s\n" "mtr <host>" "$(_t cmd_mtr)"
     printf "    %-24s %s\n" "prom-push <gw> [job]" "$(_t cmd_prom_push)"
     printf "    %-24s %s\n" "stealth-test" "$(_t cmd_stealth_test)"
+    printf "    %-24s %s\n" "fingerprint-audit" "$(_t cmd_fingerprint_audit)"
     printf "    %-24s %s\n" "audit-syslog <h:p>" "$(_t cmd_audit_syslog)"
     printf "    %-24s %s\n" "backup-config <remote>" "$(_t cmd_backup_config)"
     printf "    %-24s %s\n" "playbook <name>" "$(_t cmd_playbook)"
@@ -11682,7 +11880,7 @@ print_cli_help() {
     printf "    %-24s %s\n" "load-switch" "Hourly load-based preset switch"
     printf "    %-24s %s\n" "metrics-mtls" "mTLS certs для prom-metrics endpoint"
     echo ""
-    echo "$(_t help_global_flags)"
+    _t help_global_flags
     printf "    %-24s %s\n" "--dry-run" "$(_t flag_dry_run)"
     printf "    %-24s %s\n" "--quiet, -q" "$(_t flag_quiet)"
     printf "    %-24s %s\n" "--verbose, -v" "Подробный вывод (alias --debug)"
@@ -11754,8 +11952,8 @@ config_command() {
         lang)
             local code="${2:-}"
             if [ -z "$code" ]; then
-                echo "$(_t lang_current "$SCRIPT_LANG")"
-                echo "$(_t lang_usage)"
+                _t lang_current "$SCRIPT_LANG"
+                _t lang_usage
                 return 0
             fi
             case "$code" in
@@ -11774,7 +11972,7 @@ config_command() {
             esac
             ;;
         show|"")
-            echo "$(_t lang_current "$SCRIPT_LANG")"
+            _t lang_current "$SCRIPT_LANG"
             echo "  config file: $LANG_CONF"
             echo "  env override: LC_VPS=<code>  (one-shot)"
             echo "  available: en, ru, de, fr, zh"
@@ -11965,6 +12163,7 @@ cli_dispatch() {
         _prom_handler)  _prom_handler ;;
         _top_snapshot)  _top_snapshot ;;
         stealth-test)   stealth_test_command "${args[@]}" ;;
+        fingerprint-audit) fingerprint_audit_command "${args[@]}" ;;
         audit-syslog)   audit_syslog_command "${args[0]:-}" ;;
         backup-config)  backup_config_command "${args[0]:-}" ;;
         playbook)       playbook_command "${args[0]:-list}" ;;
@@ -12588,6 +12787,8 @@ if [ $# -gt 0 ]; then
             ;;
         prom-metrics) prom_metrics; exit 0 ;;
         _prom_handler) _prom_handler; exit 0 ;;
+        # v8.15: fingerprint-audit — полностью офлайн и read-only, без root.
+        fingerprint-audit) shift; fingerprint_audit_command "$@"; exit $? ;;
         # v8.12: read-only / snippet-only commands не требуют root.
         masque)
             shift
