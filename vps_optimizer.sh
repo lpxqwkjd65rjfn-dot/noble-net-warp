@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.2 PHOENIX-Z++)
+# VPS Global Optimization Script (v8.17 PHOENIX-Z++)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -113,8 +113,16 @@ HEALTH_FILE="$HEALTH_DIR/health.json"
 # shellcheck disable=SC2034  # used in deploy_noise_generator
 NOISE_STATE_DIR="/var/lib/vps-noise"
 INTERNET_PROBE_URL="https://1.1.1.1/cdn-cgi/trace"
+# v8.17: multi-endpoint connectivity failover (closes #1). Quorum-based: link is
+# considered UP only if at least INTERNET_PROBE_QUORUM endpoints answer on :443.
+# Override via env: LC_VPS_PROBE_HOSTS / LC_VPS_PROBE_QUORUM.
+INTERNET_PROBE_HOSTS="${LC_VPS_PROBE_HOSTS:-1.1.1.1 8.8.8.8 9.9.9.9 208.67.222.222}"
+INTERNET_PROBE_QUORUM="${LC_VPS_PROBE_QUORUM:-2}"
+# v8.17: user hook directory. Drop executable scripts into
+# $HOOK_DIR/{pre-apply.d,post-apply.d}/ to extend apply without forking.
+HOOK_DIR="${LC_VPS_HOOK_DIR:-/etc/vps-optimizer.d}"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.16"
+SCRIPT_VERSION="8.17"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -598,13 +606,40 @@ release_lock() {
 # Быстрая проверка наличия интернета — чтобы не сломать DNS если связь уже отвалилась.
 check_internet() {
     local timeout=3
+    # Fast path: HTTPS trace to the primary probe.
     if curl -sf --max-time "$timeout" "$INTERNET_PROBE_URL" >/dev/null 2>&1; then
         return 0
     fi
-    if timeout "$timeout" bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+    # v8.17: multi-endpoint TCP/443 quorum failover (resilient to regional blocks).
+    local ok=0 host
+    for host in $INTERNET_PROBE_HOSTS; do
+        if timeout "$timeout" bash -c "exec 3<>/dev/tcp/${host}/443" 2>/dev/null; then
+            ok=$((ok + 1))
+            [ "$ok" -ge "$INTERNET_PROBE_QUORUM" ] && return 0
+        fi
+    done
+    return 1
+}
+
+# v8.17: run user-provided hook scripts from $HOOK_DIR/<phase>.d/ in lexical
+# order. Non-fatal: a failing hook is logged but never aborts apply.
+run_user_hooks() {
+    local phase="$1" hdir="$HOOK_DIR/${phase}.d" hook
+    [ -d "$hdir" ] || return 0
+    if [ "$DRY_RUN" = "1" ]; then
+        _log INFO "${GRAY:-}[hook] DRY-RUN: would run ${phase} hooks in $hdir${NC:-}"
         return 0
     fi
-    return 1
+    for hook in "$hdir"/*; do
+        [ -f "$hook" ] && [ -x "$hook" ] || continue
+        _log INFO "${CYAN:-}[hook] ${phase}: $(basename "$hook")${NC:-}"
+        if VPS_HOOK_PHASE="$phase" VPS_SCRIPT_VERSION="$SCRIPT_VERSION" "$hook"; then
+            :
+        else
+            _log WARN "${YELLOW:-}[hook] ${phase}: $(basename "$hook") exited non-zero (ignored)${NC:-}"
+        fi
+        _audit hook "phase=${phase} script=$(basename "$hook")"
+    done
 }
 
 # Простой SHA256 — для idempotency и self_update integrity check
@@ -2346,6 +2381,8 @@ apply_optimizations() {
         return "$EXIT_LOCK_BUSY"
     fi
 
+    run_user_hooks pre-apply
+
     # Internet-check: если связи нет — предупреждаем (но не блокируем,
     # пользователь может специально применять оффлайн).
     if [ "$DRY_RUN" != "1" ] && ! check_internet; then
@@ -2467,6 +2504,8 @@ apply_optimizations() {
         fi
     fi
 
+    run_user_hooks post-apply
+
     [ "$QUIET" = "1" ] && return 0
     [ "$CLI_MODE" = "1" ] && return 0
     [ -t 0 ] && read -r -p "Нажмите Enter..."
@@ -2494,6 +2533,15 @@ post_apply_connectivity_ok() {
         if command -v nc >/dev/null 2>&1 && nc -z -w 3 1.1.1.1 443 2>/dev/null; then
             probes_ok=$((probes_ok + 1))
         fi
+    fi
+    # v8.17: if local probes failed, fall back to the multi-endpoint pool.
+    if [ "$probes_ok" -lt 1 ]; then
+        local host
+        for host in $INTERNET_PROBE_HOSTS; do
+            if timeout 3 bash -c "exec 3<>/dev/tcp/${host}/443" 2>/dev/null; then
+                probes_ok=$((probes_ok + 1)); break
+            fi
+        done
     fi
     # Хоть одна из проб ок — считаем что связь есть.
     [ "$probes_ok" -ge 1 ]
