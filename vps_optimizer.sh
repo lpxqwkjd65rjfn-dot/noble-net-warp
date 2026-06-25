@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.17 PHOENIX-Z++)
+# VPS Global Optimization Script (v8.18 PHOENIX-Z++)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -122,7 +122,7 @@ INTERNET_PROBE_QUORUM="${LC_VPS_PROBE_QUORUM:-2}"
 # $HOOK_DIR/{pre-apply.d,post-apply.d}/ to extend apply without forking.
 HOOK_DIR="${LC_VPS_HOOK_DIR:-/etc/vps-optimizer.d}"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.17"
+SCRIPT_VERSION="8.18"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -900,6 +900,65 @@ detect_link_speed_mbps() {
     fi
     [ -z "$speed" ] || ! [[ "$speed" =~ ^[0-9]+$ ]] && speed=0
     echo "$speed"
+}
+
+# === v8.18 FLAGSHIP: Bufferbloat Grade (A+..F) ================================
+# Measures idle RTT vs RTT under saturation and assigns a human grade. Turns the
+# wall of sysctl into one understandable, "sellable" number.
+run_bufferbloat_grade() {
+    command -v ping >/dev/null 2>&1 || { _log ERROR "[grade] ping not found"; return 1; }
+    local target idle_avg loaded_avg bloat grade host p pids=()
+    target="${INTERNET_PROBE_HOSTS%% *}"; target="${target:-1.1.1.1}"
+    _log INFO "${CYAN:-}[grade] Idle latency -> ${target} ...${NC:-}"
+    idle_avg=$(ping -n -c 20 -i 0.2 -w 8 "$target" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+    [ -z "$idle_avg" ] && { _log ERROR "[grade] idle probe failed"; return 1; }
+    _log INFO "${CYAN:-}[grade] Latency under load (~12s saturation) ...${NC:-}"
+    for host in $INTERNET_PROBE_HOSTS; do
+        ( curl -s -o /dev/null --max-time 12 "https://speed.cloudflare.com/__down?bytes=104857600" ) & pids+=($!)
+    done
+    loaded_avg=$(ping -n -c 30 -i 0.2 -w 12 "$target" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+    for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true
+    [ -z "$loaded_avg" ] && loaded_avg="$idle_avg"
+    bloat=$(awk -v a="$idle_avg" -v b="$loaded_avg" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.1f", d}')
+    grade=$(awk -v d="$bloat" 'BEGIN{if(d<5)print"A+";else if(d<30)print"A";else if(d<60)print"B";else if(d<200)print"C";else if(d<400)print"D";else print"F"}')
+    _log INFO "${GREEN:-}===== Bufferbloat Grade =====${NC:-}"
+    _log INFO "  Idle RTT    : ${idle_avg} ms"
+    _log INFO "  Loaded RTT  : ${loaded_avg} ms"
+    _log INFO "  Bufferbloat : +${bloat} ms"
+    _log INFO "  ${YELLOW:-}GRADE: ${grade}${NC:-}"
+    case "$grade" in
+        A+|A) _log INFO "  ${GREEN:-}Latency under load is well controlled.${NC:-}";;
+        B|C)  _log INFO "  ${YELLOW:-}Some bufferbloat — ensure CAKE/fq_codel is active (run: apply).${NC:-}";;
+        *)    _log WARN  "  ${RED:-}High bufferbloat — apply optimizations / enable CAKE shaping.${NC:-}";;
+    esac
+}
+
+# === v8.18 FLAGSHIP: Network DNA fingerprint =================================
+# Builds a stable hash of the environment (virt+provider+NIC+kernel) and a
+# latency-class preset recommendation. Lets the optimizer "recognise" the VM.
+build_network_dna() {
+    local virt provider iface nic kver rtt dna preset
+    virt=$(detect_virt 2>/dev/null || echo unknown)
+    provider=$(detect_provider 2>/dev/null || echo unknown)
+    iface=$(list_real_ifaces 2>/dev/null | head -n1); iface="${iface:-eth0}"
+    nic=$(head -c 40 "/sys/class/net/$iface/device/modalias" 2>/dev/null); nic="${nic:-generic}"
+    kver=$(uname -r)
+    rtt=$(ping -n -c 5 -i 0.2 -w 4 "${INTERNET_PROBE_HOSTS%% *}" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f",$5}')
+    rtt="${rtt:-0}"
+    dna=$(printf '%s|%s|%s|%s' "$virt" "$provider" "$nic" "$kver" | sha256sum | cut -c1-16)
+    if   [ "$rtt" -le 5 ];  then preset="lowlatency"
+    elif [ "$rtt" -le 40 ]; then preset="balanced"
+    else                         preset="throughput"; fi
+    _log INFO "${GREEN:-}===== Network DNA =====${NC:-}"
+    _log INFO "  Virt        : $virt"
+    _log INFO "  Provider    : $provider"
+    _log INFO "  NIC         : $nic"
+    _log INFO "  Kernel      : $kver"
+    _log INFO "  Baseline RTT: ${rtt} ms"
+    _log INFO "  ${CYAN:-}DNA hash    : $dna${NC:-}"
+    _log INFO "  ${YELLOW:-}Recommended preset: $preset${NC:-}"
+    mkdir -p /var/lib/vps-optimizer 2>/dev/null || true
+    echo "$dna" >/var/lib/vps-optimizer/network.dna 2>/dev/null || true
 }
 
 run_benchmark() {
@@ -2955,6 +3014,27 @@ ENABLE_APT_PHANTOM="${ENABLE_APT_PHANTOM:-1}"
 
 IOS_BURST_INTERVAL_MIN="${IOS_BURST_INTERVAL_MIN:-1}"
 IOS_BURST_INTERVAL_MAX="${IOS_BURST_INTERVAL_MAX:-6}"
+# v8.18: iOS background service-mesh — daemon traffic an *idle* iPhone emits
+# (CloudKit/Maps/Weather/Siri/OTA/AppStore/FindMy), not just Safari browsing.
+ENABLE_IOS_MESH="${ENABLE_IOS_MESH:-1}"
+IOS_MESH_INTERVAL_MIN="${IOS_MESH_INTERVAL_MIN:-8}"
+IOS_MESH_INTERVAL_MAX="${IOS_MESH_INTERVAL_MAX:-40}"
+# v8.18: Low Power Mode simulation — real iOS throttles background fetch in LPM.
+ENABLE_IOS_LOW_POWER="${ENABLE_IOS_LOW_POWER:-1}"
+IOS_LOW_POWER_CHANCE="${IOS_LOW_POWER_CHANCE:-25}"
+[ -n "${URLS_IOS_MESH+x}" ] || URLS_IOS_MESH=(
+    "https://gateway.icloud.com/"
+    "https://p01-content.icloud.com/"
+    "https://gsp-ssl.ls.apple.com/"
+    "https://gsp64-ssl.ls.apple.com/"
+    "https://weather-data.apple.com/"
+    "https://gsa.apple.com/"
+    "https://mesu.apple.com/assets/"
+    "https://bag.itunes.apple.com/bag.xml"
+    "https://gateway.push.apple.com/"
+    "https://configuration.apple.com/"
+    "https://smoot.apple.com/"
+)
 EMAIL_INTERVAL_MIN="${EMAIL_INTERVAL_MIN:-45}"
 EMAIL_INTERVAL_MAX="${EMAIL_INTERVAL_MAX:-180}"
 NEWS_INTERVAL_MIN="${NEWS_INTERVAL_MIN:-20}"
@@ -5164,6 +5244,48 @@ loop_ios() {
         sleep_minutes "$IOS_BURST_INTERVAL_MIN" "$IOS_BURST_INTERVAL_MAX"
     done
 }
+
+# === v8.18: iOS Low Power Mode simulation =====================================
+# Deterministic per-day evening window during which background fetch is throttled
+# — mirrors real iOS behaviour at low battery. Makes the traffic pattern breathe.
+ios_low_power_active() {
+    [ "${ENABLE_IOS_LOW_POWER:-1}" = "1" ] || return 1
+    local day h start
+    day=$(date +%j)
+    [ "$(( (day * 7919) % 100 ))" -ge "${IOS_LOW_POWER_CHANCE:-25}" ] && return 1
+    start=$(( 18 + (day % 4) ))
+    h=$(date +%-H)
+    [ "$h" -ge "$start" ] && [ "$h" -lt "$(( start + 2 ))" ]
+}
+
+# === v8.18: iOS background service-mesh =======================================
+# Emulates the silent daemon traffic an idle iPhone produces beyond Safari:
+# CloudKit, Maps tiles, Weather, Siri/auth, OTA checks, App Store bag, Find My /
+# Push gateways — all through the existing JA3/UA-coherent http_request path.
+ios_mesh_burst() {
+    [ "${ENABLE_IOS_MESH:-1}" = "1" ] || return 0
+    [ "${#URLS_IOS_MESH[@]}" -gt 0 ] || return 0
+    local url
+    url="${URLS_IOS_MESH[$(urand 0 $(( ${#URLS_IOS_MESH[@]} - 1 )) )]}"
+    http_request "$url" ios en ios-mesh api
+}
+loop_ios_mesh() {
+    [ "${ENABLE_IOS_MESH:-1}" = "1" ] || return 0
+    while true; do
+        vacation_check_and_sleep
+        if hard_sleep_suppress; then
+            # CloudKit/FindMy keep only a faint heartbeat overnight.
+            sleep "$(rrange 1200 3000)"
+            continue
+        fi
+        ios_mesh_burst
+        if ios_low_power_active; then
+            sleep_minutes "$(( IOS_MESH_INTERVAL_MIN * 2 ))" "$(( IOS_MESH_INTERVAL_MAX * 2 ))"
+        else
+            sleep_minutes "$IOS_MESH_INTERVAL_MIN" "$IOS_MESH_INTERVAL_MAX"
+        fi
+    done
+}
 loop_apns() {
     while true; do
         vacation_check_and_sleep
@@ -5290,6 +5412,7 @@ loop_health() {
 # Старт включённых модулей в фоне
 PIDS=()
 [ "$ENABLE_IOS_BURST"   = "1" ] && { loop_ios   & PIDS+=($!); }
+[ "${ENABLE_IOS_MESH:-1}" = "1" ] && { loop_ios_mesh & PIDS+=($!); }
 [ "$ENABLE_APNS"        = "1" ] && { loop_apns  & PIDS+=($!); }
 [ "${ENABLE_PUSH:-1}"   = "1" ] && { loop_push  & PIDS+=($!); }   # v8.4: APNs/FCM/WNS rotation
 [ "${ENABLE_STUN:-1}"   = "1" ] && { loop_stun  & PIDS+=($!); }   # v8.4: WebRTC STUN burst
@@ -12310,6 +12433,8 @@ cli_dispatch() {
             echo -e "${GREEN}[+] swap ${gb}G активен.${NC}"
             ;;
         benchmark) run_benchmark ;;
+        grade)     run_bufferbloat_grade ;;
+        dna)       build_network_dna ;;
         reset)     reset_all ;;
         export)    export_config "${args[0]:-}" ;;
         import)
