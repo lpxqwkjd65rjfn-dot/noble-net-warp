@@ -527,8 +527,10 @@ print_header() {
     # v8.16: версия в баннере берётся из SCRIPT_VERSION (раньше было захардкожено v8.2).
     printf "       ULTRA VPS ACCELERATOR v%-6s (PHOENIX-Z++)\n" "$SCRIPT_VERSION"
     echo "================================================================="
-    echo -e "  Probe-then-Write | XPS+RPS+IRQ | conntrack | MPTCP | THP    "
-    echo -e "  Presets: balanced / proxy / web    Stealth: iOS+RU+APT     "
+    echo -e "  ⚡ BBR · CAKE/fq · XPS+RPS+IRQ · conntrack · MPTCP · THP      "
+    echo -e "  🤖 AI-autotune (BDP) · 🌐 multi-endpoint failover · 🪝 hooks   "
+    echo -e "  🎭 Stealth: iOS+RU+APT · JA3-rotate · iOS service-mesh + LPM   "
+    echo -e "  Presets: balanced / proxy / web                                "
     echo -e "=================================================================${NC}"
     echo ""
 }
@@ -12860,15 +12862,17 @@ main_menu() {
             echo -e "  ${GRAY}(Recommended: ${BOLD}$reco_preset${NC}${GRAY} — для твоего железа; см. suggest)${NC}"
         fi
         echo ""
-        echo -e "${BOLD}Категории:${NC}"
-        echo -e "  ${GREEN}[1]${NC} ⚡ ${BOLD}Performance${NC}    — apply / preset / suggest / wizard"
-        echo -e "  ${CYAN}[2]${NC} 🎭 ${BOLD}Stealth${NC}        — noise / stealth-test / DNS"
-        echo -e "  ${CYAN}[3]${NC} 🩺 ${BOLD}Diagnostics${NC}    — doctor / status / top / log-tail"
-        echo -e "  ${CYAN}[4]${NC} ⚙  ${BOLD}Config${NC}         — swap / язык / preset / профили"
-        echo -e "  ${YELLOW}[5]${NC} 📊 ${BOLD}Monitoring${NC}    — benchmark / bench-suite / Prometheus"
-        echo -e "  ${YELLOW}[6]${NC} 📦 ${BOLD}Misc${NC}          — install / export / import / update"
-        echo -e "  ${RED}[8]${NC} ↩  ${BOLD}Reset all${NC}        — откат всех изменений"
-        echo -e "  ${GREEN}[0]${NC} ❌ Выход"
+        echo -e "${BOLD}${MAGENTA}┌─ Категории ───────────────────────────────────────────┐${NC}"
+        echo -e "  ${GREEN}[1]${NC} ⚡ ${BOLD}Performance${NC}   apply · preset · suggest · wizard"
+        echo -e "  ${CYAN}[2]${NC} 🎭 ${BOLD}Stealth${NC}       noise iOS+RU+APT · stealth-test · DNS"
+        echo -e "  ${CYAN}[3]${NC} 🩺 ${BOLD}Diagnostics${NC}   doctor · status · top · log-tail"
+        echo -e "  ${CYAN}[4]${NC} ⚙  ${BOLD}Config${NC}        swap · язык · preset · профили · hooks"
+        echo -e "  ${YELLOW}[5]${NC} 📊 ${BOLD}Monitoring${NC}   benchmark · bench-suite · Prometheus"
+        echo -e "  ${YELLOW}[6]${NC} 📦 ${BOLD}Misc${NC}         install · export · import · update"
+        echo -e "  ${MAGENTA}[7]${NC} 🤖 ${BOLD}AI Network${NC}   nettune · grade · dna · BDP-autosize"
+        echo -e "  ${RED}[8]${NC} ↩  ${BOLD}Reset all${NC}    откат всех изменений"
+        echo -e "  ${GRAY}[0]${NC} ❌ ${BOLD}Выход${NC}"
+        echo -e "${BOLD}${MAGENTA}└───────────────────────────────────────────────────────┘${NC}"
         echo ""
         read -r -p "Ваш выбор: " choice
         case $choice in
@@ -12878,6 +12882,7 @@ main_menu() {
             4) _menu_config ;;
             5) _menu_monitoring ;;
             6) _menu_misc ;;
+            7) _menu_ai ;;
             8) reset_all ;;
             0) exit 0 ;;
             # v8.7: backward-compat — старые номера (1-12) тоже работают, для
@@ -12887,6 +12892,34 @@ main_menu() {
             *)  echo -e "${RED}[!] Неверный выбор. Введи число 0-8.${NC}"; sleep 1 ;;
         esac
     done
+}
+
+_menu_ai() {
+    clear
+    echo -e "${MAGENTA}${BOLD}🤖 AI Network Autotuner${NC}"
+    echo -e "${GRAY}  Самообучающаяся оптимизация сети · idle-приоритет · без замусоривания диска${NC}"
+    echo ""
+    echo -e "  ${GREEN}[1]${NC} ${BOLD}nettune on${NC}      — включить самообучение (таймер)"
+    echo -e "  ${CYAN}[2]${NC} nettune status   — qdisc-рука · Network IQ · Q-таблица"
+    echo -e "  ${CYAN}[3]${NC} nettune once     — один шаг обучения сейчас"
+    echo -e "  ${CYAN}[4]${NC} nettune off      — выключить таймер"
+    echo -e "  ${CYAN}[5]${NC} nettune reset    — сбросить обученную политику"
+    echo -e "  ${GRAY}  ──────────────────────────────────────────────${NC}"
+    echo -e "  ${GREEN}[6]${NC} ${BOLD}grade${NC}           — Bufferbloat Grade A+..F"
+    echo -e "  ${GREEN}[7]${NC} ${BOLD}dna${NC}             — Network DNA + рекомендация пресета"
+    echo -e "  ${RED}[0]${NC} ↩  Назад"
+    echo ""
+    read -r -p "Выбор: " a
+    case "$a" in
+        1) run_nettune_command on;     read -r -p "Enter..." ;;
+        2) run_nettune_command status; read -r -p "Enter..." ;;
+        3) run_nettune_command once;   read -r -p "Enter..." ;;
+        4) run_nettune_command off;    read -r -p "Enter..." ;;
+        5) run_nettune_command reset;  read -r -p "Enter..." ;;
+        6) run_bufferbloat_grade;      read -r -p "Enter..." ;;
+        7) build_network_dna;          read -r -p "Enter..." ;;
+        0) ;;
+    esac
 }
 
 _menu_performance() {
