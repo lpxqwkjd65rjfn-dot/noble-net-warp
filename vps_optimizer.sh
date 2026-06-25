@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.18 PHOENIX-Z++)
+# VPS Global Optimization Script (v8.19 PHOENIX-Z++)
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -122,7 +122,7 @@ INTERNET_PROBE_QUORUM="${LC_VPS_PROBE_QUORUM:-2}"
 # $HOOK_DIR/{pre-apply.d,post-apply.d}/ to extend apply without forking.
 HOOK_DIR="${LC_VPS_HOOK_DIR:-/etc/vps-optimizer.d}"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.18"
+SCRIPT_VERSION="8.19"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -900,6 +900,168 @@ detect_link_speed_mbps() {
     fi
     [ -z "$speed" ] || ! [[ "$speed" =~ ^[0-9]+$ ]] && speed=0
     echo "$speed"
+}
+
+# ============================================================================
+# v8.19 SMART NETWORK AUTOTUNER (AI) — lightweight, self-learning, disk-safe
+# ----------------------------------------------------------------------------
+# Closed-loop epsilon-greedy bandit (qdisc arms) + BDP buffer right-sizing.
+# Built for the WEAKEST VPS: pure bash+awk, no daemon, passive metrics only
+# (/proc/net/snmp + ss), idle IO/CPU priority, ONE size-capped state file that
+# is rewritten (never appended) so the disk never fills.
+# Custom knobs (env-overridable, do not exist in other optimizers):
+#   NETTUNE_ENABLE(1) NETTUNE_EPS(15) NETTUNE_RAM_FLOOR_MB(256)
+#   NETTUNE_STATE_MAX_BYTES(8192) NETTUNE_BDP_FACTOR(120)
+#   NETTUNE_W_RETRANS(60) NETTUNE_W_RTT(40)
+#   NETTUNE_INTERVAL_SEC(900) NETTUNE_BOOT_SEC(300)
+# ============================================================================
+NETTUNE_STATE="${NETTUNE_STATE:-/var/lib/vps-optimizer/nettune.state}"
+
+_nt_kv_get() { awk -F= -v k="$1" '$1==k{print $2; exit}' "$NETTUNE_STATE" 2>/dev/null; }
+_nt_ram_mb() { awk '/MemTotal/{printf "%d",$2/1024; exit}' /proc/meminfo 2>/dev/null; }
+_nt_tcp_counter() {
+    awk -v c="$1" '/^Tcp:/{n++; if(n==1){for(i=2;i<=NF;i++)x[$i]=i} else {print $(x[c]); exit}}' /proc/net/snmp 2>/dev/null
+}
+_nt_passive_srtt() {
+    ss -tin 2>/dev/null | grep -oE 'rtt:[0-9.]+' \
+      | awk -F: '{s+=$2;n++} END{if(n)printf "%.0f", s/n; else print 50}'
+}
+_nt_state_write() {  # stdin -> atomic, hard size cap
+    local tmp; tmp="$(mktemp /tmp/.nettune.XXXXXX 2>/dev/null)" || return 0
+    head -c "${NETTUNE_STATE_MAX_BYTES:-8192}" >"$tmp"
+    mkdir -p "$(dirname "$NETTUNE_STATE")" 2>/dev/null || true
+    mv -f "$tmp" "$NETTUNE_STATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+_nt_save_counters() {
+    echo "prev_rx=$(_nt_tcp_counter RetransSegs)"
+    echo "prev_out=$(_nt_tcp_counter OutSegs)"
+    echo "prev_ts=$(date +%s)"
+}
+_nt_reward() {  # 0..100, higher = healthier (fewer retransmits, lower loaded RTT)
+    local rx out prx pout drx dout srtt
+    rx=$(_nt_tcp_counter RetransSegs); out=$(_nt_tcp_counter OutSegs)
+    rx="${rx:-0}"; out="${out:-0}"
+    prx=$(_nt_kv_get prev_rx); prx="${prx:-$rx}"
+    pout=$(_nt_kv_get prev_out); pout="${pout:-$out}"
+    drx=$((rx-prx)); dout=$((out-pout))
+    [ "$drx" -lt 0 ] && drx=0; [ "$dout" -lt 1 ] && dout=1
+    srtt=$(_nt_passive_srtt); srtt="${srtt:-50}"
+    awk -v drx="$drx" -v dout="$dout" -v srtt="$srtt" \
+        -v wr="${NETTUNE_W_RETRANS:-60}" -v wt="${NETTUNE_W_RTT:-40}" 'BEGIN{
+        ratio=drx/dout; pen_r=wr*ratio; if(pen_r>wr)pen_r=wr;
+        pen_t=wt*(srtt/300); if(pen_t>wt)pen_t=wt;
+        r=100-pen_r-pen_t; if(r<0)r=0; if(r>100)r=100; printf "%.1f", r}'
+}
+_nt_best_arm() {
+    local a best="" bq="-1" q
+    for a in $1; do
+        q=$(_nt_kv_get "q_${a}"); q="${q:-0}"
+        if awk -v q="$q" -v b="$bq" 'BEGIN{exit !(q>b)}'; then bq="$q"; best="$a"; fi
+    done
+    echo "${best:-fq}"
+}
+_nt_apply_qdisc() {
+    local q="$1" ifc
+    command -v tc >/dev/null 2>&1 || return 0
+    if [ "$q" = "cake" ]; then
+        if tc qdisc add dev lo root cake 2>/dev/null; then tc qdisc del dev lo root 2>/dev/null || true
+        else q=fq_codel; fi
+    fi
+    for ifc in $(list_real_ifaces 2>/dev/null); do
+        tc qdisc replace dev "$ifc" root "$q" 2>/dev/null || true
+    done
+}
+_nt_apply_bdp() {  # RAM-aware bandwidth-delay-product socket buffer right-sizing
+    local ram="$1" ifc speed srtt bdp cap maxb
+    ifc=$(list_real_ifaces 2>/dev/null | head -n1); ifc="${ifc:-eth0}"
+    speed=$(cat "/sys/class/net/$ifc/speed" 2>/dev/null)
+    case "$speed" in ''|-*|0) speed=1000;; esac
+    srtt=$(_nt_passive_srtt); srtt="${srtt:-50}"
+    bdp=$(awk -v s="$speed" -v r="$srtt" -v f="${NETTUNE_BDP_FACTOR:-120}" 'BEGIN{printf "%d", s*125000*(r/1000)*(f/100)}')
+    cap=$(( ram*1024*1024/16 ))
+    maxb="$bdp"; [ "$maxb" -gt "$cap" ] && maxb="$cap"; [ "$maxb" -lt 262144 ] && maxb=262144
+    sysctl -w "net.ipv4.tcp_rmem=4096 131072 $maxb" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv4.tcp_wmem=4096 16384 $maxb"  >/dev/null 2>&1 || true
+    sysctl -w "net.core.rmem_max=$maxb" >/dev/null 2>&1 || true
+    sysctl -w "net.core.wmem_max=$maxb" >/dev/null 2>&1 || true
+}
+nettune_once() {  # ONE learning iteration (called by timer) — cheap & bounded
+    [ "${NETTUNE_ENABLE:-1}" = "1" ] || return 0
+    [ "$(id -u)" = "0" ] || return 0
+    local ram floor eps arms a cur reward steps q n nq pick idx iq
+    ram=$(_nt_ram_mb); ram="${ram:-256}"; floor="${NETTUNE_RAM_FLOOR_MB:-256}"
+    arms="fq fq_codel cake"
+    cur=$(_nt_kv_get cur_arm); cur="${cur:-fq}"
+    steps=$(_nt_kv_get steps); steps="${steps:-0}"
+    reward=$(_nt_reward)
+    q=$(_nt_kv_get "q_${cur}"); q="${q:-0}"
+    n=$(_nt_kv_get "n_${cur}"); n="${n:-0}"; n=$((n+1))
+    nq=$(awk -v q="$q" -v r="$reward" -v n="$n" 'BEGIN{printf "%.2f", q+(r-q)/n}')
+    eps="${NETTUNE_EPS:-15}"; [ "$ram" -lt "$floor" ] && eps=0
+    eps=$(awk -v e="$eps" -v s="$steps" 'BEGIN{printf "%d", e/(1+s/20)}')
+    if [ "$((RANDOM%100))" -lt "$eps" ]; then
+        idx=$((RANDOM%3+1)); set -- $arms; pick="${!idx}"
+    else
+        pick=$(_nt_best_arm "$arms")
+    fi
+    _nt_apply_qdisc "$pick"
+    _nt_apply_bdp "$ram"
+    iq=$(awk -v r="$reward" 'BEGIN{v=r; if(v<0)v=0; if(v>100)v=100; printf "%d", v}')
+    {
+        echo "cur_arm=$pick"; echo "steps=$((steps+1))"; echo "iq=$iq"
+        echo "last_reward=$reward"; echo "q_${cur}=$nq"; echo "n_${cur}=$n"
+        for a in $arms; do
+            [ "$a" = "$cur" ] && continue
+            echo "q_${a}=$(_nt_kv_get q_${a} 2>/dev/null || echo 0)"
+            echo "n_${a}=$(_nt_kv_get n_${a} 2>/dev/null || echo 0)"
+        done
+        _nt_save_counters
+    } | _nt_state_write
+    _audit nettune "arm=$pick reward=$reward iq=$iq eps=$eps ram=${ram}MB"
+}
+_nt_install_timer() {
+    local self; self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    cat >/etc/systemd/system/vps-nettune.service <<NT_SVC_EOF
+[Unit]
+Description=VPS Smart Network Autotuner (one learning step)
+After=network-online.target
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+ExecStart=/bin/bash $self nettune once
+NT_SVC_EOF
+    cat >/etc/systemd/system/vps-nettune.timer <<NT_TMR_EOF
+[Unit]
+Description=Run VPS Smart Network Autotuner periodically
+[Timer]
+OnBootSec=${NETTUNE_BOOT_SEC:-300}
+OnUnitActiveSec=${NETTUNE_INTERVAL_SEC:-900}
+AccuracySec=60
+Persistent=true
+[Install]
+WantedBy=timers.target
+NT_TMR_EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now vps-nettune.timer >/dev/null 2>&1 || true
+}
+run_nettune_command() {
+    local sub="${1:-status}" a
+    case "$sub" in
+        on)    _nt_install_timer; _log INFO "${GREEN:-}[nettune] AI autotuner ENABLED (idle-priority, ${NETTUNE_INTERVAL_SEC:-900}s)${NC:-}";;
+        off)   systemctl disable --now vps-nettune.timer >/dev/null 2>&1 || true; _log INFO "${YELLOW:-}[nettune] disabled${NC:-}";;
+        once)  nettune_once; _log INFO "[nettune] one learning step done";;
+        reset) rm -f "$NETTUNE_STATE" 2>/dev/null || true; _log INFO "[nettune] state reset";;
+        status|*)
+            _log INFO "${GREEN:-}===== Smart Network Autotuner =====${NC:-}"
+            _log INFO "  Active qdisc arm : $(_nt_kv_get cur_arm 2>/dev/null || echo n/a)"
+            _log INFO "  Network IQ       : $(_nt_kv_get iq 2>/dev/null || echo n/a) / 100"
+            _log INFO "  Learning steps   : $(_nt_kv_get steps 2>/dev/null || echo 0)"
+            _log INFO "  Last reward      : $(_nt_kv_get last_reward 2>/dev/null || echo n/a)"
+            for a in fq fq_codel cake; do
+                _log INFO "    Q[$a]=$(_nt_kv_get q_${a} 2>/dev/null || echo 0)  n=$(_nt_kv_get n_${a} 2>/dev/null || echo 0)"
+            done;;
+    esac
 }
 
 # === v8.18 FLAGSHIP: Bufferbloat Grade (A+..F) ================================
@@ -12434,6 +12596,7 @@ cli_dispatch() {
             ;;
         benchmark) run_benchmark ;;
         grade)     run_bufferbloat_grade ;;
+        nettune)   run_nettune_command "${args[0]:-status}" ;;
         dna)       build_network_dna ;;
         reset)     reset_all ;;
         export)    export_config "${args[0]:-}" ;;
