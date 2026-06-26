@@ -1,604 +1,193 @@
-# 🦅 Noble Net Warp / VPS Optimizer
+<div align="center">
 
-Single-file Bash 5+ tool that turns a stock cloud Ubuntu 22.04/24.04 VPS into a
-tuned, low-latency proxy / edge / web host **without touching the hypervisor**
-and **without breaking on locked-down OpenVZ/LXC**.
+# ⚡ noble-net-warp
 
-Every kernel knob is applied via **probe-then-write** — if the kernel/host
-rejects it, it is silently skipped instead of being persisted into a broken
-`/etc/sysctl.d/` file. After `apply` you get a coloured self-test showing
-`OK / SKIPPED / DENIED` per setting.
+### Universal Ubuntu 24.04 network optimizer — now with a self-learning AI core
+
+Unlocks maximum performance for **any** virtual machine and accelerates **all** protocols.
+
+![version](https://img.shields.io/badge/version-8.19_PHOENIX--Z++-blueviolet?style=for-the-badge)
+![shell](https://img.shields.io/badge/bash-single--file-121011?style=for-the-badge&logo=gnu-bash&logoColor=white)
+![target](https://img.shields.io/badge/Ubuntu-22.04_·_24.04-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)
+![license](https://img.shields.io/badge/license-see_LICENSE-green?style=for-the-badge)
+
+</div>
 
 ---
 
-## Quick start
+## 🚀 What is this?
+
+`noble-net-warp` is a **single-file** (`vps_optimizer.sh`) Bash tool that tunes the
+entire Linux network stack for VPS / VM workloads — BBR, qdisc shaping, conntrack,
+RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotuner**,
+**multi-endpoint resilience**, a **user hook system**, and an advanced
+**iOS traffic-masking (white-noise)** engine.
+
+> 💡 Everything lives in **one script**. No modules, no dependencies to vendor —
+> copy it to your server and run.
+
+---
+
+## ✨ Highlights (v8.17 → v8.19)
+
+| Area | Feature | Why it matters |
+|------|---------|----------------|
+| 🤖 **AI** | Smart Network Autotuner | Self-learning ε-greedy bandit + BDP buffer right-sizing. Runs on the weakest VPS. |
+| 🌐 **Resilience** | Multi-endpoint failover | Quorum-based connectivity check across a pool — survives single-endpoint / regional blocks. |
+| 🪝 **Extensibility** | User hook system | Drop scripts into `/etc/vps-optimizer.d/` — customise without forking. |
+| 🎭 **Stealth** | iOS service-mesh + Low Power Mode | Mimics the *daemon* traffic of an idle iPhone, not just Safari browsing. |
+| 📊 **Insight** | Bufferbloat Grade + Network DNA | One human-readable grade (A+…F) and an environment fingerprint. |
+| 🎨 **UX** | Refreshed interactive menu | Framed TUI, new 🤖 AI section, 100% feature-accurate. |
+
+---
+
+## 🤖 Smart Network Autotuner (AI)
+
+A closed-loop **measure → tune → re-evaluate** controller, designed to run on
+even the smallest VPS.
+
+- **Lightweight** — pure `bash` + `awk`, **no daemon** (one `systemd` oneshot per tick).
+- **Passive metrics only** — `/proc/net/snmp` + `ss`. Generates **zero** extra traffic.
+- **Disk-safe** — a single, atomically-rewritten, **size-capped** state file (never appends → disk can't fill).
+- **Self-learning** — ε-greedy **multi-armed bandit** over qdisc arms (`fq` / `fq_codel` / `cake`), with **decaying exploration** as confidence grows.
+- **BDP buffer right-sizing** — socket buffers scaled to bandwidth-delay product, RAM-aware ceiling (safe on tiny VPS, generous on fast ones).
+- **Weak-VPS guard** — below a RAM floor it switches to **exploit-only** (applies the best-known policy, no experiments).
+- **Network IQ** — a 0–100 score that rises as the policy converges.
 
 ```bash
-curl -O https://raw.githubusercontent.com/lpxqwkjd65rjfn-dot/noble-net-warp/main/vps_optimizer.sh
+sudo ./vps_optimizer.sh nettune on       # enable idle-priority learning timer
+sudo ./vps_optimizer.sh nettune status   # arm · Network IQ · per-arm Q-values
+sudo ./vps_optimizer.sh nettune once     # run one learning step now
+sudo ./vps_optimizer.sh nettune off      # disable
+sudo ./vps_optimizer.sh nettune reset    # wipe learned policy
+```
+
+---
+
+## 🌐 Multi-endpoint failover
+
+Connectivity is now verified against a **pool** of endpoints with a **quorum**, so a
+single blocked resolver (common in some regions) no longer triggers a false
+"no internet" rollback.
+
+```bash
+# Override the pool / quorum via env:
+LC_VPS_PROBE_HOSTS="1.1.1.1 8.8.8.8 77.88.8.8" LC_VPS_PROBE_QUORUM=2 \
+  sudo ./vps_optimizer.sh apply
+```
+
+---
+
+## 🪝 User hook system
+
+Extend `apply` without touching the script. Drop **executable** files into:
+
+```
+/etc/vps-optimizer.d/pre-apply.d/      # run before optimizations
+/etc/vps-optimizer.d/post-apply.d/     # run after optimizations
+```
+
+```bash
+sudo mkdir -p /etc/vps-optimizer.d/post-apply.d
+sudo tee /etc/vps-optimizer.d/post-apply.d/10-my-tweak.sh >/dev/null <<'EOF'
+#!/bin/bash
+sysctl -w net.core.somaxconn=65535
+EOF
+sudo chmod +x /etc/vps-optimizer.d/post-apply.d/10-my-tweak.sh
+```
+
+> Hooks run in lexical order and are **non-fatal** — a failing hook is logged
+> (and audited) but never aborts `apply`. They honour `DRY_RUN` and receive
+> `VPS_HOOK_PHASE` / `VPS_SCRIPT_VERSION`.
+
+---
+
+## 🎭 Stealth / white-noise engine (iOS)
+
+On top of the existing engine (per-connection JA3 rotation, curl-impersonate-safari,
+circadian timing, Markov-6, IMAP IDLE, RU human profile, APT phantom):
+
+- **iOS background service-mesh** — emulates the silent daemon traffic of an idle
+  iPhone: CloudKit, Maps tiles, Weather, Siri/auth, OTA checks, App Store bag,
+  Push gateways — all through the same **JA3/UA-coherent** request path.
+- **Low Power Mode simulation** — a deterministic per-day window throttles
+  background fetch, so the pattern *breathes* like a real device.
+
+> The traffic now resembles a phone in someone's pocket — not just a browser session.
+
+---
+
+## 📊 Insight commands
+
+```bash
+sudo ./vps_optimizer.sh grade   # Bufferbloat Grade A+..F (idle vs loaded RTT)
+sudo ./vps_optimizer.sh dna     # Network DNA fingerprint + recommended preset
+```
+
+---
+
+## 🎛️ Custom knobs (env-overridable)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NETTUNE_ENABLE` | `1` | Master switch for the AI autotuner |
+| `NETTUNE_EPS` | `15` | Exploration rate (%) for the bandit |
+| `NETTUNE_RAM_FLOOR_MB` | `256` | Below this → exploit-only mode |
+| `NETTUNE_STATE_MAX_BYTES` | `8192` | Hard cap for the state file |
+| `NETTUNE_BDP_FACTOR` | `120` | BDP scaling (% of bandwidth-delay product) |
+| `NETTUNE_W_RETRANS` / `NETTUNE_W_RTT` | `60` / `40` | Reward weights |
+| `NETTUNE_INTERVAL_SEC` / `NETTUNE_BOOT_SEC` | `900` / `300` | Timer cadence |
+| `LC_VPS_PROBE_HOSTS` / `LC_VPS_PROBE_QUORUM` | pool / `2` | Failover endpoints / quorum |
+| `LC_VPS_HOOK_DIR` | `/etc/vps-optimizer.d` | Hook directory |
+| `ENABLE_IOS_MESH` / `ENABLE_IOS_LOW_POWER` | `1` / `1` | iOS noise features |
+
+---
+
+## 📦 Quick start
+
+```bash
+git clone https://github.com/<owner>/noble-net-warp.git
+cd noble-net-warp
 chmod +x vps_optimizer.sh
-sudo ./vps_optimizer.sh apply --preset proxy
-sudo ./vps_optimizer.sh status
-```
 
-For machine-readable status (Grafana / cron alerts / Zabbix):
-
-```bash
-sudo ./vps_optimizer.sh status --json
-sudo ./vps_optimizer.sh prom-metrics            # Prometheus text format
-sudo ./vps_optimizer.sh prom-serve 9777 &       # exporter on :9777
-```
-
-Self-update (with SHA256 verification when sidecar is published):
-
-```bash
-sudo ./vps_optimizer.sh update
-```
-
-Full uninstall (resets all settings + removes the script itself):
-
-```bash
-sudo ./vps_optimizer.sh uninstall
+sudo ./vps_optimizer.sh            # interactive menu
+sudo ./vps_optimizer.sh apply      # apply optimizations
+sudo ./vps_optimizer.sh nettune on # enable the AI autotuner
+sudo ./vps_optimizer.sh grade      # check your Bufferbloat Grade
 ```
 
 ---
 
-## ✨ What it does
+## 🖥️ Interactive menu
 
-### Network stack — deep TCP / UDP tuning
-
-- **BBR + fq_codel** by default, full pacing tuning (`tcp_pacing_ss_ratio`,
-  `tcp_pacing_ca_ratio`, `tcp_min_rtt_wlen`).
-- **Modern TCP recovery**: RACK, passive ECN, thin-stream linear timeouts,
-  `tcp_reordering`, `tcp_max_reordering`, `tcp_early_retrans=3`, `tcp_frto=2`,
-  `tcp_autocorking=0`, `tcp_limit_output_bytes`.
-- **v8.2 additions**: `tcp_rto_min_us`, `tcp_comp_sack_delay_ns`,
-  `tcp_comp_sack_nr`, `tcp_comp_sack_slack_ns`, `tcp_pingpong_thresh`,
-  `tcp_min_tso_segs`, `tcp_tso_win_divisor`, `tcp_no_ssthresh_metrics_save`.
-- **Low-latency / fast-failover**: `tcp_mtu_probing=1` + `tcp_base_mss=1024`
-  (cures PMTU black holes on tunnels / proxies — WireGuard / Reality / XHTTP),
-  `tcp_low_latency=1`, `tcp_workaround_signed_windows=1`, `tcp_retries2=8`,
-  `netdev_budget=600` + `netdev_budget_usecs=8000`.
-- **Adaptive buffers**: `ethtool` reads real link speed; `tcp_rmem` / `tcp_wmem`
-  ceilings auto-grow up to 256 MB on 10G+ and 512 MB on 25G+.
-- **conntrack tuning**: `nf_conntrack_max` 1M..2M, `nf_conntrack_buckets=256k`,
-  `tcp_timeout_established=600` — fixes the silent dropped-packet ceiling at
-  ~65k connections that cripples busy proxies by default.
-- **MPTCP** auto-enabled on Linux 5.6+.
-- **ECMP / multipath**: detected automatically when the host has multiple
-  default routes (or use `--ecmp`).
-
-### CPU / IRQ load distribution
-
-- **Multi-queue auto-expand**: `ethtool -L combined N` raises virtio-net (and
-  similar) from the default 1 queue to `min(N_cpus, max_combined)` — usually
-  the #1 bottleneck on cloud VPS.
-- **RPS / RFS / XPS** with kernel-correct cpumask format that works on hosts
-  with **>32 CPUs** (comma-separated 32-bit hex chunks).
-- **`isolcpus=`-aware** affinity: dedicated/isolated cores excluded from
-  RPS/XPS/IRQ rotation.
-- **NIC offload safety**: TSO/GSO/GRO are only changed on bare-metal/KVM/Xen.
-  In OpenVZ/LXC/Docker we only force `lro off` (which is what proxies need)
-  and leave the rest under host control.
-
-### Memory / I/O
-
-- **THP → `madvise`** (no latency spikes that `always` causes on proxy
-  workloads).
-- **I/O scheduler auto-pick**: `none` for NVMe, `mq-deadline` for SSD.
-- **VM tuning**: `vm.max_map_count=1M`, `vm.overcommit_memory=1`,
-  `watermark_scale_factor=125` + `watermark_boost_factor=15000`,
-  `compaction_proactiveness=0`, dirty ratios, `admin_reserve_kbytes=16384`.
-- **ZRAM** (lz4) auto-setup when supported.
-- `core_pattern → /bin/false` so a crash dump can't fill the disk.
-
-### DNS — three transports, manual choice
-
-```bash
-sudo ./vps_optimizer.sh dns plain yandex
-sudo ./vps_optimizer.sh dns dot cloudflare
-sudo ./vps_optimizer.sh dns doh quad9
-sudo ./vps_optimizer.sh dns doh custom https://my-doh.example/dns-query
-sudo ./vps_optimizer.sh dns local
 ```
-
-Built-in resolvers: **Cloudflare / Google / Yandex / Quad9 / AdGuard**, plus
-`custom <ips/url>`. Local **dnsmasq** caching (10k entries, neg-ttl 60s) sits
-in front of any upstream so repeat-query RTT collapses to near-zero.
-
-### Stealth — white-noise traffic generator
-
-A separate, sandboxed `vps-noise.service` (systemd-hardened: `PrivateTmp`,
-`ProtectSystem`, `ProtectKernelTunables`, `LockPersonality`,
-`RestrictSUIDSGID`, `RestrictNamespaces`, `NoNewPrivileges`,
-`MemoryMax=256M`, `TasksMax=64`, `Restart=on-failure`,
-`StartLimitBurst=5`) emits a realistic background traffic profile **without
-ever writing payload to disk** (`curl -o /dev/null` everywhere).
-
-Loops:
-
-| Loop | Cadence | Behaviour |
-|---|---|---|
-| iOS Safari / CFNetwork bursts | 1–6 min | Apple, iCloud, mzstatic, AppStore, Weather, News, Stocks, Maps, GSA. iOS 18.x / iPadOS 18.x / 17.x / 16.x UAs. |
-| APNs keepalive | 25–40 min | `courier.push.apple.com:5223` keepalive. |
-| RU email | 45–180 min | Yandex.Mail / Mail.ru / Max.ru, multiple inner pages per session. |
-| RU news | 20–90 min | lenta / ria / rbc / tass / kommersant / vedomosti / gazeta / rg / iz / interfax / kp / dzen / mk / fontanka / meduza. |
-| Library / archive phantom | 90 min – 6 h | GitHub releases, npm registry, PyPI, Maven, RubyGems, crates.io, kernel.org, GNU FTP, openssl.org, Apache archive, Debian/Ubuntu APT mirrors. UAs: `curl`, `Wget`, `pip`, `npm`, `Maven`, `Go-http-client`, `Debian APT-HTTP/1.3 Ubuntu/24.04`. |
-| **Cloud / NTP / cloud-init phantom** *(v8.2)* | 30–180 min | `archive.ubuntu.com`, `security.ubuntu.com`, `time.ubuntu.com:123`, `api.snapcraft.io` — what every real Ubuntu node hits in the background. |
-| **DNS prefetch** *(v8.2)* | 30–240 s | Browser-style DNS preconnect — silent `getent` lookups against random hosts from all pools. |
-| **Health touch** *(v8.2)* | 30 s | Updates `/run/vps-noise/health.json` so `noise health` / `prom-serve` always show liveness. |
-
-Plus:
-
-- **iOS RU-strict mode**: 70% Apple / 20% RU news / 10% RU government &
-  critical-infrastructure portals. **No social networks, no messengers** by
-  design.
-- **Diurnal curve**: nights ×2.5 longer pauses, morning/evening peaks ×0.6–0.7,
-  day ×1.0.
-- **Place profile** *(v8.2)*: `auto` / `office` / `home` / `always_on` —
-  shapes the curve to look like a 9–18 office machine, an evening-peak home
-  machine, or a true 24/7 server.
-- **Vacation mode**: ~7% chance per day to enter 6–72 h of complete silence.
-  State persists in `/var/lib/vps-noise/`.
-- **Referer chains** *(v8.2)*: every burst now sends real `Referer:` headers
-  walking through your "session" pages, with correct `Sec-Fetch-Site:
-  same-origin/cross-site/none` decisions per hop.
-- **HTTP cache headers** *(v8.2)*: `If-None-Match` / `If-Modified-Since`
-  emitted on repeat URLs, exactly how a real browser cache behaves.
-- **`/dev/urandom` randomness** *(v8.2)*: replaces `$RANDOM` so parallel
-  loops can't accidentally pick correlated URLs.
-- Optional **curl-impersonate-safari** (auto-installed with
-  `install --impersonate`) for real Safari TLS / JA3 / JA4 fingerprint —
-  defeats handshake-level fingerprinting.
-
-### Security & robustness
-
-- **Probe-then-write** for every sysctl/sysfs.
-- **Hypervisor detection** (KVM / Xen / OpenVZ / LXC / Docker / WSL) — features
-  the host forbids are silently skipped.
-- **Kernel-version gating** for MPTCP, BBR3, etc.
-- **Lock-file** (`/var/lock/vps-optimizer.lock`) prevents two `apply`s racing.
-- **Rollback snapshot** taken before every `apply`
-  (`/var/backups/vps-optimizer/pre-apply-*.tar.gz`).
-- **Idempotency**: identical sysctl content → no rewrite, no `sysctl -p`.
-- **Audit log** (`/var/log/vps-optimizer-audit.log`) records every mutating
-  command with timestamp + user.
-- **Debug log** (`--debug`, `/var/log/vps-optimizer-debug.log`) records every
-  sysctl/sysfs write attempt with OK / SKIP / DENIED.
-- **Self-update with SHA256 verification** (when sidecar `.sha256` is
-  published with the release) and automatic rollback if the new script doesn't
-  pass `--help`.
-- **Connectivity pre-check** before `apply` — warns if the host has no
-  internet (won't accidentally lock you out via DNS).
-- **Full `reset`** restores DNS, dnsmasq, dnscrypt-proxy, ZRAM, swap, RPS
-  service, sysctl, limits, the noise service.
-
-### Opt-in security baseline (`harden`)
-
-Separate from the default `apply` to avoid surprising production:
-
-```bash
-sudo ./vps_optimizer.sh harden ssh        # MaxAuthTries 3, no password auth, banner
-sudo ./vps_optimizer.sh harden ufw        # default deny, allow detected SSH port
-sudo ./vps_optimizer.sh harden upgrades   # unattended-upgrades security-only
-sudo ./vps_optimizer.sh harden all
+┌─ Категории ───────────────────────────────────────────┐
+  [1] ⚡ Performance   apply · preset · suggest · wizard
+  [2] 🎭 Stealth       noise iOS+RU+APT · stealth-test · DNS
+  [3] 🩺 Diagnostics   doctor · status · top · log-tail
+  [4] ⚙  Config        swap · язык · preset · профили · hooks
+  [5] 📊 Monitoring    benchmark · bench-suite · Prometheus
+  [6] 📦 Misc          install · export · import · update
+  [7] 🤖 AI Network    nettune · grade · dna · BDP-autosize
+  [8] ↩  Reset all     откат всех изменений
+  [0] ❌ Выход
+└───────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## CLI reference
+## 🔒 Safety & design principles
 
-```text
-install                         Setup base components (dnsmasq, ethtool, jq, socat...)
-                                use `--impersonate` to also install curl-impersonate
-apply [--preset NAME]           Apply sysctl/sysfs/ZRAM. NAME: balanced (default) / proxy / web
-    [--vpn]                     Force VPN-friendly knobs (rp_filter=2, ip_forward=1, accept_local=1)
-    [--no-rollback]             Disable the post-apply auto-rollback safety net
-    [--boot]                    Install one-shot systemd unit so `apply` runs on every boot
-status [--json]                 Status dashboard, or JSON for cron / Grafana
-self-test                       Re-verify applied settings
-audit [--json]                  Deep diagnostics (drift / conntrack / RPS / DNS / PTR), `--json` for monitoring
-doctor                          Actionable diagnostics with concrete fixes (conntrack, retransmits, softnet, /var, DNS)
-why <key>                       Knowledge base: explain a specific sysctl key (e.g. `why net.ipv4.tcp_rmem`)
-wg setup                        Opt-in WireGuard helper: ICMP-based MTU autodetect + base config
-logs [N]                        Last N log lines: own log + journalctl + dmesg + audit
-preset <name>                   Save a preset for the next apply
-noise on|off|edit|test|status|health   Manage the stealth noise generator
-dns ...                         Manage DNS (plain | dot | doh — see `--help`)
-swap <gb>                       Create a swapfile of N GB
-benchmark                       Latency check against popular endpoints
-compare [target]                Save / diff a ping baseline (default 1.1.1.1)
-harden ssh|ufw|upgrades|all     Opt-in security baseline (does NOT touch default apply)
-prom-metrics                    Dump Prometheus metrics to stdout
-prom-serve [port]               Start a Prometheus exporter (default :9777)
-reset [--soft]                  Full rollback. `--soft` keeps DNS / noise / swap untouched
-uninstall                       Reset + remove the script itself
-export [path.tar.gz]            Bundle all configs (with manifest)
-import <path.tar.gz>            Apply a bundle (with version check)
-update                          Self-update from GitHub (with SHA256 verification)
-help                            Print full help
-```
-
-### Global flags
-
-```text
---dry-run        preview only, no writes
---quiet, -q      minimum output (cron/scripts)
---debug          verbose log to /var/log/vps-optimizer-debug.log
---force          ignore lock / interactive confirmations
---preset NAME    use a specific preset (balanced|proxy|web)
---impersonate    use curl-impersonate in noise (if installed)
---ecmp           force ECMP/multipath knobs (multi-NIC)
---vpn            force VPN-friendly knobs (auto-detected by default)
---no-rollback    disable the auto-rollback safety net after `apply`
---soft           soft mode for `reset` — keep DNS / noise / swap intact
---boot           install one-shot systemd unit for `apply` (re-applies on every boot)
---json           JSON output (for `status` / `audit`)
-```
-
-### Cron-friendly exit codes
-
-```text
- 0   ok
-10   already-applied (idempotent no-op)
-20   no internet (probe failed)
-30   blocked by hypervisor/container restrictions
-40   another instance is running (lock busy)
-50   invalid arguments / unknown preset
-60   auto-rolled-back due to connectivity loss
-```
+- ✅ **Single file** — easy to audit, copy, and version.
+- ✅ **Idempotent apply** with snapshot + rollback (Time-Machine).
+- ✅ **Multi-endpoint health checks** before committing changes.
+- ✅ **AI runs at idle priority** (`Nice=15`, `IOSchedulingClass=idle`) and never floods the disk.
+- ✅ **i18n** (en / ru / de / fr) · Prometheus metrics + alerts · man page.
 
 ---
 
-## Tested & validated
+<div align="center">
 
-- `bash -n` — clean.
-- `shellcheck` — 0 warnings on the host script and on the embedded noise
-  generator.
-- Probe-then-write verified to skip cleanly on locked-down OpenVZ.
+Made for people who want their VPS to be **fast, resilient, and quietly smart.** ⚡
 
----
-
-## Compatibility
-
-- **Required**: root, Bash 5+, Ubuntu 22.04 / 24.04 (or Debian 11/12 with
-  minor adjustments).
-- **Hypervisor**: KVM, Xen, VMware — full feature set.
-  OpenVZ / LXC — features the host forbids are auto-skipped.
-- **Kernels**: ≥ 5.4 minimum; ≥ 5.10 recommended for the full feature surface
-  (RACK, MPTCP, modern NAPI knobs); some `tcp_*` v8.2 keys land on 6.x.
-- **Disk**: ≤ 30 MB of additional packages installed by the optional
-  `install` step (`dnsmasq`, `zram-tools`, `jq`, `nano`, `socat`, ...).
-
----
-
-## Files this script touches
-
-```text
-/etc/sysctl.d/99-vps-optimizer.conf
-/etc/sysctl.d/99-vps-experimental.conf
-/etc/security/limits.d/99-vps-limits.conf
-/etc/systemd/system/vps-noise.service
-/etc/systemd/system/vps-rps.service
-/etc/systemd/resolved.conf.d/99-vps-optimizer.conf
-/etc/dnsmasq.d/vps-speed.conf
-/etc/dnscrypt-proxy/dnscrypt-proxy.toml      (only when DoH selected)
-/etc/vps-noise.conf
-/etc/vps-optimizer.preset
-/etc/vps-optimizer.dns
-/usr/local/bin/vps_noise_gen.sh
-/usr/local/sbin/vps_rps_boot.sh
-/var/lib/vps-noise/                          (vacation state, cookie jars)
-/var/log/vps-optimizer.log
-/var/log/vps-optimizer-audit.log
-/var/log/vps-optimizer-debug.log
-/var/backups/vps-optimizer/                  (pre-apply snapshots)
-/var/lock/vps-optimizer.lock
-/run/vps-noise/health.json
-```
-
-`uninstall` removes all of them.
-
----
-
-## Changelog
-
-### v8.8 — kernel-стек 2024 + iOS-стелс 2.0 + UX-доводка (current)
-
-Несовместимых изменений нет. Все default-флаги совпадают с v8.7. Никаких новых
-правил firewall/routing. SSH/VPN не трогается ни одной командой по дефолту.
-
-**🚀 Прорывной kernel-стек 2024** (probe-then-write, gracefully skip на старых ядрах):
-- **BIG TCP for IPv6** (kernel 6.3+) — `gso_max_size` / `gro_max_size` поднимаем с 64 K до **192 K**. На 10 G+ NIC это даёт +20-40% throughput через уменьшение per-segment overhead. На kernel <6.3 fallback к 64 K автоматически.
-- **TCP BBRv3** (kernel 6.4+) — auto-detect и use если доступен в kernel; в `doctor` теперь рекомендация активировать BBRv3 если он есть, но не активен (без auto-apply на live-системе).
-- **Accurate ECN** (`tcp_ecn=3`, kernel 6.0+, RFC 9341) — точнее классического ECN на mixed-ECN-router путях. Gated на kernel ≥6.0.
-- **`txqueuelen` auto-tune** — на 10 G NIC выставляем 5000, на 25 G+ NIC — 10000 (default 1000 — узкое место для bursty traffic). Не растёт memory footprint в idle.
-- **`tcp_min_rtt_wlen`** — на balanced/web preset возвращён к 300 s (быстрее адаптация на переменчивых VPS); proxy preset сохраняет 600 s (стабильнее BBR).
-- **`tcp_syn_linear_timeouts=4`** (kernel 6.4+) — линейный backoff для thin-stream SYN retransmits.
-
-**🎭 iOS стелс 2.0** (углубление маскировки под real iOS 17/18):
-- **APNs gateway endpoints** — `gateway.push.apple.com`, `1-courier.push.apple.com`, `17-courier.push.apple.com`. Real iOS держит на них постоянное TLS-соединение.
-- **iCloud Private Relay** — `mask.icloud.com`, `mask-h2.icloud.com`. Apple Network Privacy сервис, Safari в iOS 15+ ходит туда регулярно.
-- **App Store Connect** — `appstoreconnect.apple.com`, `buy.itunes.apple.com`. Real iPhone проверяет обновления приложений.
-- **Apple ID auth telemetry** — `idmsa.apple.com`, `gsa.apple.com`, `appleid.apple.com`. Fired на каждый login flow / refresh-token / 2FA.
-- **MDM / Configurator** — `albert.apple.com`, `configuration.apple.com`. Activation-related endpoints.
-- **ALPN rotation в noise** — h3 ~50% / h2 ~40% / http/1.1 ~10% (раньше было 50/50). Real iOS периодически falls back на http/1.1.
-- **`tcp_timestamps=2`** (kernel 4.10+, gated to proxy preset) — random-offset вместо raw uptime; скрывает boot-time машины.
-- **`ip_local_reserved_ports`** — резерв портов VPN-listener'ов (500/1194/4500/8388/9000-9999/51820) от source-port pool. Защищает от collision и leak.
-
-**🎨 UX / диагностика — доводка**:
-- `vps_optimizer.sh whoami [--json]` — текущий active config (preset/lang/BBR/qdisc/profiles count). Read-only, без root.
-- `vps_optimizer.sh show <preset>` — превью того, что preset изменит, без apply.
-- `vps_optimizer.sh compare-presets <p1> <p2>` — diff sysctl-знаний двух preset'ов.
-- `vps_optimizer.sh rollback --to <name>` — откат к именованному snapshot'у v8.7. С confirmation (override через `--yes`).
-- `vps_optimizer.sh doctor --fix` — интерактивный mode: для каждого warning'а в doctor предлагает конкретный fix с Y/n prompt.
-- `vps_optimizer.sh --version [--json]` / `version --json` — для оркестраторов.
-- `--verbose` (alias `--debug`).
-
-**🩺 Diagnostics + safety**:
-- doctor проверяет **TCP retrans rate** (RetransSegs/OutSegs из /proc/net/snmp) — warn >1%, error >5%.
-- doctor проверяет **conntrack table fill ratio** — warn >50%, error >70%.
-- doctor предупреждает если **NetworkManager управляет интерфейсами** (наши routing-правки могут быть стёрты при reload).
-- doctor предупреждает если **systemd-networkd И ifupdown(networking)** одновременно активны.
-- VPN-iface skip-list расширен: **Cloudflared (`cf*`), Tailscale/Headscale (`tailscale*`/`headscale*`), Resilio Sync (`sync*`), ZeroTier (`zt*`), OpenVPN named (`utun*`)**. Раньше skip только `tun*/tap*/wg*/ppp*/ipsec*`.
-
-**Quick-start**:
-```
-sudo ./vps_optimizer.sh whoami              # текущая конфигурация
-sudo ./vps_optimizer.sh show proxy          # что preset proxy изменит, без apply
-sudo ./vps_optimizer.sh compare-presets balanced proxy   # diff между preset
-sudo ./vps_optimizer.sh apply --learn       # dry-run + diff (без записи)
-sudo ./vps_optimizer.sh apply --preset proxy
-sudo ./vps_optimizer.sh doctor --fix        # интерактивные фиксы
-sudo ./vps_optimizer.sh rollback --to before-tuning   # откат к profile snapshot
-```
-
-### v8.7 — UX overhaul + sysctl + iOS-stealth deepening
-
-Несовместимых изменений нет. Все default-флаги совпадают с v8.6. Никаких новых
-правил firewall/routing. SSH/VPN не трогается ни одной командой по дефолту.
-
-**🎨 UX / интерфейс** — главный фокус релиза:
-- `vps_optimizer.sh suggest` — авто-подбор preset на основе RAM / CPU / NIC-speed / virt / NUMA-nodes. Не применяет ничего; покажет рекомендацию и причину. `suggest --apply` — применить сразу.
-- `vps_optimizer.sh wizard` — first-run guided setup (5 шагов): язык → preset (с suggest) → DNS → noise → apply. Все шаги с дефолтами по Enter.
-- **Categorical main menu** — вместо плоского списка теперь 6 категорий: ⚡ Performance / 🎭 Stealth / 🩺 Diagnostics / ⚙ Config / 📊 Monitoring / 📦 Misc. С Recommended-бейджем рядом с текущим preset'ом если он не оптимален для железа.
-- `vps_optimizer.sh install-completion` — генерирует bash + zsh tab-completion (`/etc/bash_completion.d/vps-optimizer`, `/usr/local/share/zsh/site-functions/_vps-optimizer`).
-- `vps_optimizer.sh log-tail [file]` — `tail -f` логов с цветной подсветкой levels (INFO/OK/WARN/ERR).
-- `vps_optimizer.sh profile save|load|list|delete <name>` — именованные снапшоты конфигурации (атомарный rollback к точке).
-- `vps_optimizer.sh bench-suite` — iperf3 baseline до 4 публичных серверов (Paris/NL/NYC) + history CSV в `/var/lib/vps-optimizer/bench-history.csv`.
-- Help layout v2 — добавлена секция «Quick-start by role» (прокси / VPN / web / wizard / suggest).
-
-**⚡ Quick-win sysctl** (probe-then-write, безопасны на любом ядре):
-- `net.ipv4.tcp_l3mdev_accept=1` + `net.ipv4.udp_l3mdev_accept=1` — VRF/cilium-подобные среды (kernel ≥4.8/5.5). Безвредно если l3mdev не используется.
-- `net.unix.max_dgram_qlen=512` — для прокси с unix-socket интерконнекта (sing-box ↔ haproxy ↔ envoy через `/run/*.sock`). Default 10 — слишком мало.
-- `net.core.dev_weight` auto-scale: 64 (≤1G NIC) → **192 (10G)** → **256 (25G+)**. Был статичный 64-96, на 10G+ NAPI-poll cycles слишком частые.
-- `vm.swappiness` per-preset: balanced=180 (ZRAM-friendly), **proxy=30** (latency-sensitive: handshake-burst), **web=60** (cached static content tolerates IO).
-
-**🎭 iOS stealth — углубление маскировки:**
-- Apple Maps tile-сервера (`gsp-ssl.ls.apple.com`, `apzones.apple.com`), iMessage relay (`relay.smoot.apple.com`), Apple Music API (`amp-api.music.apple.com`), Spotlight Suggest (`smoot-search.apple.com`), Siri/Smoot endpoints, `captive.apple.com/hotspot-detect.html` (~60s периодичность реального iOS) — добавлены в noise-pool. ~16 новых endpoint'ов.
-- JA3 hash-list: расширен с 4 до **12 hash'ей** (iOS 13/14 legacy + iOS 15-17 mainstream + iOS 18 + iPadOS 17/18). В проде на CF/Akamai встречается до 12 одновременно.
-- `vps_optimizer.sh dns padding on|off` — opt-in EDNS0 padding (RFC 7830/8467) для unbound: `pad-responses-block-size: 468`, `pad-queries-block-size: 128`. Ломает size-based DNS fingerprint. dnsmasq не поддерживает (limitation), dnscrypt-proxy уже padded автоматически.
-
-**🩺 Diagnostics:**
-- `doctor` теперь проверяет UDP `RcvbufErrors` / `InErrors` из `/proc/net/snmp` — критично для QUIC/WireGuard. Warn при `RcvbufErrors > 1000` (буфер переполняется → повышай `net.core.rmem_max`/`optmem_max`).
-
-**Тесты:** добавлено 19 bats-тестов для v8.7 (suggest/wizard/profile/log-tail/bench-suite/dns padding/sysctl/JA3/iOS endpoints/categorical menu). 54 тестов всего, все green.
-
-### v8.6 — i18n + perf + iOS stealth quick-wins
-
-Несовместимых изменений нет. Все default-флаги совпадают с v8.5. Никаких новых
-правил firewall/routing.
-
-**🌐 i18n (выбор языка)** — 5 языков: `en` / `ru` / `de` / `fr` / `zh`.
-Native: `en` / `ru`. Machine-translated baseline (community-perfectible):
-`de` / `fr` / `zh` — PR-ы с правками приветствуются.
-
-```bash
-vps_optimizer.sh config show              # текущий язык + где сохранён
-sudo vps_optimizer.sh config lang ru      # сохранить в /etc/vps-optimizer.lang
-LC_VPS=de vps_optimizer.sh help           # one-shot env-override
-vps_optimizer.sh --no-color help          # отключить ANSI (или NO_COLOR=1, или TTY-detect — auto в pipe)
-```
-
-**⚡ Quick-win sysctl** (probe-then-write):
-- `net.ipv4.tcp_reordering 6 → 10` + `tcp_max_reordering 300 → 600` — устойчивость к джиттеру (Wi-Fi / спутник / RU↔EU). Все пресеты.
-- `net.ipv4.tcp_thin_dupack=1` — **только `--preset proxy`** (per CONTRIBUTING #5: tcp_thin_*). Для interactive thin-streams (SSH, gRPC keepalive) ускоряет fast-retx.
-- `kernel.numa_balancing=0` — auto-disable на VPS с 1 NUMA-узлом (через `numactl --hardware` или `/sys/devices/system/node`). На multi-socket bare-metal остаётся включённым.
-- `cpufreq governor=performance` где `/sys/devices/.../scaling_governor` доступен на запись.
-
-**🎭 iOS stealth quick-wins:**
-- IPv6 privacy extensions (`use_tempaddr=2 + regen_max_retry=3 + max_desync_factor=60`) — только под `--preset proxy`. RFC 4941, активно использует Apple.
-- `curl --tcp-fastopen` 50% запросов в noise-генераторе (curl 7.49+).
-- `stealth-test --json` (machine-readable) + `--exit-fail-on-leak` (CI-friendly, exit=2 если JA3 leak) + `--ja4` (опц., если curl-impersonate-chrome 0.6+ установлен).
-
-**🛠 UX / observability:**
-- `status --watch` — live-update каждые 2 сек (Ctrl-C для выхода).
-- `--json-logs` — глобальный флаг, переключает `RUN_LOG` в structured JSON-line формат для ELK/Loki/Vector.
-- DNS cache hit-ratio в `prom-metrics` (через `unbound-control stats_noreset`): новые метрики `vps_dns_cache_hits`, `vps_dns_cache_misses`, `vps_dns_cache_hit_ratio`.
-- `--learn` — dry-run с явным diff'ом «current → desired» по каждому sysctl/sysfs (не пишет на диск).
-
-**Новые тесты:** добавлено 15 unit-тестов в `tests/test_helpers.bats` (i18n / config / --no-color / --json-logs / --learn / stealth-test флаги / DNS hit-ratio / TFO в noise / numa_balancing).
-
-### v8.5 — perf-pkg + diag/stealth/playbooks
-
-Расширение v8.4. Все default-флаги совпадают с v8.4. Никаких новых правил
-firewall/routing — apply остаётся VPN/SSH-safe. Новые DNS-расширения (DoQ,
-DNSSEC) — **только opt-in** через явные команды.
-
-**Новые quick-win sysctl** (probe-then-write):
-- `kernel.io_uring_disabled=0` — для прокси на современных стеках (sing-box/h2o).
-- `kernel.sched_min_granularity_ns=10ms` + `sched_wakeup_granularity_ns=15ms` — больше CPU-time per task.
-
-**Новые apply-step'ы:**
-- KSM (Kernel Samepage Merging) auto-detect — включаем только в виртуализации (kvm/xen/hyperv/vmware), мягко (sleep_millisecs=200).
-
-**doctor дополнения (12 → 15 секций):**
-- systemd-resolved coexistence — детектит конфликт с dnsmasq за порт 53.
-- ip_local_port_range проверка ширины (warn если span < 20000 — риск EADDRINUSE).
-- bpftool prog show — сколько eBPF-программ загружено.
-- WireGuard: kernel-mode vs userspace (wireguard-go) с рекомендацией.
-
-**Новые CLI команды:**
-- `stealth-test` — JA3-leak self-check через ja3er.com (warn если curl-default fingerprint).
-- `audit-syslog <host:port>` — pешать audit-log в remote rsyslog.
-- `backup-config <rclone-remote>` — выгружать snapshot конфигов на S3/Backblaze/Yandex.
-- `playbook hysteria2-host|wg-vpn-server|web-frontend` — готовые роли.
-- `health-watch on|off|status` — systemd-таймер doctor каждые 5 мин.
-- `dns doq <preset>` — указатель на установку DNS-over-QUIC (**opt-in**, не активируется автоматически).
-- `dns dnssec on|off` — DNSSEC validation в unbound (**opt-in**).
-
-**Новые stealth-улучшения:**
-- `noise on` теперь подсказывает установить curl-impersonate-safari если его нет (с fallback warning).
-
-**Assets:**
-- `assets/prometheus/vps-optimizer-alerts.yml` — drop-in alerts для conntrack/retrans/noise/drift.
-- `assets/man/vps-optimizer.8` — настоящая nroff manpage (`cp ... /usr/share/man/man8/`).
-
-**Тесты:**
-- `tests/test_helpers.bats` — 19 unit-тестов (bats-core); CI запускает их + groff-валидацию manpage + YAML-валидацию alerts.
-
-### v8.4 — stealth & perf
-
-Расширение v8.3 без изменений defaults — всё новое либо probe-then-write, либо
-opt-in. SSH/VPN-совместимо: ни один новый knob не меняет routing/firewall.
-
-**Стелс / маскировка под iOS** (главный приоритет):
-- **APNs/FCM/WNS rotation** в шуме — реальные мобильные устройства держат TCP до push-сервисов **постоянно**. Раньше был только APNs, теперь — APNs + FCM (`mtalk.google.com:5228`) + Microsoft WNS.
-- **WebRTC STUN UDP бёрсты** — Safari/Chrome регулярно стучатся в `stun.l.google.com:19302` / Cloudflare STUN. Теперь имитируем (1-3 STUN Binding Request раз в 10-40 минут).
-- **WebSocket-style long-poll** — длинные TCP/443 keepalive (5-20 мин) к крупным сайтам. Раньше шум был request/response, теперь имитируем Telegram/Discord-pattern.
-- **HTTP/3 в шуме чаще** (1/2 вместо 1/3) — Safari/Chrome ходят h3 ~50%.
-- **TLS 1.3 0-RTT / Early Data** на resumed sessions через curl `--tls-earlydata` (если поддерживается).
-
-**Производительность TCP/UDP** (probe-then-write):
-- `tcp_min_rtt_wlen 600` — стабильнее BBR на джиттере.
-- `bpf_jit_enable=1` + `bpf_jit_kallsyms=1` + `bpf_jit_harden=1` — JIT для eBPF, +10-100x для XDP.
-- `nf_conntrack_tcp_be_liberal=1` — меньше drop'ов на ASN-roaming.
-- `vm.min_free_kbytes` авто (~0.5% RAM, 64MB-1GB bounds) — нет direct-reclaim под burst.
-- `initcwnd=30 / initrwnd=30` через `ip route change` на default-маршруте (skip VPN-iface) — Google-style.
-- `modprobe tls` — kTLS-модуль (sendfile-on-TLS, -30-50% CPU для nginx-ktls).
-- **OOM-protect** для xray/sing-box/hysteria/v2ray/tuic/wireguard-go (`oom_score_adj=-500`).
-
-**NIC enhancements** (best-effort, ошибки игнорируются):
-- `rx-flow-hash udp4/tcp4 sdfn` — RSS hash включает src/dst ports → лучше распределение QUIC.
-- `hw-tc-offload on`, `ntuple on`, `gso_max_size 65536`, `gro_max_size 65536`.
-
-**doctor дополнения:**
-- top-3 connections by retransmits через `ss -tin`.
-- PCIe gen warning (gen3 на gen4-капабельной hw).
-- kTLS статус (`/sys/module/tls`).
-
-**Новые CLI команды:**
-- `top` — TUI: live conntrack, TCP states, top-10 connections by retransmits (`watch -n 2`).
-- `mtr <host>` — обёртка над mtr для quick-troubleshoot линка.
-- `prom-push <gw-url>` — push-режим для cron-jobs (Pushgateway).
-
-**Backward-compat:** все default-флаги совпадают с v8.3. v8.3-конфиги работают без изменений.
-
-### v8.3 PHOENIX-Z++ — VPN-safe
-
-**Главное:** apply теперь VPN/SSH-friendly по дефолту, сам себя откатывает если потерял связь.
-
-**SSH/VPN safety net:**
-- **Auto-rollback** после `apply`: пробуем DNS + TCP/443; если связь упала — откатываем на pre-apply snapshot. Защита от своего же sysctl. Отключаемо: `--no-rollback`.
-- **VPN-friendly auto-detect** (opt-in): если виден `tun*`/`wg*`/`ppp*` iface, или передан `--vpn` — автоматически переключаем `rp_filter` со strict (=1) на loose (=2), включаем `accept_local=1`, `ip_forward=1`, `nf_conntrack_helper=0`. Без VPN остаётся прежний strict-режим (backward-compat).
-
-**UDP / QUIC / VPN скорость:**
-- **UDP-GRO/GSO** ethtool offloads: `rx-udp-gro-forwarding`, `tx-udp-segmentation` — даёт **2-3x throughput** для QUIC/Hysteria2/TUIC/WireGuard на 5.18+ ядрах.
-- **TCP Fast Open black-hole defuse**: `tcp_fastopen_blackhole_timeout_sec=0` — без этого после первой неудачи TFO лочился на 1 час.
-- **UDP stack hardening**: `udp_rmem_min`/`udp_wmem_min`/`udp_mem` подняты — нужно для тяжёлого QUIC. `net.core.optmem_max` остался 4MB (как было в v8.2) — этого достаточно для SO_ZEROCOPY у sing-box/xray.
-- **gRPC keepalive sysctl**: для long-lived потоков sing-box/xray.
-- **netdev_max_backlog/dev_weight** автомасштаб: 25G+ → 300000/128, 10G+ → 100000/96, иначе 30000/64.
-
-**Новые команды:**
-- `doctor` — actionable-диагностика: проверяет conntrack, retransmits, softnet drops, /var, DNS — с подсказками как починить.
-- `why <key>` — объясняет почему конкретный sysctl такой (knowledge base ~30 ключей).
-- `audit --json` — машиночитаемый аудит для мониторинга.
-- `wg setup` — WireGuard helper (opt-in): автодетект MTU через ICMP needs-frag, генерация конфига, ip_forward.
-- `reset --soft` — откат только sysctl, оставляет DNS/noise/swap.
-- `apply --boot` — one-shot systemd unit для apply на каждом boot (для OpenVZ, где `/etc/sysctl.d/` иногда вытирается).
-- `apply --vpn` — явный VPN-режим без auto-detect.
-- PTR sanity check в `audit` (только warn).
-
-**Cron-friendly exit codes:**
-`0`=ok, `10`=already-applied, `20`=internet-down, `30`=hypervisor-blocked, `40`=lock-busy, `50`=invalid-args, `60`=rolled-back.
-
-**Daily snapshots:**
-`/var/backups/vps-optimizer/daily-YYYYMMDD.tar.gz` — 1 в сутки, держим 7 дней. Pre-apply снапшоты держим до 30 штук с авто-rotation.
-
-**Микро-фиксы (Q1-Q5,Q7,Q8):**
-- audit drift parser: `awk` вместо `IFS='='` для значений с `=`.
-- `_prom_handler` различает `/metrics`, `/`, `/healthz` (Prometheus + k8s liveness).
-- `install_curl_impersonate` тянет latest tag через GitHub API (fallback 0.6.1).
-- dmesg log filter: `out of memory|invoked oom-killer` вместо `killed` (меньше ложных).
-- `detect_provider` hostname-эвристика теперь требует доменный суффикс, не любую подстроку.
-
-**Не сделано (отложено по соображениям SSH/VPN-безопасности):**
-- Egress-firewall preset (мог закрыть SSH).
-- Disable kernel watchdog (мог скрыть реальные проблемы ядра).
-- GRUB-tweaks (требует ребут).
-- AppArmor profile noise (мог сломать на нестандартных ядрах).
-- HugePages (мог OOM на маленьких VPS).
-
-### v8.2 PHOENIX-Z++
-
-- New TCP knobs: `tcp_rto_min_us`, `tcp_comp_sack_*`, `tcp_pingpong_thresh`,
-  `tcp_min_tso_segs`, `tcp_tso_win_divisor`, `tcp_no_ssthresh_metrics_save`,
-  `high_order_alloc_disable`.
-- ECMP / multipath auto-detect (`fib_multipath_hash_policy=1` when 2+ default
-  routes or `--ecmp`).
-- NIC offload safety: only touch TSO/GSO/GRO on hosts where it's safe; in
-  containers we limit ourselves to `lro off`.
-- Idempotent `apply`: identical sysctl conf → no rewrite, no `sysctl -p`.
-- Pre-apply rollback snapshot in `/var/backups/vps-optimizer/`.
-- Lock file prevents concurrent `apply`s.
-- Internet-connectivity pre-check.
-- New CLI: `status --json`, `logs`, `audit`, `harden`, `uninstall`,
-  `compare`, `prom-metrics`, `prom-serve`, `version`, `noise test`,
-  `noise health`.
-- Audit log for every mutating command. Debug log under `--debug`.
-- `self-update` now verifies SHA256 (sidecar `.sha256`) and rolls back if the
-  new script fails sanity check.
-- `import` / `export` use a manifest with `format_version` for forward
-  compatibility.
-- `vps-noise.service`: hardened (Protect{System,Home,Kernel*}, LockPersonality,
-  RestrictSUIDSGID, RestrictNamespaces, TasksMax=64, Restart=on-failure +
-  StartLimit). Health written to `/run/vps-noise/health.json`.
-- Noise generator: real `Referer:` chains, `Sec-Fetch-Site` per hop,
-  `If-None-Match` / `If-Modified-Since` cache simulation,
-  cloud / NTP / cloud-init phantom loop, browser-style DNS prefetch loop,
-  `/dev/urandom` randomness, place profile (`office` / `home` / `always_on` /
-  `auto`).
-- `--impersonate` flag: optional auto-install of `curl-impersonate-safari`.
-- Provider auto-detect via `dmidecode` / hostname (Hetzner / DigitalOcean /
-  Vultr / AWS / GCP / Azure / Aeza / Timeweb / Firstbyte / Oracle).
-- Full `--help` rewrite + man-style flags reference.
-- README rewritten.
-
-### v8.1.1 PHOENIX-Z+
-
-First stable tagged release. v6.0 → v8.1.1 development cycle merged.
-
-- Adaptive TCP/UDP buffers, BBR + fq_codel, RACK / ECN / MPTCP.
-- conntrack tuning, MPTCP on 5.6+.
-- Multi-queue auto-expand, RPS / XPS / RFS, isolcpus-aware affinity.
-- THP → `madvise`, NVMe / SSD I/O scheduler auto-pick, ZRAM.
-- DoT / DoH via systemd-resolved / dnscrypt-proxy with provider presets.
-- iOS Safari + RU email / news + APT phantom + lib phantom + vacation mode.
-- Probe-then-write for every knob, hypervisor + kernel-version gates.
-- Three presets (balanced / proxy / web), full CLI, dry-run, self-test.
-- Bug fixes: `tcp_fin_timeout` preset override, >32-CPU XPS cpumask,
-  persistent-boot-script multi-queue + isolcpus parity.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Security
-
-See [SECURITY.md](SECURITY.md). For vulnerabilities — please open a private
-GitHub Security Advisory rather than a public issue.
+</div>
