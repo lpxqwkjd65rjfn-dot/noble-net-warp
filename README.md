@@ -146,7 +146,7 @@ sudo ./vps_optimizer.sh dna     # Network DNA fingerprint + recommended preset
 ## 📦 Quick start
 
 ```bash
-git clone https://github.com/<owner>/noble-net-warp.git
+git clone https://github.com/lpxqwkjd65rjfn-dot/noble-net-warp.git
 cd noble-net-warp
 chmod +x vps_optimizer.sh
 
