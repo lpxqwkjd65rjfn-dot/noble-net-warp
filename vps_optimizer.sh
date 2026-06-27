@@ -130,7 +130,7 @@ INTERNET_PROBE_QUORUM="${LC_VPS_PROBE_QUORUM:-2}"
 # $HOOK_DIR/{pre-apply.d,post-apply.d}/ to extend apply without forking.
 HOOK_DIR="${LC_VPS_HOOK_DIR:-/etc/vps-optimizer.d}"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.20"
+SCRIPT_VERSION="8.21"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -1894,10 +1894,14 @@ apply_sysctls() {
     esac
     [ "${QDISC_MODE:-auto}" != "auto" ] && _log INFO "qdisc: режим=${QDISC_MODE} → ${best_qdisc}"
     sysctl_safe net.core.default_qdisc "$best_qdisc"
-    # макс-доработанные профили накладываются на реальные интерфейсы
-    [ "$_noble_aqm" = "1" ] && apply_noble_aqm
-    [ -n "$_tune_kind" ] && apply_tuned_qdisc "$_tune_kind"
-    sysctl_safe net.ipv4.tcp_congestion_control "$best_bbr"
+    # v8.21: crash-guard — снимок, применение кастома, проверка связности, авто-откат
+    if [ "$_noble_aqm" = "1" ] || [ -n "$_tune_kind" ]; then
+        _qdisc_guard_begin
+        [ "$_noble_aqm" = "1" ] && apply_noble_aqm
+        [ -n "$_tune_kind" ] && apply_tuned_qdisc "$_tune_kind"
+        _qdisc_guard_verify
+    fi
+    apply_bbr_max "$best_bbr"   # v8.21: BBR-max + verify + cubic-fallback
     sysctl_safe net.core.netdev_budget 600
     sysctl_safe net.core.netdev_budget_usecs 8000
     sysctl_safe net.core.netdev_max_backlog "$PRESET_NETDEV_BACKLOG"
@@ -2700,6 +2704,13 @@ apply_optimizations() {
     fi
     _log INFO "${YELLOW}[*] Глобальный тюнинг v${SCRIPT_VERSION} PHOENIX-Z++...${NC}"
 
+    # v8.21: подхватываем ручные параметры кастомов/BBR из конфига (env имеет приоритет).
+    if [ -f "$NOISE_CONF" ]; then
+        set -a; # shellcheck disable=SC1090
+        . "$NOISE_CONF" 2>/dev/null || _log WARN "не удалось прочитать $NOISE_CONF — берём дефолты"
+        set +a
+    fi
+
     if ! acquire_lock; then
         return "$EXIT_LOCK_BUSY"
     fi
@@ -2903,6 +2914,94 @@ rollback_last_snapshot() {
 # в день, ~25–40 заглядываний в новости, ~1–4 «обновления системы».
 #
 # ============================================================================
+# v8.21 ULTRACODE: защита от краша сети + утилиты ручной настройки.
+# ----------------------------------------------------------------------------
+# _qnum <value> <min> <max> <default> — валидирует целое в диапазоне, иначе default.
+_qnum() {
+    local v="${1:-}" lo="${2:-0}" hi="${3:-0}" def="${4:-0}"
+    case "${v:-}" in ''|*[!0-9]*) echo "$def"; return 0 ;; esac
+    if [ "$v" -ge "$lo" ] && [ "$v" -le "$hi" ]; then echo "$v"; else echo "$def"; fi
+}
+
+# _ng_ifaces — реальные интерфейсы (без виртуальных/туннельных).
+_ng_ifaces() { ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|ifb|ifb-noble|sit|gre|ip6tnl)'; }
+
+# _net_alive — связность жива? (шлюз → публичные резолверы). 0 = ok.
+_net_alive() {
+    local gw t; gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+    for t in "$gw" 1.1.1.1 8.8.8.8 77.88.8.8; do
+        [ -n "${t:-}" ] || continue
+        ping -c1 -w2 "$t" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# _qdisc_guard_begin — снимок текущего default_qdisc перед рискованным применением.
+_qdisc_guard_begin() {
+    NETGUARD_PREV_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo fq_codel)
+    export NETGUARD_PREV_QDISC
+}
+
+# _qdisc_rollback — полный откат кастомных qdisc/ingress/IFB к безопасному состоянию.
+_qdisc_rollback() {
+    local e
+    for e in $(_ng_ifaces); do
+        tc qdisc del dev "$e" root 2>/dev/null || true
+        tc qdisc del dev "$e" ingress 2>/dev/null || true
+    done
+    ip link del ifb-noble 2>/dev/null || true
+    sysctl -w net.core.default_qdisc="${NETGUARD_PREV_QDISC:-fq_codel}" >/dev/null 2>&1 || true
+    _log WARN "crash-guard: выполнен откат → ${NETGUARD_PREV_QDISC:-fq_codel} (кастом снят, сеть восстановлена)"
+}
+
+# _qdisc_guard_verify — проверить связность после кастома; при потере — авто-откат.
+_qdisc_guard_verify() {
+    [ "${NETGUARD_ENABLE:-1}" = "1" ] || { _log INFO "crash-guard: отключён (NETGUARD_ENABLE=0)"; return 0; }
+    if _net_alive; then
+        _log OK "crash-guard: связность подтверждена — кастомный qdisc активен"
+        return 0
+    fi
+    _log ERROR "crash-guard: связность ПОТЕРЯНА после применения qdisc — аварийный откат!"
+    _qdisc_rollback
+    if _net_alive; then _log OK "crash-guard: связность восстановлена после отката"
+    else _log ERROR "crash-guard: связность всё ещё нарушена — проверьте сеть вручную"; fi
+    return 0
+}
+
+# apply_bbr_max <auto-detected> — BBR до максимума с verify и cubic-fallback.
+# Безопасно для classic Ubuntu 24.04 (kernel 6.8). BBR_FORCE: auto|bbr|bbr2|bbr3|cubic|reno.
+apply_bbr_max() {
+    local chosen="${1:-cubic}" want="${BBR_FORCE:-auto}"
+    case "$want" in
+        cubic|reno)     chosen="$want" ;;
+        bbr|bbr2|bbr3)  if has_cong_ctl "$want"; then chosen="$want"; else _log WARN "bbr: '$want' недоступен в ядре → оставляю '$chosen'"; fi ;;
+        auto|*)         : ;;
+    esac
+    if sysctl -w net.ipv4.tcp_congestion_control="$chosen" >/dev/null 2>&1; then
+        local rb; rb=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        if [ "$rb" != "$chosen" ]; then
+            _log WARN "bbr: ядро не приняло '$chosen' (текущий '$rb') → fallback cubic"
+            sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true; chosen="cubic"
+        fi
+    else
+        _log WARN "bbr: не удалось выставить '$chosen' → fallback cubic"
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true; chosen="cubic"
+    fi
+    case "$chosen" in
+        bbr|bbr2|bbr3)
+            # макс-companion для BBR-семейства (probe-safe, безопасно на 6.8):
+            sysctl_safe net.ipv4.tcp_notsent_lowat "$(_qnum "${TCP_NOTSENT_LOWAT:-}" 4096 1048576 131072)"
+            sysctl_safe net.ipv4.tcp_no_metrics_save 1
+            sysctl_safe net.ipv4.tcp_ecn 1
+            sysctl_safe net.ipv4.tcp_ecn_fallback 1
+            ;;
+    esac
+    APPLIED_BBR="$chosen"; export APPLIED_BBR
+    if [ "$want" = "auto" ]; then _log INFO "congestion control: $chosen"
+    else _log INFO "congestion control: $chosen (ручной режим BBR_FORCE=$want)"; fi
+}
+
+# ============================================================================
 # v8.20 ULTRACODE: apply_tuned_qdisc — МАКС-доработанные fq / fq_codel.
 # Не стоковые дефолты, а hand-tuned профили на новейших фичах ядра с
 # многоуровневым graceful-fallback (full → medium → basic), чтобы заводилось
@@ -2926,18 +3025,33 @@ apply_tuned_qdisc() {
     mem_b=$(( mem_mb * 1024 * 1024 ))
     local tgt=$(( rtt_ms / 5 + 4 )); [ "$tgt" -lt 3 ] && tgt=3
 
+    # v8.21: ручные переопределения параметров (env/конфиг), всё валидируется _qnum.
+    local fq_fl fq_q fq_iq fq_bk fq_ce fc_lim fc_fl fc_q fc_tg fc_iv fc_ce fc_ecn
+    fq_fl=$(_qnum "${FQ_FLOW_LIMIT:-}" 1 100000 200)
+    fq_q=$(_qnum "${FQ_QUANTUM:-}" 256 1000000 3028)
+    fq_iq=$(_qnum "${FQ_INITIAL_QUANTUM:-}" 256 10000000 15140)
+    fq_bk=$(_qnum "${FQ_BUCKETS:-}" 64 1048576 2048)
+    fq_ce=$(_qnum "${FQ_CE_THRESHOLD:-}" 1 1000 "$tgt")
+    fc_lim=$(_qnum "${FQCODEL_LIMIT:-}" 64 1000000 10240)
+    fc_fl=$(_qnum "${FQCODEL_FLOWS:-}" 1 65536 1024)
+    fc_q=$(_qnum "${FQCODEL_QUANTUM:-}" 256 65536 1514)
+    fc_tg=$(_qnum "${FQCODEL_TARGET:-}" 1 1000 "$tgt")
+    fc_iv=$(_qnum "${FQCODEL_INTERVAL:-}" 1 2000 "$rtt_ms")
+    fc_ce=$(_qnum "${FQCODEL_CE:-}" 1 1000 1)
+    fc_ecn="${FQCODEL_ECN:-ecn}"; case "$fc_ecn" in ecn|noecn) : ;; *) fc_ecn="ecn" ;; esac
+
     local applied=0 ifc
     for ifc in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|ifb|sit|gre|ip6tnl)'); do
         case "$kind" in
           fq)
-            tc qdisc replace dev "$ifc" root fq flow_limit 200 quantum 3028 initial_quantum 15140 maxrate 0 buckets 2048 horizon 10s horizon_drop ce_threshold ${tgt}ms timer_slack 10us 2>/dev/null \
-              || tc qdisc replace dev "$ifc" root fq flow_limit 200 quantum 3028 initial_quantum 15140 buckets 2048 ce_threshold ${tgt}ms 2>/dev/null \
+            tc qdisc replace dev "$ifc" root fq flow_limit $fq_fl quantum $fq_q initial_quantum $fq_iq maxrate 0 buckets $fq_bk horizon 10s horizon_drop ce_threshold ${fq_ce}ms timer_slack 10us 2>/dev/null \
+              || tc qdisc replace dev "$ifc" root fq flow_limit $fq_fl quantum $fq_q initial_quantum $fq_iq buckets $fq_bk ce_threshold ${fq_ce}ms 2>/dev/null \
               || tc qdisc replace dev "$ifc" root fq 2>/dev/null \
               || continue
             _log OK "fq+ (EDT/horizon/ce) ↑ ${ifc} (rtt=${rtt_ms}ms)"; applied=1 ;;
           fq_codel)
-            tc qdisc replace dev "$ifc" root fq_codel limit 10240 flows 1024 quantum 1514 target ${tgt}ms interval ${rtt_ms}ms memory_limit ${mem_b} ecn ce_threshold 1ms 2>/dev/null \
-              || tc qdisc replace dev "$ifc" root fq_codel limit 10240 flows 1024 target ${tgt}ms interval ${rtt_ms}ms ecn 2>/dev/null \
+            tc qdisc replace dev "$ifc" root fq_codel limit $fc_lim flows $fc_fl quantum $fc_q target ${fc_tg}ms interval ${fc_iv}ms memory_limit ${mem_b} $fc_ecn ce_threshold ${fc_ce}ms 2>/dev/null \
+              || tc qdisc replace dev "$ifc" root fq_codel limit $fc_lim flows $fc_fl target ${fc_tg}ms interval ${fc_iv}ms $fc_ecn 2>/dev/null \
               || tc qdisc replace dev "$ifc" root fq_codel 2>/dev/null \
               || continue
             _log OK "fq_codel+ (L4S ce/mem ${mem_mb}mb) ↑ ${ifc} (rtt=${rtt_ms}ms)"; applied=1 ;;
@@ -2971,8 +3085,12 @@ apply_noble_aqm() {
     ram_kb=$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 1048576)
     mem_mb=$(( ram_kb / 1024 / 64 )); [ "$mem_mb" -lt 4 ] && mem_mb=4; [ "$mem_mb" -gt 64 ] && mem_mb=64
 
+    # v8.21: ручные переопределения noble (env/конфиг), валидируются _qnum.
+    [ -n "${NOBLE_RTT_MS:-}" ] && rtt_ms=$(_qnum "$NOBLE_RTT_MS" 1 1000 "$rtt_ms")
+    [ -n "${NOBLE_MEM_MB:-}" ] && mem_mb=$(_qnum "$NOBLE_MEM_MB" 1 256 "$mem_mb")
+
     # 3) Профиль cake: уникальная "noble"-комбинация.
-    local cake_opts="diffserv4 dual-srchost nat ack-filter split-gso rtt ${rtt_ms}ms memlimit ${mem_mb}mb overhead 38 mpu 84"
+    local cake_opts="${NOBLE_DIFFSERV:-diffserv4} ${NOBLE_FLOWMODE:-dual-srchost} nat ${NOBLE_ACKFILTER:-ack-filter} split-gso rtt ${rtt_ms}ms memlimit ${mem_mb}mb overhead ${NOBLE_OVERHEAD:-38} mpu ${NOBLE_MPU:-84}"
     local fb_opts="limit 10240 flows 1024 target $(( rtt_ms / 5 + 4 ))ms interval ${rtt_ms}ms ecn"
 
     local applied=0 ifc
@@ -3020,6 +3138,37 @@ PROFILE="ru"
 #   cake     — продвинутый shaping/AQM (нужен sch_cake)
 #   noble    — КАСТОМНЫЙ noble-aqm: RTT-адаптивный cake + раздельный egress/ingress
 QDISC_MODE="auto"
+
+# v8.21 ULTRACODE: ручная настройка кастомов и BBR. Пусто = авто/рекомендуемое.
+# Любой параметр можно переопределить и через переменную окружения при запуске.
+# --- защита от краша сети ---
+NETGUARD_ENABLE=1            # 1 = авто-откат qdisc при потере связности (рекоменд.)
+# --- BBR (congestion control) ---
+BBR_FORCE="auto"            # auto|bbr|bbr2|bbr3|cubic|reno
+TCP_NOTSENT_LOWAT=131072    # байт; меньше = ниже задержка, больше = выше throughput
+# --- fq+ (кастом) ---
+FQ_FLOW_LIMIT=200
+FQ_QUANTUM=3028
+FQ_INITIAL_QUANTUM=15140
+FQ_BUCKETS=2048
+FQ_CE_THRESHOLD=            # мс; пусто = авто (RTT/5+4)
+# --- fq_codel+ (кастом) ---
+FQCODEL_LIMIT=10240
+FQCODEL_FLOWS=1024
+FQCODEL_QUANTUM=1514
+FQCODEL_TARGET=             # мс; пусто = авто
+FQCODEL_INTERVAL=           # мс; пусто = авто (RTT)
+FQCODEL_CE=1               # мс (L4S ce_threshold)
+FQCODEL_ECN="ecn"          # ecn|noecn
+# --- noble-aqm (наш топ-кастом) ---
+NOBLE_RTT_MS=              # пусто = авто-измерение до шлюза
+NOBLE_MEM_MB=             # пусто = авто (под RAM, 4..64)
+NOBLE_DIFFSERV="diffserv4" # besteffort|diffserv3|diffserv4|diffserv8
+NOBLE_FLOWMODE="dual-srchost"
+NOBLE_ACKFILTER="ack-filter"   # ack-filter|no-ack-filter
+NOBLE_OVERHEAD=38
+NOBLE_MPU=84
+NOBLE_INGRESS=1           # 1 = двунаправленный AQM (download через IFB)
 
 # --- Что включено ---
 ENABLE_IOS_BURST=1        # фон iOS Safari (apple.com / icloud.com / ...)
@@ -3196,6 +3345,33 @@ prompt_custom_noise_conf() {
         1) QDISC_MODE="auto" ;;  2) QDISC_MODE="fq" ;;  3) QDISC_MODE="fq_codel" ;;
         4) QDISC_MODE="cake" ;;  5) QDISC_MODE="noble" ;;  *) : ;;
     esac
+
+    # v8.21: congestion control (BBR) + защита от краша.
+    echo ""
+    echo -e "${CYAN}-- Congestion control (BBR) --${NC}"
+    echo -e "  ${BOLD}1${NC}) auto   ${BOLD}2${NC}) bbr   ${BOLD}3${NC}) bbr2   ${BOLD}4${NC}) bbr3   ${BOLD}5${NC}) cubic   ${BOLD}6${NC}) reno"
+    read -r -p "Выбор [1-6, текущий: ${BBR_FORCE:-auto}]: " v
+    case "${v:-}" in 1) BBR_FORCE="auto";; 2) BBR_FORCE="bbr";; 3) BBR_FORCE="bbr2";; 4) BBR_FORCE="bbr3";; 5) BBR_FORCE="cubic";; 6) BBR_FORCE="reno";; *) :;; esac
+    read -r -p "Авто-откат qdisc при потере связи (crash-guard) [1/0, текущий: ${NETGUARD_ENABLE:-1}]: " v
+    case "${v:-}" in 0) NETGUARD_ENABLE=0;; 1) NETGUARD_ENABLE=1;; *) :;; esac
+
+    # v8.21: ручная правка параметров кастомов (по желанию).
+    echo ""
+    read -r -p "Открыть ручную настройку параметров fq/fq_codel/noble? [y/N]: " v
+    if [ "${v:-}" = "y" ] || [ "${v:-}" = "Y" ]; then
+        echo -e "${GRAY}Enter — оставить текущее значение. Пусто = авто.${NC}"
+        read -r -p "FQ_FLOW_LIMIT [${FQ_FLOW_LIMIT:-200}]: " v;        FQ_FLOW_LIMIT="${v:-${FQ_FLOW_LIMIT:-200}}"
+        read -r -p "FQ_QUANTUM [${FQ_QUANTUM:-3028}]: " v;            FQ_QUANTUM="${v:-${FQ_QUANTUM:-3028}}"
+        read -r -p "FQ_CE_THRESHOLD мс [${FQ_CE_THRESHOLD:-авто}]: " v; FQ_CE_THRESHOLD="${v:-${FQ_CE_THRESHOLD:-}}"
+        read -r -p "FQCODEL_TARGET мс [${FQCODEL_TARGET:-авто}]: " v;   FQCODEL_TARGET="${v:-${FQCODEL_TARGET:-}}"
+        read -r -p "FQCODEL_INTERVAL мс [${FQCODEL_INTERVAL:-авто}]: " v; FQCODEL_INTERVAL="${v:-${FQCODEL_INTERVAL:-}}"
+        read -r -p "FQCODEL_CE мс [${FQCODEL_CE:-1}]: " v;            FQCODEL_CE="${v:-${FQCODEL_CE:-1}}"
+        read -r -p "NOBLE_RTT_MS [${NOBLE_RTT_MS:-авто}]: " v;        NOBLE_RTT_MS="${v:-${NOBLE_RTT_MS:-}}"
+        read -r -p "NOBLE_MEM_MB [${NOBLE_MEM_MB:-авто}]: " v;        NOBLE_MEM_MB="${v:-${NOBLE_MEM_MB:-}}"
+        read -r -p "NOBLE_DIFFSERV [${NOBLE_DIFFSERV:-diffserv4}]: " v; NOBLE_DIFFSERV="${v:-${NOBLE_DIFFSERV:-diffserv4}}"
+        read -r -p "NOBLE_OVERHEAD [${NOBLE_OVERHEAD:-38}]: " v;      NOBLE_OVERHEAD="${v:-${NOBLE_OVERHEAD:-38}}"
+        read -r -p "NOBLE_INGRESS (двунапр. AQM) [${NOBLE_INGRESS:-1}]: " v; NOBLE_INGRESS="${v:-${NOBLE_INGRESS:-1}}"
+    fi
     echo ""
 
     local v

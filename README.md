@@ -28,7 +28,7 @@ RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotun
 
 ---
 
-## ✨ Highlights (v8.17 → v8.20 ULTRACODE)
+## ✨ Highlights (v8.17 → v8.21 ULTRACODE)
 
 | Area | Feature | Why it matters |
 |------|---------|----------------|
@@ -36,6 +36,9 @@ RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotun
 | 🎬 **White-noise v8.20** | Native iOS-app traffic | **RUTUBE · VK Видео · Одноклассники (OK) · ЛитРес** emulated 1:1 with real **CFNetwork/Darwin** app User-Agents — indistinguishable from an iPhone in RU. |
 | 🧬 **sysctl v8.20** | Rare/custom knobs | Compressed-SACK timing, ECN+fallback, pingpong-thresh, shrink-window, migrate-req, netdev budget — all probe-safe (skipped silently if the kernel lacks them). |
 | 🚦 **Queue v8.20** | Selectable qdisc + **noble-aqm** | Pick `fq` · `fq_codel` · `cake` · or the **custom `noble-aqm`** — an RTT-adaptive CAKE profile (auto memlimit, ACK-filter, diffserv4, split-gso, ingress shaping) that ships in *no other tool*. |
+| 🛡️ **Crash-guard v8.21** | Self-healing network | Snapshots qdisc state, applies the custom, **pings gateway + public resolvers, and auto-rolls-back** if connectivity drops — your box never gets locked out. |
+| 🚀 **BBR-max v8.21** | Safe BBR/BBRv3 | `BBR_FORCE=auto/bbr/bbr2/bbr3/cubic/reno` with **read-back verify + cubic fallback** + tuned companions (`notsent_lowat`, ECN). Safe on stock Ubuntu 24.04 (6.8). |
+| 🎚️ **Manual tuning v8.21** | Every custom is editable | Hand-set **all** `fq+` / `fq_codel+` / `noble-aqm` / BBR params via config or env — from the menu or `/etc/vps-noise.conf`. |
 | 🌐 **Resilience** | Multi-endpoint failover | Quorum-based connectivity check across a pool — survives single-endpoint / regional blocks. |
 | 🪝 **Extensibility** | User hook system | Drop scripts into `/etc/vps-optimizer.d/` — customise without forking. |
 | 🎭 **Stealth** | iOS service-mesh + Low Power Mode | Mimics the *daemon* traffic of an idle iPhone, not just Safari browsing. |
@@ -192,6 +195,41 @@ Choose how the kernel schedules packets — straight from the interactive menu
 # one-off
 sudo QDISC_MODE=noble ./vps_optimizer.sh
 # or persist in /etc/vps-noise.conf:  QDISC_MODE="noble"
+```
+
+---
+
+## 🛡️ Crash protection & manual tuning (v8.21)
+
+**Never lock yourself out.** Before any custom qdisc is applied, noble-net-warp
+takes a snapshot, applies the change, then verifies connectivity (gateway →
+`1.1.1.1`/`8.8.8.8`/`77.88.8.8`). If the link dies, it **auto-rolls-back**
+the qdisc/IFB and restores the previous `default_qdisc` — fully automatic.
+Toggle with `NETGUARD_ENABLE=1|0`.
+
+**BBR to the max, safely.** `apply_bbr_max` honours `BBR_FORCE`
+(`auto`/`bbr`/`bbr2`/`bbr3`/`cubic`/`reno`), **reads the value back** to
+confirm the kernel accepted it, and falls back to `cubic` if the module is
+missing — so a stock Ubuntu 24.04 kernel (6.8) can never end up with a dead CC.
+BBR-family picks also get tuned companions (`tcp_notsent_lowat`, ECN + fallback).
+
+**Everything is hand-editable** — from the menu (*Кастомизация* → qdisc/BBR →
+ручная настройка) or in `/etc/vps-noise.conf` / env:
+
+| Group | Knobs |
+|-------|-------|
+| Safety | `NETGUARD_ENABLE` |
+| BBR | `BBR_FORCE`, `TCP_NOTSENT_LOWAT` |
+| fq+ | `FQ_FLOW_LIMIT`, `FQ_QUANTUM`, `FQ_INITIAL_QUANTUM`, `FQ_BUCKETS`, `FQ_CE_THRESHOLD` |
+| fq_codel+ | `FQCODEL_LIMIT`, `FQCODEL_FLOWS`, `FQCODEL_QUANTUM`, `FQCODEL_TARGET`, `FQCODEL_INTERVAL`, `FQCODEL_CE`, `FQCODEL_ECN` |
+| noble-aqm | `NOBLE_RTT_MS`, `NOBLE_MEM_MB`, `NOBLE_DIFFSERV`, `NOBLE_FLOWMODE`, `NOBLE_ACKFILTER`, `NOBLE_OVERHEAD`, `NOBLE_MPU`, `NOBLE_INGRESS` |
+
+All values are range-validated (`_qnum`) — a bad number silently falls back to
+the safe default. Empty = auto.
+
+```bash
+# Example: force BBRv3 + custom noble-aqm with a hand-set RTT, no rollback risk
+sudo BBR_FORCE=bbr3 QDISC_MODE=noble NOBLE_RTT_MS=30 NOBLE_MEM_MB=16 ./vps_optimizer.sh
 ```
 
 ---
