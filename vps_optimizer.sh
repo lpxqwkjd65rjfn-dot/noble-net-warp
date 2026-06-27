@@ -1883,7 +1883,20 @@ apply_sysctls() {
     buf_max=$(( buf_max * PRESET_BUF_MULT ))
 
     # Networking core
+    # v8.20 ULTRACODE: ручной выбор qdisc (QDISC_MODE: auto|fq|fq_codel|cake|noble).
+    local _noble_aqm=0 _tune_kind=""
+    case "${QDISC_MODE:-auto}" in
+        fq)        modprobe sch_fq 2>/dev/null && best_qdisc="fq"; _tune_kind="fq" ;;
+        fq_codel)  best_qdisc="fq_codel"; _tune_kind="fq_codel" ;;
+        cake)      if modprobe sch_cake 2>/dev/null; then best_qdisc="cake"; _noble_aqm=1; else best_qdisc="fq_codel"; _tune_kind="fq_codel"; fi ;;
+        noble)     if modprobe sch_cake 2>/dev/null; then best_qdisc="cake"; else best_qdisc="fq_codel"; fi; _noble_aqm=1 ;;
+        auto|*)    : ;;  # сохранить интеллектуальный авто-выбор
+    esac
+    [ "${QDISC_MODE:-auto}" != "auto" ] && _log INFO "qdisc: режим=${QDISC_MODE} → ${best_qdisc}"
     sysctl_safe net.core.default_qdisc "$best_qdisc"
+    # макс-доработанные профили накладываются на реальные интерфейсы
+    [ "$_noble_aqm" = "1" ] && apply_noble_aqm
+    [ -n "$_tune_kind" ] && apply_tuned_qdisc "$_tune_kind"
     sysctl_safe net.ipv4.tcp_congestion_control "$best_bbr"
     sysctl_safe net.core.netdev_budget 600
     sysctl_safe net.core.netdev_budget_usecs 8000
@@ -2889,6 +2902,106 @@ rollback_last_snapshot() {
 # совпадала с поведением реального человека в РФ: ~10 проверок почты
 # в день, ~25–40 заглядываний в новости, ~1–4 «обновления системы».
 #
+# ============================================================================
+# v8.20 ULTRACODE: apply_tuned_qdisc — МАКС-доработанные fq / fq_codel.
+# Не стоковые дефолты, а hand-tuned профили на новейших фичах ядра с
+# многоуровневым graceful-fallback (full → medium → basic), чтобы заводилось
+# и на 6.x, и на старых LTS-ядрах. RTT/RAM-адаптивно, всё probe-safe.
+#   fq+       : EDT-pacing, horizon (5.14+), ce_threshold (L4S), timer_slack (5.17+)
+#   fq_codel+ : ce_threshold 1ms (L4S-style), memory_limit под RAM, RTT-target
+# ----------------------------------------------------------------------------
+apply_tuned_qdisc() {
+    local kind="${1:-}"
+    command -v tc >/dev/null 2>&1 || { _log WARN "tuned-qdisc: tc не найден"; return 0; }
+
+    local gw rtt_ms=50 _r
+    gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+    if [ -n "${gw:-}" ]; then
+        _r=$(ping -c2 -w2 -q "$gw" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+        case "${_r:-}" in ''|*[!0-9]*) : ;; *) [ "$_r" -ge 1 ] && [ "$_r" -le 1000 ] && rtt_ms="$_r" ;; esac
+    fi
+    local ram_kb mem_b mem_mb=8
+    ram_kb=$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 1048576)
+    mem_mb=$(( ram_kb / 1024 / 64 )); [ "$mem_mb" -lt 4 ] && mem_mb=4; [ "$mem_mb" -gt 64 ] && mem_mb=64
+    mem_b=$(( mem_mb * 1024 * 1024 ))
+    local tgt=$(( rtt_ms / 5 + 4 )); [ "$tgt" -lt 3 ] && tgt=3
+
+    local applied=0 ifc
+    for ifc in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|ifb|sit|gre|ip6tnl)'); do
+        case "$kind" in
+          fq)
+            tc qdisc replace dev "$ifc" root fq flow_limit 200 quantum 3028 initial_quantum 15140 maxrate 0 buckets 2048 horizon 10s horizon_drop ce_threshold ${tgt}ms timer_slack 10us 2>/dev/null \
+              || tc qdisc replace dev "$ifc" root fq flow_limit 200 quantum 3028 initial_quantum 15140 buckets 2048 ce_threshold ${tgt}ms 2>/dev/null \
+              || tc qdisc replace dev "$ifc" root fq 2>/dev/null \
+              || continue
+            _log OK "fq+ (EDT/horizon/ce) ↑ ${ifc} (rtt=${rtt_ms}ms)"; applied=1 ;;
+          fq_codel)
+            tc qdisc replace dev "$ifc" root fq_codel limit 10240 flows 1024 quantum 1514 target ${tgt}ms interval ${rtt_ms}ms memory_limit ${mem_b} ecn ce_threshold 1ms 2>/dev/null \
+              || tc qdisc replace dev "$ifc" root fq_codel limit 10240 flows 1024 target ${tgt}ms interval ${rtt_ms}ms ecn 2>/dev/null \
+              || tc qdisc replace dev "$ifc" root fq_codel 2>/dev/null \
+              || continue
+            _log OK "fq_codel+ (L4S ce/mem ${mem_mb}mb) ↑ ${ifc} (rtt=${rtt_ms}ms)"; applied=1 ;;
+        esac
+    done
+    [ "$applied" = "1" ] || _log WARN "tuned-qdisc(${kind}): не применено ни к одному интерфейсу"
+    return 0
+}
+
+# ============================================================================
+# v8.20 ULTRACODE: NOBLE-AQM — кастомный AQM-профиль (не существует как пресет).
+# Поверх ядра sch_cake строит уникальную RTT-адаптивную конфигурацию с раздельным
+# egress/ingress shaping, ACK-фильтром, diffserv4-приоритизацией и автоподбором
+# memlimit под объём RAM. Fallback: fq_codel c hand-tuned target/interval, если
+# модуль cake недоступен. Всё bounded и probe-safe — на слабых VPS не валит сеть.
+# ----------------------------------------------------------------------------
+apply_noble_aqm() {
+    command -v tc >/dev/null 2>&1 || { _log WARN "noble-aqm: tc не найден — пропуск"; return 0; }
+
+    # 1) Базовый RTT: меряем до шлюза, иначе консервативные 50 ms.
+    local gw rtt_ms=50
+    gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+    if [ -n "${gw:-}" ]; then
+        local _r
+        _r=$(ping -c2 -w2 -q "$gw" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+        case "${_r:-}" in ''|*[!0-9]*) : ;; *) [ "$_r" -ge 1 ] && [ "$_r" -le 1000 ] && rtt_ms="$_r" ;; esac
+    fi
+
+    # 2) memlimit под RAM: ~1/64 ОЗУ, но в коридоре 4..64 MB (cake любит запас).
+    local ram_kb mem_mb=8
+    ram_kb=$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 1048576)
+    mem_mb=$(( ram_kb / 1024 / 64 )); [ "$mem_mb" -lt 4 ] && mem_mb=4; [ "$mem_mb" -gt 64 ] && mem_mb=64
+
+    # 3) Профиль cake: уникальная "noble"-комбинация.
+    local cake_opts="diffserv4 dual-srchost nat ack-filter split-gso rtt ${rtt_ms}ms memlimit ${mem_mb}mb overhead 38 mpu 84"
+    local fb_opts="limit 10240 flows 1024 target $(( rtt_ms / 5 + 4 ))ms interval ${rtt_ms}ms ecn"
+
+    local applied=0 ifc
+    for ifc in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|ifb|sit|gre|ip6tnl)' ); do
+        # снять старый root qdisc, наложить noble-профиль
+        tc qdisc replace dev "$ifc" root cake $cake_opts 2>/dev/null \
+            && { _log OK "noble-aqm[cake] ↑ ${ifc} (rtt=${rtt_ms}ms mem=${mem_mb}mb)"; applied=1; continue; }
+        tc qdisc replace dev "$ifc" root fq_codel $fb_opts 2>/dev/null \
+            && { _log OK "noble-aqm[fq_codel*] ↑ ${ifc} (target/interval подобраны под rtt)"; applied=1; }
+    done
+    # v8.20: двунаправленный AQM — ingress shaping через IFB (download-сторона).
+    if [ "${NOBLE_INGRESS:-1}" = "1" ] && modprobe ifb numifbs=1 2>/dev/null; then
+        ip link add ifb-noble type ifb 2>/dev/null || true
+        if ip link set dev ifb-noble up 2>/dev/null; then
+            local _e
+            for _e in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|ifb|ifb-noble|sit|gre|ip6tnl)'); do
+                tc qdisc add dev "$_e" handle ffff: ingress 2>/dev/null || true
+                tc filter replace dev "$_e" parent ffff: protocol all u32 match u32 0 0 \
+                    action mirred egress redirect dev ifb-noble 2>/dev/null || true
+            done
+            tc qdisc replace dev ifb-noble root cake $cake_opts wash 2>/dev/null \
+                && _log OK "noble-aqm[ingress] ↑ ifb-noble (download-AQM активен)" \
+                || _log WARN "noble-aqm: ingress cake не наложился (egress работает)"
+        fi
+    fi
+    [ "$applied" = "1" ] || _log WARN "noble-aqm: не удалось применить ни к одному интерфейсу"
+    return 0
+}
+
 write_default_noise_conf() {
     cat > "$NOISE_CONF" <<'CONF_EOF'
 # ============================================================
@@ -2899,6 +3012,14 @@ write_default_noise_conf() {
 
 # Профиль доменов: ru | global | mixed
 PROFILE="ru"
+
+# v8.20 ULTRACODE: алгоритм управления очередью (qdisc).
+#   auto     — интеллектуальный авто-выбор под virt/BBR (рекомендуется)
+#   fq       — pacing-friendly, лучший для BBR
+#   fq_codel — классика, минимальный бутылочный bloat
+#   cake     — продвинутый shaping/AQM (нужен sch_cake)
+#   noble    — КАСТОМНЫЙ noble-aqm: RTT-адаптивный cake + раздельный egress/ingress
+QDISC_MODE="auto"
 
 # --- Что включено ---
 ENABLE_IOS_BURST=1        # фон iOS Safari (apple.com / icloud.com / ...)
@@ -3061,6 +3182,20 @@ prompt_custom_noise_conf() {
 
     echo -e "${CYAN}${BOLD}=== Кастомизация шумогенератора ===${NC}"
     echo -e "${YELLOW}Enter — оставить рекомендованное значение.${NC}"
+
+    # v8.20 ULTRACODE: выбор алгоритма очереди (qdisc).
+    echo ""
+    echo -e "${CYAN}-- Алгоритм очереди (qdisc) --${NC}"
+    echo -e "  ${BOLD}1${NC}) auto      — интеллектуальный авто-выбор (рекомендуется)"
+    echo -e "  ${BOLD}2${NC}) fq        — pacing-friendly, лучший для BBR"
+    echo -e "  ${BOLD}3${NC}) fq_codel  — классика, минимальный bloat"
+    echo -e "  ${BOLD}4${NC}) cake      — продвинутый shaping/AQM"
+    echo -e "  ${BOLD}5${NC}) noble     — ${GREEN}КАСТОМНЫЙ noble-aqm${NC} (RTT-адаптивный cake + ingress)"
+    read -r -p "Выбор [1-5, текущий: ${QDISC_MODE:-auto}]: " v
+    case "${v:-}" in
+        1) QDISC_MODE="auto" ;;  2) QDISC_MODE="fq" ;;  3) QDISC_MODE="fq_codel" ;;
+        4) QDISC_MODE="cake" ;;  5) QDISC_MODE="noble" ;;  *) : ;;
+    esac
     echo ""
 
     local v

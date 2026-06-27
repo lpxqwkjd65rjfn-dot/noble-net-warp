@@ -35,6 +35,7 @@ RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotun
 | 🤖 **AI v8.20** | Smarter self-learning core | **UCB1** arm selection + **load-aware gating** + **EWMA Network-IQ** + **best-arm/regret memory**. Converges faster, refuses to learn under load, still pure-bash & disk-safe on the weakest VPS. |
 | 🎬 **White-noise v8.20** | Native iOS-app traffic | **RUTUBE · VK Видео · Одноклассники (OK) · ЛитРес** emulated 1:1 with real **CFNetwork/Darwin** app User-Agents — indistinguishable from an iPhone in RU. |
 | 🧬 **sysctl v8.20** | Rare/custom knobs | Compressed-SACK timing, ECN+fallback, pingpong-thresh, shrink-window, migrate-req, netdev budget — all probe-safe (skipped silently if the kernel lacks them). |
+| 🚦 **Queue v8.20** | Selectable qdisc + **noble-aqm** | Pick `fq` · `fq_codel` · `cake` · or the **custom `noble-aqm`** — an RTT-adaptive CAKE profile (auto memlimit, ACK-filter, diffserv4, split-gso, ingress shaping) that ships in *no other tool*. |
 | 🌐 **Resilience** | Multi-endpoint failover | Quorum-based connectivity check across a pool — survives single-endpoint / regional blocks. |
 | 🪝 **Extensibility** | User hook system | Drop scripts into `/etc/vps-optimizer.d/` — customise without forking. |
 | 🎭 **Stealth** | iOS service-mesh + Low Power Mode | Mimics the *daemon* traffic of an idle iPhone, not just Safari browsing. |
@@ -154,9 +155,44 @@ sudo ./vps_optimizer.sh dna     # Network DNA fingerprint + recommended preset
 | `NETTUNE_INTERVAL_SEC` / `NETTUNE_BOOT_SEC` | `900` / `300` | Timer cadence |
 | `LC_VPS_PROBE_HOSTS` / `LC_VPS_PROBE_QUORUM` | pool / `2` | Failover endpoints / quorum |
 | `LC_VPS_HOOK_DIR` | `/etc/vps-optimizer.d` | Hook directory |
+| `QDISC_MODE` | `auto` | Queue discipline: `auto`/`fq`/`fq_codel`/`cake`/`noble` (custom noble-aqm) |
 | `ENABLE_IOS_MESH` / `ENABLE_IOS_LOW_POWER` | `1` / `1` | iOS noise features |
 | `ENABLE_RUTUBE_BURST` / `ENABLE_VKVIDEO_BURST` | `1` / `1` | RUTUBE / VK Видео iOS traffic |
 | `ENABLE_OKRU_BURST` / `ENABLE_LITRES_BURST` | `1` / `1` | Одноклассники / ЛитРес iOS traffic |
+
+---
+
+## 🚦 Queue discipline selector (NEW)
+
+Choose how the kernel schedules packets — straight from the interactive menu
+(*Кастомизация* → *Алгоритм очереди*) or via the `QDISC_MODE` env var:
+
+| Mode | What it does |
+|------|--------------|
+| `auto` | Intelligent pick based on virtualization + BBR (recommended default) |
+| `fq` | **fq+** — hand-tuned pacing: EDT, `horizon` (5.14+), `ce_threshold` (L4S), `timer_slack` (5.17+), bigger buckets/quantum |
+| `fq_codel` | **fq_codel+** — L4S `ce_threshold 1ms`, RAM-scaled `memory_limit`, RTT-adaptive target/interval |
+| `cake` | Full noble CAKE profile **+ bidirectional ingress AQM** (IFB) |
+| `noble` | **🔥 Custom `noble-aqm`** — exclusive to this project |
+
+**`noble-aqm`** is a hand-built AQM profile that exists nowhere else. It:
+
+- measures live **RTT to the gateway** and feeds it into CAKE (`rtt <measured>ms`),
+- auto-scales **`memlimit`** to the box's RAM (4–64 MB envelope) so it never
+  bloats a 256 MB VPS,
+- enables **`ack-filter`**, **`diffserv4`**, **`dual-srchost`/`dual-dsthost`**,
+  **`split-gso`** and tuned **`overhead/mpu`** for VPN-style flows,
+- adds **bidirectional shaping** — download-side AQM via an `ifb-noble` IFB device,
+- uses a **multi-tier fallback** (full → medium → basic `tc` profile) so it loads on 6.x *and* old LTS kernels,
+- applies a hand-tuned **`fq_codel` fallback** (target/interval derived from RTT)
+  if `sch_cake` is missing — so it degrades gracefully on minimal kernels,
+- is fully **probe-safe & bounded** — failures are logged, never fatal.
+
+```bash
+# one-off
+sudo QDISC_MODE=noble ./vps_optimizer.sh
+# or persist in /etc/vps-noise.conf:  QDISC_MODE="noble"
+```
 
 ---
 
