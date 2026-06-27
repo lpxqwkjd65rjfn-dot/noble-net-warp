@@ -28,7 +28,7 @@ RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotun
 
 ---
 
-## ✨ Highlights (v8.17 → v8.21 ULTRACODE)
+## ✨ Highlights (v8.17 → v8.22 ULTRACODE)
 
 | Area | Feature | Why it matters |
 |------|---------|----------------|
@@ -38,6 +38,9 @@ RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotun
 | 🚦 **Queue v8.20** | Selectable qdisc + **noble-aqm** | Pick `fq` · `fq_codel` · `cake` · or the **custom `noble-aqm`** — an RTT-adaptive CAKE profile (auto memlimit, ACK-filter, diffserv4, split-gso, ingress shaping) that ships in *no other tool*. |
 | 🛡️ **Crash-guard v8.21** | Self-healing network | Snapshots qdisc state, applies the custom, **pings gateway + public resolvers, and auto-rolls-back** if connectivity drops — your box never gets locked out. |
 | 🚀 **BBR-max v8.21** | Safe BBR/BBRv3 | `BBR_FORCE=auto/bbr/bbr2/bbr3/cubic/reno` with **read-back verify + cubic fallback** + tuned companions (`notsent_lowat`, ECN). Safe on stock Ubuntu 24.04 (6.8). |
+| 🧩 **BBRv3 installer v8.22** | Crash-proof kernel swap | One-command **XanMod (BBRv3) install** with 6-layer safety: container-refusal, pre-flight checks, **GRUB recordfail auto-fallback**, one-shot boot try, **post-reboot commit-guard**, and verify+fallback. Worst case = reboot into the old kernel. |
+| 🌊 **noble shaping v8.22** | Bufferbloat killer | Optional `NOBLE_BANDWIDTH` / `NOBLE_BANDWIDTH_IN` per-direction CAKE shaping — the single biggest latency-under-load win, off by default (unlimited). |
+| 🧭 **Network Tuning menu v8.22** | Dedicated control panel | Separate main-menu item `[9]` for qdisc / BBR / BBRv3-install / rollback / shaping / manual params — all in one place. |
 | 🎚️ **Manual tuning v8.21** | Every custom is editable | Hand-set **all** `fq+` / `fq_codel+` / `noble-aqm` / BBR params via config or env — from the menu or `/etc/vps-noise.conf`. |
 | 🌐 **Resilience** | Multi-endpoint failover | Quorum-based connectivity check across a pool — survives single-endpoint / regional blocks. |
 | 🪝 **Extensibility** | User hook system | Drop scripts into `/etc/vps-optimizer.d/` — customise without forking. |
@@ -199,6 +202,30 @@ sudo QDISC_MODE=noble ./vps_optimizer.sh
 
 ---
 
+## 🧩 Safe BBRv3 kernel install (v8.22)
+
+Stock Ubuntu 24.04 ships kernel 6.8 — **mainline BBR is v1**; real **BBRv3**
+lives in the XanMod kernel. noble-net-warp can install it with a safety model
+designed so **the system can never end up unbootable**:
+
+| Layer | Guard |
+|-------|-------|
+| 0 | **Container refusal** — OpenVZ/LXC/Docker share the host kernel → install is blocked with a clear message (use plain `bbr`). |
+| 1 | **Pre-flight** — `/boot` ≥ 300 MB, disk ≥ 2 GB, internet up, no apt lock, GRUB config backed up. |
+| 2 | **Verified install** — XanMod added via **`signed-by` GPG keyring** (no blind `curl\|bash`); the old kernel is **never removed**. |
+| 3 | **GRUB recordfail fallback** — if the new kernel fails to boot, GRUB **auto-reverts** to the old one on the next boot. |
+| 4 | **One-shot boot try** — `grub-reboot` tries the new kernel exactly once; default stays on the old kernel until confirmed. |
+| 5 | **Commit-guard** — a one-shot systemd unit makes the new kernel default **only after** verifying it booted *and* the network is alive, then activates `bbr3`; otherwise nothing is committed. |
+
+**Worst case = one reboot back into your old kernel, BBRv3 simply inactive.**
+Available from the menu: **[9] Network Tuning → [6] Install BBRv3 kernel**
+(and **[7]** to roll back). A reboot is required after install.
+
+> ⚠️ On a VPS, keep your provider's VNC/recovery console handy — the installer
+> warns and asks for confirmation before doing anything.
+
+---
+
 ## 🛡️ Crash protection & manual tuning (v8.21)
 
 **Never lock yourself out.** Before any custom qdisc is applied, noble-net-warp
@@ -222,7 +249,7 @@ BBR-family picks also get tuned companions (`tcp_notsent_lowat`, ECN + fallback)
 | BBR | `BBR_FORCE`, `TCP_NOTSENT_LOWAT` |
 | fq+ | `FQ_FLOW_LIMIT`, `FQ_QUANTUM`, `FQ_INITIAL_QUANTUM`, `FQ_BUCKETS`, `FQ_CE_THRESHOLD` |
 | fq_codel+ | `FQCODEL_LIMIT`, `FQCODEL_FLOWS`, `FQCODEL_QUANTUM`, `FQCODEL_TARGET`, `FQCODEL_INTERVAL`, `FQCODEL_CE`, `FQCODEL_ECN` |
-| noble-aqm | `NOBLE_RTT_MS`, `NOBLE_MEM_MB`, `NOBLE_DIFFSERV`, `NOBLE_FLOWMODE`, `NOBLE_ACKFILTER`, `NOBLE_OVERHEAD`, `NOBLE_MPU`, `NOBLE_INGRESS` |
+| noble-aqm | `NOBLE_RTT_MS`, `NOBLE_MEM_MB`, `NOBLE_DIFFSERV`, `NOBLE_FLOWMODE`, `NOBLE_ACKFILTER`, `NOBLE_OVERHEAD`, `NOBLE_MPU`, `NOBLE_INGRESS`, **`NOBLE_BANDWIDTH`**, **`NOBLE_BANDWIDTH_IN`** |
 
 All values are range-validated (`_qnum`) — a bad number silently falls back to
 the safe default. Empty = auto.
