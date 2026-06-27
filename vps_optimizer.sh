@@ -2,7 +2,15 @@
 # shellcheck disable=SC2059
 
 # ==============================================================================
-# VPS Global Optimization Script (v8.19 PHOENIX-Z++)
+# VPS Global Optimization Script (v8.20 PHOENIX-Z++ / ULTRACODE)
+#
+# v8.20 ULTRACODE highlights:
+#   - Smarter self-learning net AI: UCB1 arm selection + load-aware gating +
+#     EWMA-smoothed IQ + best-arm/regret memory; still pure bash, disk-safe,
+#     tuned for the weakest VPS (auto-degrades on low RAM / high load).
+#   - White-noise expansion: native iOS-app 1:1 traffic for RUTUBE, VK Video,
+#     Odnoklassniki (OK) and ЛитРес (Litres) with CFNetwork/Darwin UAs.
+#   - Extra sysctl & custom knobs that ship nowhere else (see apply_sysctls).
 # ------------------------------------------------------------------------------
 # Phase 1 — Correctness on locked-down rented VPS:
 #   - Hypervisor / container detection (KVM / OpenVZ / LXC / Docker / native)
@@ -122,7 +130,7 @@ INTERNET_PROBE_QUORUM="${LC_VPS_PROBE_QUORUM:-2}"
 # $HOOK_DIR/{pre-apply.d,post-apply.d}/ to extend apply without forking.
 HOOK_DIR="${LC_VPS_HOOK_DIR:-/etc/vps-optimizer.d}"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.19"
+SCRIPT_VERSION="8.20"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -987,30 +995,83 @@ _nt_apply_bdp() {  # RAM-aware bandwidth-delay-product socket buffer right-sizin
     sysctl -w "net.core.rmem_max=$maxb" >/dev/null 2>&1 || true
     sysctl -w "net.core.wmem_max=$maxb" >/dev/null 2>&1 || true
 }
+# v8.20 ULTRACODE: load-aware gate. Learning while the box is hammered yields
+# pure-noise reward and the bandit chases ghosts. Skip when 1-min loadavg per
+# core exceeds NETTUNE_LOADAVG_GATE (default 4.0).
+_nt_loadavg_ok() {
+    local gate cores la
+    gate="${NETTUNE_LOADAVG_GATE:-4.0}"
+    cores=$(nproc 2>/dev/null || echo 1); [ "$cores" -ge 1 ] || cores=1
+    la=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+    awk -v la="$la" -v c="$cores" -v g="$gate" 'BEGIN{exit !((la/c) <= g)}'
+}
+
+# v8.20 ULTRACODE: UCB1 arm selection — argmax(Q + c*sqrt(ln(N+1)/n)). Unseen
+# arms get +inf so every qdisc is tried once, then the explorer narrows fast.
+# Far fewer bad pulls than epsilon-greedy on a weak VPS.
+_nt_ucb_arm() {
+    local arms="$1" total a q n v best="" bestv=""
+    total=0
+    for a in $arms; do n=$(_nt_kv_get "n_${a}"); total=$((total + ${n:-0})); done
+    for a in $arms; do
+        q=$(_nt_kv_get "q_${a}"); q="${q:-0}"
+        n=$(_nt_kv_get "n_${a}"); n="${n:-0}"
+        v=$(awk -v q="$q" -v n="$n" -v t="$total" -v c="${NETTUNE_UCB_C:-1.4}" \
+            'BEGIN{ if(n<1){print 1000000000; exit} printf "%.4f", q + c*sqrt(log(t+1)/n) }')
+        if [ -z "$best" ] || awk -v a="$v" -v b="$bestv" 'BEGIN{exit !(a>b)}'; then
+            bestv="$v"; best="$a"
+        fi
+    done
+    echo "${best:-fq}"
+}
+
 nettune_once() {  # ONE learning iteration (called by timer) — cheap & bounded
     [ "${NETTUNE_ENABLE:-1}" = "1" ] || return 0
     [ "$(id -u)" = "0" ] || return 0
     local ram floor eps arms a cur reward steps q n nq pick idx iq
+    local iq_ewma bestq bestarm regret use_ucb
     ram=$(_nt_ram_mb); ram="${ram:-256}"; floor="${NETTUNE_RAM_FLOOR_MB:-256}"
-    arms="fq fq_codel cake"
+    # v8.20: under heavy load skip learning, but still apply the known-best qdisc
+    # so the box is never left untuned.
+    if ! _nt_loadavg_ok; then
+        cur=$(_nt_kv_get cur_arm); cur="${cur:-fq}"
+        _nt_apply_qdisc "$cur"; _nt_apply_bdp "$ram"
+        _audit nettune "skip=loadavg arm=$cur ram=${ram}MB"
+        return 0
+    fi
+    # v8.20: weakest-VPS guard — drop the heavier 'cake' arm on tiny boxes.
+    if [ "$ram" -lt "$floor" ]; then arms="fq fq_codel"; else arms="fq fq_codel cake"; fi
     cur=$(_nt_kv_get cur_arm); cur="${cur:-fq}"
     steps=$(_nt_kv_get steps); steps="${steps:-0}"
     reward=$(_nt_reward)
     q=$(_nt_kv_get "q_${cur}"); q="${q:-0}"
     n=$(_nt_kv_get "n_${cur}"); n="${n:-0}"; n=$((n+1))
     nq=$(awk -v q="$q" -v r="$reward" -v n="$n" 'BEGIN{printf "%.2f", q+(r-q)/n}')
-    eps="${NETTUNE_EPS:-15}"; [ "$ram" -lt "$floor" ] && eps=0
+    # v8.20: explorer choice. UCB1 by default; epsilon as fallback. Exploration
+    # off on low-RAM boxes (stay locked on the best arm).
+    use_ucb="${NETTUNE_UCB:-1}"
+    eps="${NETTUNE_EPS:-15}"; [ "$ram" -lt "$floor" ] && { eps=0; use_ucb=0; }
     eps=$(awk -v e="$eps" -v s="$steps" 'BEGIN{printf "%d", e/(1+s/20)}')
-    if [ "$((RANDOM%100))" -lt "$eps" ]; then
-        idx=$((RANDOM%3+1)); set -- $arms; pick="${!idx}"
+    if [ "$use_ucb" = "1" ]; then
+        pick=$(_nt_ucb_arm "$arms")
+    elif [ "$((RANDOM%100))" -lt "$eps" ]; then
+        set -- $arms; idx=$((RANDOM % $# + 1)); pick="${!idx}"
     else
         pick=$(_nt_best_arm "$arms")
     fi
     _nt_apply_qdisc "$pick"
     _nt_apply_bdp "$ram"
     iq=$(awk -v r="$reward" 'BEGIN{v=r; if(v<0)v=0; if(v>100)v=100; printf "%d", v}')
+    # v8.20: EWMA-smoothed IQ — a stable trend status/dashboard can trust.
+    iq_ewma=$(_nt_kv_get iq_ewma); iq_ewma="${iq_ewma:-$iq}"
+    iq_ewma=$(awk -v p="$iq_ewma" -v c="$iq" -v a="${NETTUNE_EWMA_ALPHA:-0.30}" \
+        'BEGIN{printf "%.1f", a*c+(1-a)*p}')
+    # v8.20: best-arm / regret memory.
+    bestarm=$(_nt_best_arm "$arms"); bestq=$(_nt_kv_get "q_${bestarm}"); bestq="${bestq:-0}"
+    regret=$(awk -v b="$bestq" -v q="$nq" 'BEGIN{d=b-q; if(d<0)d=0; printf "%.2f", d}')
     {
         echo "cur_arm=$pick"; echo "steps=$((steps+1))"; echo "iq=$iq"
+        echo "iq_ewma=$iq_ewma"; echo "best_arm=$bestarm"; echo "regret=$regret"
         echo "last_reward=$reward"; echo "q_${cur}=$nq"; echo "n_${cur}=$n"
         for a in $arms; do
             [ "$a" = "$cur" ] && continue
@@ -1019,7 +1080,7 @@ nettune_once() {  # ONE learning iteration (called by timer) — cheap & bounded
         done
         _nt_save_counters
     } | _nt_state_write
-    _audit nettune "arm=$pick reward=$reward iq=$iq eps=$eps ram=${ram}MB"
+    _audit nettune "arm=$pick reward=$reward iq=$iq iqavg=$iq_ewma best=$bestarm regret=$regret eps=$eps ucb=$use_ucb ram=${ram}MB"
 }
 _nt_install_timer() {
     local self; self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -1058,6 +1119,8 @@ run_nettune_command() {
             _log INFO "${GREEN:-}===== Smart Network Autotuner =====${NC:-}"
             _log INFO "  Active qdisc arm : $(_nt_kv_get cur_arm 2>/dev/null || echo n/a)"
             _log INFO "  Network IQ       : $(_nt_kv_get iq 2>/dev/null || echo n/a) / 100"
+            _log INFO "  Network IQ (EWMA): $(_nt_kv_get iq_ewma 2>/dev/null || echo n/a) / 100"
+            _log INFO "  Best-known arm   : $(_nt_kv_get best_arm 2>/dev/null || echo n/a)  (regret $(_nt_kv_get regret 2>/dev/null || echo 0))"
             _log INFO "  Learning steps   : $(_nt_kv_get steps 2>/dev/null || echo 0)"
             _log INFO "  Last reward      : $(_nt_kv_get last_reward 2>/dev/null || echo n/a)"
             for a in fq fq_codel cake; do
@@ -2327,6 +2390,30 @@ apply_sysctls() {
     sysctl_safe fs.nr_open 2097152
     sysctl_safe fs.aio-max-nr 1048576
 
+    # === v8.20 ULTRACODE: продвинутые/редкие knob'ы (probe-safe через sysctl_safe).
+    # Все значения пишутся только если ядро реально поддерживает параметр, поэтому
+    # блок безопасен и на слабых/старых VPS (несуществующие ключи молча пропускаются).
+    # -- Compressed/SACK тонкая настройка (ниже задержка ACK на быстрых линках):
+    sysctl_safe net.ipv4.tcp_comp_sack_delay_ns 200000
+    sysctl_safe net.ipv4.tcp_comp_sack_nr 44
+    sysctl_safe net.ipv4.tcp_comp_sack_slack_ns 100000
+    # -- ECN c безопасным откатом (меньше потерь на congested RU↔EU маршрутах):
+    sysctl_safe net.ipv4.tcp_ecn 2
+    sysctl_safe net.ipv4.tcp_ecn_fallback 1
+    # -- 6.x: адаптивный порог pingpong и плавное сжатие окна вместо обрыва:
+    sysctl_safe net.ipv4.tcp_pingpong_thresh 3
+    sysctl_safe net.ipv4.tcp_shrink_window 1
+    # -- Быстрее освобождаем orphan'ы и аккуратнее с TIME-WAIT на прокси:
+    sysctl_safe net.ipv4.tcp_migrate_req 1
+    sysctl_safe net.ipv4.tcp_tw_reuse 2
+    # -- NIC batch чуть выше для bursty-нагрузки, но безопасно для 1-vCPU:
+    sysctl_safe net.core.netdev_budget 600
+    sysctl_safe net.core.netdev_budget_usecs 8000
+    # -- MPTCP path-manager (если включён MPTCP выше) — больше subflow на отказах:
+    sysctl_safe net.mptcp.add_addr_timeout 60
+    # -- UDP mem headroom для QUIC/прокси (масштабируем по RAM в buf_max уже учтён):
+    sysctl_safe net.ipv4.udp_early_demux 1
+
     APPLIED_BBR="$best_bbr"
     APPLIED_QDISC="$best_qdisc"
     APPLIED_BUF_MAX="$buf_max"
@@ -2945,6 +3032,10 @@ ENABLE_APPSTORE_BURST=1      # Y16: RuStore / AppGallery / Apple РФ-region upd
 ENABLE_STREAMING_BURST=1     # Y18: KION/Wink/Кинопоиск/Окко/Premier/IVI (вечер пик)
 ENABLE_MUSIC_BURST=1         # Y19: Yandex Music / VK Music / Звук / Boom
 ENABLE_TRAVEL_BURST=1        # Y20: Tutu / Aviasales / RUSSPASS / RZD
+ENABLE_RUTUBE_BURST=1        # v8.20: RUTUBE (нативный iOS-клиент, вечер пик)
+ENABLE_VKVIDEO_BURST=1       # v8.20: VK Видео (отдельное iOS-приложение)
+ENABLE_OKRU_BURST=1          # v8.20: Одноклассники / OK (соц-лента, iOS)
+ENABLE_LITRES_BURST=1        # v8.20: ЛитРес (чтение/аудиокниги, iOS)
 ENABLE_APPLE_RU_BURST=1      # Y10: FindMy / HomeKit / iCloud Time (без Vision Pro/Apple AI)
 ENABLE_EDUCATIONAL=0         # Y15-EDU: Сферум / Учи.ру / Infourok (opt-in — школьник/студент)
 # Y13: per-timezone offset (часов от MSK). 0=MSK, -1=KGD, +2=Урал, +4=Сибирь, +7=ДВ.
@@ -3850,6 +3941,35 @@ UA_APP_STORE=(
 "AppGallery/14.3.5.300 (Android 13; ru)"
 )
 
+# === v8.20 ULTRACODE: нативные iOS-app UA (1:1 под NSURLSession).
+# CFNetwork/Darwin строго соответствуют поезду iOS: 1568.200.51/Darwin 24.5.0 = iOS 18.5,
+# 1568.100.1/Darwin 24.4.0 = iOS 18.4, 1496.0.7/Darwin 23.6.0 = iOS 17.6.
+# Это даёт трафик, неотличимый от реального приложения на iPhone в РФ.
+# shellcheck disable=SC2034
+UA_RUTUBE_APP=(
+"RUTUBE/3.21.1 (iPhone15,3; iOS 18.5; Scale/3.00) CFNetwork/1568.200.51 Darwin/24.5.0"
+"RUTUBE/3.21.0 (iPhone14,5; iOS 18.4; Scale/3.00) CFNetwork/1568.100.1 Darwin/24.4.0"
+"RUTUBE/3.19.2 (iPhone13,2; iOS 17.6; Scale/3.00) CFNetwork/1496.0.7 Darwin/23.6.0"
+)
+# shellcheck disable=SC2034
+UA_VKVIDEO_APP=(
+"VKVideo/1.42 (iPhone15,3; iOS 18.5; Scale/3.00) CFNetwork/1568.200.51 Darwin/24.5.0"
+"VKVideo/1.41 (iPhone14,7; iOS 18.4; Scale/3.00) CFNetwork/1568.100.1 Darwin/24.4.0"
+"com.vk.vkvideo/1.40 (iPhone13,3; iOS 17.6; Scale/3.00) CFNetwork/1496.0.7 Darwin/23.6.0"
+)
+# shellcheck disable=SC2034
+UA_OK_APP=(
+"OK/24.7.1 (iPhone15,2; iOS 18.5; ru) CFNetwork/1568.200.51 Darwin/24.5.0"
+"OK/24.6.2 (iPhone14,5; iOS 18.4; ru) CFNetwork/1568.100.1 Darwin/24.4.0"
+"ru.ok.iphone/24.5.0 (iPhone13,2; iOS 17.6; ru) CFNetwork/1496.0.7 Darwin/23.6.0"
+)
+# shellcheck disable=SC2034
+UA_LITRES_APP=(
+"Litres/3.112 (iPhone15,2; iOS 18.5; ru_RU) CFNetwork/1568.200.51 Darwin/24.5.0"
+"ReadAndListen/3.111 (iPhone14,7; iOS 18.4; ru_RU) CFNetwork/1568.100.1 Darwin/24.4.0"
+"ru.litres.ios.readandlisten/3.110 (iPhone13,2; iOS 17.6; ru_RU) CFNetwork/1496.0.7 Darwin/23.6.0"
+)
+
 # === Y18: РФ-streaming (KION/Wink/Кинопоиск/Окко/Premier/IVI) ===
 # Real юзер вечером смотрит фильмы/сериалы. KION/Wink — Ростелеком,
 # Кинопоиск — Яндекс, Окко — Sber, Premier — Газпром Медиа, IVI — independent.
@@ -4102,6 +4222,55 @@ COOKIE_PERSIST_DIR="/var/lib/vps-noise/cookies"
 mkdir -p "$COOKIE_PERSIST_DIR" 2>/dev/null || true
 chmod 700 "$COOKIE_PERSIST_DIR" 2>/dev/null || true
 
+# === v8.20 ULTRACODE: RUTUBE (нативное iOS-приложение, client=ios) ===
+# shellcheck disable=SC2034
+URLS_RUTUBE=(
+"https://rutube.ru/"
+"https://rutube.ru/api/feeds/recommended/?client=ios&format=json&page=1"
+"https://rutube.ru/api/video/?format=json&page=1"
+"https://rutube.ru/api/tags/video/?format=json"
+"https://rutube.ru/api/playlist/custom/?format=json"
+"https://rutube.ru/api/feeds/history/?format=json"
+"https://rutube.ru/api/profile/me/?format=json"
+"https://rutube.ru/api/search/video/?format=json&query=сериал"
+)
+
+# === v8.20 ULTRACODE: VK Видео (отдельное iOS-приложение vkvideo.ru) ===
+# shellcheck disable=SC2034
+URLS_VKVIDEO=(
+"https://vkvideo.ru/"
+"https://vkvideo.ru/feed"
+"https://api.vk.com/method/video.getRecommended?v=5.251&count=20"
+"https://api.vk.com/method/video.get?v=5.251&count=20"
+"https://api.vk.com/method/catalog.getVideo?v=5.251"
+"https://api.vk.com/method/video.getCatalog?v=5.251&count=16"
+"https://vkvideo.ru/playlists"
+)
+
+# === v8.20 ULTRACODE: Одноклассники / OK (нативное iOS-приложение ru.ok.iphone) ===
+# shellcheck disable=SC2034
+URLS_OK_RU=(
+"https://ok.ru/"
+"https://m.ok.ru/"
+"https://api.ok.ru/fb.do?method=stream.get&application_key=CBACCCGEBABABABABA"
+"https://api.ok.ru/api/video/getList"
+"https://api.ok.ru/api/discovery/feed"
+"https://api.ok.ru/api/users/getCurrentUser"
+"https://mob.ok.ru/feed"
+)
+
+# === v8.20 ULTRACODE: ЛитРес / Litres (iOS «Читай и Слушай», foundation API) ===
+# shellcheck disable=SC2034
+URLS_LITRES=(
+"https://www.litres.ru/"
+"https://m.litres.ru/"
+"https://api.litres.ru/foundation/api/genres"
+"https://api.litres.ru/foundation/api/arts/?limit=20&offset=0"
+"https://api.litres.ru/foundation/api/arts/recommendations/?limit=20"
+"https://api.litres.ru/foundation/api/me/library/?limit=20"
+"https://www.litres.ru/pages/catalit_browser/?checkpoint=2000-01-01"
+)
+
 # Per-session referer (имитирует браузерную навигационную цепочку:
 # главная → статья → статья → ... — тот же session, тот же Referer).
 declare -A LAST_URL_PER_TAG
@@ -4229,6 +4398,11 @@ _pick_ua_pool() {
         # v8.12 (X10): app-specific UA pools.
         vk_app)     echo "${UA_VK_APP[$(urand 0 $(( ${#UA_VK_APP[@]} - 1 )) )]}" ;;
         yandex_app) echo "${UA_YANDEX_APP[$(urand 0 $(( ${#UA_YANDEX_APP[@]} - 1 )) )]}" ;;
+        # v8.20 ULTRACODE: native iOS-app UA pools (CFNetwork/Darwin, 1:1).
+        rutube_app)   echo "${UA_RUTUBE_APP[$(urand 0 $(( ${#UA_RUTUBE_APP[@]} - 1 )) )]}" ;;
+        vkvideo_app)  echo "${UA_VKVIDEO_APP[$(urand 0 $(( ${#UA_VKVIDEO_APP[@]} - 1 )) )]}" ;;
+        ok_app)       echo "${UA_OK_APP[$(urand 0 $(( ${#UA_OK_APP[@]} - 1 )) )]}" ;;
+        litres_app)   echo "${UA_LITRES_APP[$(urand 0 $(( ${#UA_LITRES_APP[@]} - 1 )) )]}" ;;
         # v8.15: ранее эти пулы были «мёртвым кодом» — loop'ы слали mobile_ru
         # и реальные app-UA не использовались. Теперь loop'ы передают свой kind,
         # и нативный трафик получает корректный app-UA + app-header-набор.
@@ -4939,6 +5113,108 @@ streaming_burst() {
         sleep "$(rrange 5 30)"
     done
 }
+# === v8.20 ULTRACODE: РФ-видео RUTUBE (нативный iOS-клиент) ===
+# Вечерний пользователь: рекомендации -> просмотр -> поиск. dwell как у video-app.
+rutube_burst() {
+    [ "${ENABLE_RUTUBE_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_RUTUBE[@]}" -gt 0 ] || return 0
+    local url n i
+    n=$(urand 2 5)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_RUTUBE[$(urand 0 $(( ${#URLS_RUTUBE[@]} - 1 )) )]}"
+        http_request "$url" rutube_app ru rutube api
+        sleep "$(urand 8 45)"
+    done
+}
+loop_rutube() {
+    [ "${ENABLE_RUTUBE_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        local _h; _h=$(_local_hour_ru)
+        if [ "$_h" -ge 18 ] && [ "$_h" -le 23 ]; then sleep_minutes 40 110; else sleep_minutes 180 540; fi
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        rutube_burst
+    done
+}
+
+# === v8.20 ULTRACODE: VK Видео (отдельное iOS-приложение) ===
+vkvideo_burst() {
+    [ "${ENABLE_VKVIDEO_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_VKVIDEO[@]}" -gt 0 ] || return 0
+    local url n i
+    n=$(urand 2 5)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_VKVIDEO[$(urand 0 $(( ${#URLS_VKVIDEO[@]} - 1 )) )]}"
+        http_request "$url" vkvideo_app ru vkvideo api
+        sleep "$(urand 6 40)"
+    done
+}
+loop_vkvideo() {
+    [ "${ENABLE_VKVIDEO_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        local _h; _h=$(_local_hour_ru)
+        if [ "$_h" -ge 18 ] && [ "$_h" -le 23 ]; then sleep_minutes 45 120; else sleep_minutes 200 600; fi
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        vkvideo_burst
+    done
+}
+
+# === v8.20 ULTRACODE: Одноклассники / OK (соц-лента, нативный iOS) ===
+okru_burst() {
+    [ "${ENABLE_OKRU_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_OK_RU[@]}" -gt 0 ] || return 0
+    local url n i
+    n=$(urand 2 4)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_OK_RU[$(urand 0 $(( ${#URLS_OK_RU[@]} - 1 )) )]}"
+        http_request "$url" ok_app ru okru api
+        sleep "$(urand 5 30)"
+    done
+}
+loop_okru() {
+    [ "${ENABLE_OKRU_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # OK популярны у более взрослой аудитории — заходы днём и вечером.
+        sleep_minutes 90 360
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        okru_burst
+    done
+}
+
+# === v8.20 ULTRACODE: ЛитРес / Litres (чтение/аудиокниги, нативный iOS) ===
+litres_burst() {
+    [ "${ENABLE_LITRES_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    [ "${#URLS_LITRES[@]}" -gt 0 ] || return 0
+    local url n i
+    n=$(urand 1 3)
+    for ((i=0; i<n; i++)); do
+        url="${URLS_LITRES[$(urand 0 $(( ${#URLS_LITRES[@]} - 1 )) )]}"
+        http_request "$url" litres_app ru litres api
+        sleep "$(urand 15 90)"
+    done
+}
+loop_litres() {
+    [ "${ENABLE_LITRES_BURST:-1}" = "1" ] || return 0
+    [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
+    while true; do
+        # Чтение редкое: поздний вечер/выходные. Раз в несколько часов.
+        local _h; _h=$(_local_hour_ru)
+        if [ "$_h" -ge 21 ] || [ "$_h" -le 1 ]; then sleep_minutes 120 360; else sleep_minutes 360 900; fi
+        vacation_check_and_sleep
+        hard_sleep_suppress && continue
+        litres_burst
+    done
+}
+
 loop_streaming() {
     [ "${ENABLE_STREAMING_BURST:-1}" = "1" ] || return 0
     [ "${ENABLE_PERFECT_RU_USER:-1}" = "1" ] || return 0
@@ -5601,6 +5877,10 @@ PIDS=()
 [ "${ENABLE_STREAMING_BURST:-1}"  = "1" ] && { loop_streaming   & PIDS+=($!); } # v8.13 (Y18)
 [ "${ENABLE_MUSIC_BURST:-1}"      = "1" ] && { loop_music       & PIDS+=($!); } # v8.13 (Y19)
 [ "${ENABLE_TRAVEL_BURST:-1}"     = "1" ] && { loop_travel      & PIDS+=($!); } # v8.13 (Y20)
+[ "${ENABLE_RUTUBE_BURST:-1}"     = "1" ] && { loop_rutube      & PIDS+=($!); } # v8.20 ULTRACODE
+[ "${ENABLE_VKVIDEO_BURST:-1}"    = "1" ] && { loop_vkvideo     & PIDS+=($!); } # v8.20 ULTRACODE
+[ "${ENABLE_OKRU_BURST:-1}"       = "1" ] && { loop_okru        & PIDS+=($!); } # v8.20 ULTRACODE
+[ "${ENABLE_LITRES_BURST:-1}"     = "1" ] && { loop_litres      & PIDS+=($!); } # v8.20 ULTRACODE
 [ "${ENABLE_APPLE_RU_BURST:-1}"   = "1" ] && { loop_apple_ru    & PIDS+=($!); } # v8.13 (Y10)
 [ "${ENABLE_EDUCATIONAL:-0}"      = "1" ] && { loop_edu         & PIDS+=($!); } # v8.13 (Y15-EDU)
 loop_health & PIDS+=($!)
