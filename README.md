@@ -28,13 +28,17 @@ RPS/XPS/IRQ affinity, ZRAM, MPTCP, THP — and adds a **self-learning AI autotun
 
 ---
 
-## ✨ Highlights (v8.17 → v8.20 ULTRACODE)
+## ✨ Highlights (v8.17 → v8.21 ULTRACODE)
 
 | Area | Feature | Why it matters |
 |------|---------|----------------|
 | 🤖 **AI v8.20** | Smarter self-learning core | **UCB1** arm selection + **load-aware gating** + **EWMA Network-IQ** + **best-arm/regret memory**. Converges faster, refuses to learn under load, still pure-bash & disk-safe on the weakest VPS. |
 | 🎬 **White-noise v8.20** | Native iOS-app traffic | **RUTUBE · VK Видео · Одноклассники (OK) · ЛитРес** emulated 1:1 with real **CFNetwork/Darwin** app User-Agents — indistinguishable from an iPhone in RU. |
 | 🧬 **sysctl v8.20** | Rare/custom knobs | Compressed-SACK timing, ECN+fallback, pingpong-thresh, shrink-window, migrate-req, netdev budget — all probe-safe (skipped silently if the kernel lacks them). |
+| 🚦 **Queue v8.20** | Selectable qdisc + **noble-aqm** | Pick `fq` · `fq_codel` · `cake` · or the **custom `noble-aqm`** — an RTT-adaptive CAKE profile (auto memlimit, ACK-filter, diffserv4, split-gso, ingress shaping) that ships in *no other tool*. |
+| 🛡️ **Crash-guard v8.21** | Self-healing network | Snapshots qdisc state, applies the custom, **pings gateway + public resolvers, and auto-rolls-back** if connectivity drops — your box never gets locked out. |
+| 🚀 **BBR-max v8.21** | Safe BBR/BBRv3 | `BBR_FORCE=auto/bbr/bbr2/bbr3/cubic/reno` with **read-back verify + cubic fallback** + tuned companions (`notsent_lowat`, ECN). Safe on stock Ubuntu 24.04 (6.8). |
+| 🎚️ **Manual tuning v8.21** | Every custom is editable | Hand-set **all** `fq+` / `fq_codel+` / `noble-aqm` / BBR params via config or env — from the menu or `/etc/vps-noise.conf`. |
 | 🌐 **Resilience** | Multi-endpoint failover | Quorum-based connectivity check across a pool — survives single-endpoint / regional blocks. |
 | 🪝 **Extensibility** | User hook system | Drop scripts into `/etc/vps-optimizer.d/` — customise without forking. |
 | 🎭 **Stealth** | iOS service-mesh + Low Power Mode | Mimics the *daemon* traffic of an idle iPhone, not just Safari browsing. |
@@ -154,9 +158,79 @@ sudo ./vps_optimizer.sh dna     # Network DNA fingerprint + recommended preset
 | `NETTUNE_INTERVAL_SEC` / `NETTUNE_BOOT_SEC` | `900` / `300` | Timer cadence |
 | `LC_VPS_PROBE_HOSTS` / `LC_VPS_PROBE_QUORUM` | pool / `2` | Failover endpoints / quorum |
 | `LC_VPS_HOOK_DIR` | `/etc/vps-optimizer.d` | Hook directory |
+| `QDISC_MODE` | `auto` | Queue discipline: `auto`/`fq`/`fq_codel`/`cake`/`noble` (custom noble-aqm) |
 | `ENABLE_IOS_MESH` / `ENABLE_IOS_LOW_POWER` | `1` / `1` | iOS noise features |
 | `ENABLE_RUTUBE_BURST` / `ENABLE_VKVIDEO_BURST` | `1` / `1` | RUTUBE / VK Видео iOS traffic |
 | `ENABLE_OKRU_BURST` / `ENABLE_LITRES_BURST` | `1` / `1` | Одноклассники / ЛитРес iOS traffic |
+
+---
+
+## 🚦 Queue discipline selector (NEW)
+
+Choose how the kernel schedules packets — straight from the interactive menu
+(*Кастомизация* → *Алгоритм очереди*) or via the `QDISC_MODE` env var:
+
+| Mode | What it does |
+|------|--------------|
+| `auto` | Intelligent pick based on virtualization + BBR (recommended default) |
+| `fq` | **fq+** — hand-tuned pacing: EDT, `horizon` (5.14+), `ce_threshold` (L4S), `timer_slack` (5.17+), bigger buckets/quantum |
+| `fq_codel` | **fq_codel+** — L4S `ce_threshold 1ms`, RAM-scaled `memory_limit`, RTT-adaptive target/interval |
+| `cake` | Full noble CAKE profile **+ bidirectional ingress AQM** (IFB) |
+| `noble` | **🔥 Custom `noble-aqm`** — exclusive to this project |
+
+**`noble-aqm`** is a hand-built AQM profile that exists nowhere else. It:
+
+- measures live **RTT to the gateway** and feeds it into CAKE (`rtt <measured>ms`),
+- auto-scales **`memlimit`** to the box's RAM (4–64 MB envelope) so it never
+  bloats a 256 MB VPS,
+- enables **`ack-filter`**, **`diffserv4`**, **`dual-srchost`/`dual-dsthost`**,
+  **`split-gso`** and tuned **`overhead/mpu`** for VPN-style flows,
+- adds **bidirectional shaping** — download-side AQM via an `ifb-noble` IFB device,
+- uses a **multi-tier fallback** (full → medium → basic `tc` profile) so it loads on 6.x *and* old LTS kernels,
+- applies a hand-tuned **`fq_codel` fallback** (target/interval derived from RTT)
+  if `sch_cake` is missing — so it degrades gracefully on minimal kernels,
+- is fully **probe-safe & bounded** — failures are logged, never fatal.
+
+```bash
+# one-off
+sudo QDISC_MODE=noble ./vps_optimizer.sh
+# or persist in /etc/vps-noise.conf:  QDISC_MODE="noble"
+```
+
+---
+
+## 🛡️ Crash protection & manual tuning (v8.21)
+
+**Never lock yourself out.** Before any custom qdisc is applied, noble-net-warp
+takes a snapshot, applies the change, then verifies connectivity (gateway →
+`1.1.1.1`/`8.8.8.8`/`77.88.8.8`). If the link dies, it **auto-rolls-back**
+the qdisc/IFB and restores the previous `default_qdisc` — fully automatic.
+Toggle with `NETGUARD_ENABLE=1|0`.
+
+**BBR to the max, safely.** `apply_bbr_max` honours `BBR_FORCE`
+(`auto`/`bbr`/`bbr2`/`bbr3`/`cubic`/`reno`), **reads the value back** to
+confirm the kernel accepted it, and falls back to `cubic` if the module is
+missing — so a stock Ubuntu 24.04 kernel (6.8) can never end up with a dead CC.
+BBR-family picks also get tuned companions (`tcp_notsent_lowat`, ECN + fallback).
+
+**Everything is hand-editable** — from the menu (*Кастомизация* → qdisc/BBR →
+ручная настройка) or in `/etc/vps-noise.conf` / env:
+
+| Group | Knobs |
+|-------|-------|
+| Safety | `NETGUARD_ENABLE` |
+| BBR | `BBR_FORCE`, `TCP_NOTSENT_LOWAT` |
+| fq+ | `FQ_FLOW_LIMIT`, `FQ_QUANTUM`, `FQ_INITIAL_QUANTUM`, `FQ_BUCKETS`, `FQ_CE_THRESHOLD` |
+| fq_codel+ | `FQCODEL_LIMIT`, `FQCODEL_FLOWS`, `FQCODEL_QUANTUM`, `FQCODEL_TARGET`, `FQCODEL_INTERVAL`, `FQCODEL_CE`, `FQCODEL_ECN` |
+| noble-aqm | `NOBLE_RTT_MS`, `NOBLE_MEM_MB`, `NOBLE_DIFFSERV`, `NOBLE_FLOWMODE`, `NOBLE_ACKFILTER`, `NOBLE_OVERHEAD`, `NOBLE_MPU`, `NOBLE_INGRESS` |
+
+All values are range-validated (`_qnum`) — a bad number silently falls back to
+the safe default. Empty = auto.
+
+```bash
+# Example: force BBRv3 + custom noble-aqm with a hand-set RTT, no rollback risk
+sudo BBR_FORCE=bbr3 QDISC_MODE=noble NOBLE_RTT_MS=30 NOBLE_MEM_MB=16 ./vps_optimizer.sh
+```
 
 ---
 
