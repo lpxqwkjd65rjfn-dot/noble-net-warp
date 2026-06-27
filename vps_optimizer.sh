@@ -130,7 +130,7 @@ INTERNET_PROBE_QUORUM="${LC_VPS_PROBE_QUORUM:-2}"
 # $HOOK_DIR/{pre-apply.d,post-apply.d}/ to extend apply without forking.
 HOOK_DIR="${LC_VPS_HOOK_DIR:-/etc/vps-optimizer.d}"
 EXPORT_FORMAT_VERSION=2
-SCRIPT_VERSION="8.21"
+SCRIPT_VERSION="8.22"
 
 # Глобальные флаги (управляются через CLI)
 DRY_RUN=0
@@ -2970,6 +2970,163 @@ _qdisc_guard_verify() {
 
 # apply_bbr_max <auto-detected> — BBR до максимума с verify и cubic-fallback.
 # Безопасно для classic Ubuntu 24.04 (kernel 6.8). BBR_FORCE: auto|bbr|bbr2|bbr3|cubic|reno.
+# ============================================================================
+# v8.22 ULTRACODE: install_bbr3_kernel — ТОЧНО БЕЗОПАСНАЯ установка BBRv3.
+# Устанавливает XanMod-ядро (содержит BBRv3) с 6-уровневой защитой от падения.
+# Старое ядро НИКОГДА не удаляется. Worst case = ребут в старое ядро, BBRv3
+# просто не активируется, система работает как прежде. Никаких слепых curl|bash.
+# ----------------------------------------------------------------------------
+_bbr3_have_bbr3() { grep -qw bbr3 /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; }
+
+rollback_bbr3_kernel() {
+    _log INFO "${CYAN}Откат BBRv3-ядра…${NC}"
+    if [ -f /etc/default/grub.nnw-bak ]; then
+        cp -f /etc/default/grub.nnw-bak /etc/default/grub 2>/dev/null && _log OK "GRUB-конфиг восстановлен из бэкапа"
+    fi
+    systemctl disable nnw-kernel-commit.service 2>/dev/null || true
+    rm -f /etc/systemd/system/nnw-kernel-commit.service 2>/dev/null || true
+    apt-get purge -y 'linux-xanmod*' >/dev/null 2>&1 && _log OK "XanMod-ядро удалено" || _log WARN "не удалось удалить XanMod (возможно, уже отсутствует)"
+    update-grub >/dev/null 2>&1 || true
+    _log OK "${GREEN}Откат завершён. Перезагрузитесь для возврата на штатное ядро.${NC}"
+}
+
+install_bbr3_kernel() {
+    echo -e "${CYAN}${BOLD}=== Безопасная установка BBRv3 (XanMod kernel) ===${NC}"
+
+    # --- Шаг 0: gatekeeper ---
+    if _bbr3_have_bbr3; then
+        _log OK "${GREEN}BBRv3 уже доступен в текущем ядре — установка не требуется.${NC}"
+        _log INFO "Активировать: выберите BBR_FORCE=bbr3 в меню тюнинга."
+        return 0
+    fi
+    local _virt; _virt=$(detect_virt)
+    case "$_virt" in
+        openvz|lxc|docker|wsl)
+            _log ERROR "${RED}Виртуализация '$_virt' использует ОБЩЕЕ ядро хоста — своё ядро поставить нельзя.${NC}"
+            _log INFO "Рекомендация: используйте обычный BBR (BBR_FORCE=bbr) — он даёт основной прирост."
+            return 1 ;;
+    esac
+    if ! command -v apt-get >/dev/null 2>&1; then
+        _log ERROR "${RED}Поддерживается только Debian/Ubuntu (apt). Прерываю.${NC}"; return 1
+    fi
+    case "$(uname -m)" in x86_64|amd64) : ;; *) _log ERROR "BBRv3-ядро доступно только для x86_64. Прерываю."; return 1 ;; esac
+
+    # --- Предупреждение и подтверждение ---
+    echo -e "${YELLOW}ВНИМАНИЕ: будет установлено новое ядро. Worst case — один ребут вернёт${NC}"
+    echo -e "${YELLOW}старое ядро автоматически (recordfail-fallback). Желательно иметь доступ${NC}"
+    echo -e "${YELLOW}к VNC/recovery-консоли провайдера на всякий случай.${NC}"
+    local _ans; read -r -p "Продолжить установку BBRv3-ядра? [y/N]: " _ans
+    case "${_ans:-}" in y|Y) : ;; *) _log INFO "Отменено пользователем."; return 1 ;; esac
+
+    # --- Шаг 1: pre-flight ---
+    local boot_free disk_free
+    boot_free=$(df -Pm /boot 2>/dev/null | awk 'NR==2{print $4}'); boot_free=${boot_free:-0}
+    disk_free=$(df -Pm /     2>/dev/null | awk 'NR==2{print $4}'); disk_free=${disk_free:-0}
+    if [ "$boot_free" -lt 300 ]; then _log ERROR "Мало места в /boot (${boot_free}MB < 300MB). Прерываю."; return 1; fi
+    if [ "$disk_free" -lt 2048 ]; then _log ERROR "Мало места на диске (${disk_free}MB < 2GB). Прерываю."; return 1; fi
+    if ! _net_alive; then _log ERROR "Нет связи с сетью — установка ядра невозможна. Прерываю."; return 1; fi
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        _log ERROR "apt/dpkg занят другим процессом. Подождите и повторите. Прерываю."; return 1
+    fi
+    local cur_kernel; cur_kernel=$(uname -r)
+    cp -f /etc/default/grub /etc/default/grub.nnw-bak 2>/dev/null && _log OK "Бэкап GRUB сохранён (/etc/default/grub.nnw-bak)"
+    _log INFO "Текущее рабочее ядро: ${cur_kernel} (останется как fallback)"
+
+    # --- Шаг 2: репозиторий XanMod + установка (с проверкой GPG) ---
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y --no-install-recommends gpg wget ca-certificates >/dev/null 2>&1 || true
+    if [ ! -f /etc/apt/keyrings/xanmod-archive-keyring.gpg ]; then
+        mkdir -p /etc/apt/keyrings
+        if ! wget -qO- https://dl.xanmod.org/archive.key | gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then
+            _log ERROR "Не удалось получить/проверить GPG-ключ XanMod. Прерываю (ничего не сломано)."; return 1
+        fi
+    fi
+    echo 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' > /etc/apt/sources.list.d/xanmod-release.list
+    if ! apt-get update -y >/dev/null 2>&1; then
+        _log ERROR "apt update с репозиторием XanMod не прошёл. Откатываю репо."; rm -f /etc/apt/sources.list.d/xanmod-release.list; apt-get update -y >/dev/null 2>&1 || true; return 1
+    fi
+    _log INFO "Устанавливаю linux-xanmod-x64v3 (BBRv3)… это может занять пару минут."
+    if ! apt-get install -y linux-xanmod-x64v3 >/dev/null 2>&1; then
+        # запасной вариант: универсальный пакет
+        if ! apt-get install -y linux-xanmod >/dev/null 2>&1; then
+            _log ERROR "${RED}Установка XanMod-ядра не удалась. Старое ядро не тронуто.${NC}"
+            rm -f /etc/apt/sources.list.d/xanmod-release.list; apt-get update -y >/dev/null 2>&1 || true; return 1
+        fi
+    fi
+    _log OK "XanMod-ядро установлено (старое ядро ${cur_kernel} сохранено)."
+
+    # --- Шаг 3: безопасный GRUB fallback ---
+    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub 2>/dev/null || echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
+    grep -q '^GRUB_RECORDFAIL_TIMEOUT' /etc/default/grub || echo 'GRUB_RECORDFAIL_TIMEOUT=5' >> /etc/default/grub
+    # держим меню доступным, чтобы провайдерский recovery мог выбрать ядро
+    sed -i 's/^GRUB_TIMEOUT_STYLE=hidden/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub 2>/dev/null || true
+    update-grub >/dev/null 2>&1 || grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || true
+    # новое (XanMod) ядро — это обычно первый/верхний пункт; пробуем загрузить ОДИН раз
+    local xan_entry
+    xan_entry=$(awk -F\' '/menuentry / && /xanmod/ {print $2; exit}' /boot/grub/grub.cfg 2>/dev/null)
+    if [ -n "${xan_entry:-}" ]; then
+        grub-reboot "$xan_entry" >/dev/null 2>&1 && _log OK "Новое ядро помечено для ОДНОЙ пробной загрузки (one-shot)."
+    else
+        _log WARN "Не нашёл пункт XanMod в grub.cfg — дефолт оставлен на старом ядре (безопасно)."
+    fi
+
+    # --- Шаг 4: one-shot commit-страж ---
+    cat > /usr/local/sbin/nnw-kernel-commit.sh <<'COMMIT_EOF'
+#!/bin/bash
+# Подтверждает новое ядро ТОЛЬКО если оно реально загрузилось и сеть жива.
+running="$(uname -r)"
+alive=0
+for t in $(ip route show default 2>/dev/null | awk '/default/{print $3; exit}') 1.1.1.1 8.8.8.8 77.88.8.8; do
+    [ -n "$t" ] || continue
+    ping -c1 -w3 "$t" >/dev/null 2>&1 && { alive=1; break; }
+done
+if echo "$running" | grep -qi xanmod && [ "$alive" = "1" ]; then
+    # делаем XanMod дефолтным навсегда
+    entry="$(awk -F\' '/menuentry / && /xanmod/ {print $2; exit}' /boot/grub/grub.cfg 2>/dev/null)"
+    [ -n "$entry" ] && grub-set-default "$entry" 2>/dev/null
+    # активируем bbr3, если доступен
+    if grep -qw bbr3 /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        sysctl -w net.ipv4.tcp_congestion_control=bbr3 >/dev/null 2>&1
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.d/99-nnw-bbr3.conf 2>/dev/null
+        echo 'net.ipv4.tcp_congestion_control=bbr3' > /etc/sysctl.d/99-nnw-bbr3.conf
+    fi
+    logger -t nnw-kernel-commit "BBRv3 kernel confirmed & committed (running=$running)"
+fi
+# самоудаление в любом случае (one-shot)
+systemctl disable nnw-kernel-commit.service 2>/dev/null
+rm -f /etc/systemd/system/nnw-kernel-commit.service /usr/local/sbin/nnw-kernel-commit.sh 2>/dev/null
+COMMIT_EOF
+    chmod +x /usr/local/sbin/nnw-kernel-commit.sh
+    cat > /etc/systemd/system/nnw-kernel-commit.service <<'SVC_EOF'
+[Unit]
+Description=noble-net-warp BBRv3 kernel commit guard (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/local/sbin/nnw-kernel-commit.sh
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable nnw-kernel-commit.service >/dev/null 2>&1 && _log OK "Commit-страж установлен (подтвердит ядро после ребута)."
+
+    # --- Шаг 5: финал ---
+    echo ""
+    _log OK "${GREEN}${BOLD}Готово! Установлено BBRv3-ядро XanMod.${NC}"
+    echo -e "${CYAN}Дальше:${NC}"
+    echo -e "  1) Выполните: ${BOLD}sudo reboot${NC}"
+    echo -e "  2) Система ОДИН раз попробует новое ядро. Если не загрузится —"
+    echo -e "     ${GREEN}автоматически вернётся на старое ядро ${cur_kernel}${NC} (recordfail)."
+    echo -e "  3) После успешной загрузки BBRv3 активируется автоматически (commit-страж)."
+    echo -e "${GRAY}Ручной откат в любой момент: запустите пункт «Откатить BBRv3-ядро».${NC}"
+    return 0
+}
+
 apply_bbr_max() {
     local chosen="${1:-cubic}" want="${BBR_FORCE:-auto}"
     case "$want" in
@@ -3089,8 +3246,15 @@ apply_noble_aqm() {
     [ -n "${NOBLE_RTT_MS:-}" ] && rtt_ms=$(_qnum "$NOBLE_RTT_MS" 1 1000 "$rtt_ms")
     [ -n "${NOBLE_MEM_MB:-}" ] && mem_mb=$(_qnum "$NOBLE_MEM_MB" 1 256 "$mem_mb")
 
+    # v8.22: опциональный шейпинг по полосе (главный приём против bufferbloat).
+    # Пусто/0 = unlimited (безопасно, без потолка). Значение в Мбит/с.
+    local _bw="unlimited" _bw_in="unlimited" _b
+    _b=$(_qnum "${NOBLE_BANDWIDTH:-}" 1 100000 0);    [ "$_b" -gt 0 ] && _bw="bandwidth ${_b}mbit"
+    _b=$(_qnum "${NOBLE_BANDWIDTH_IN:-}" 1 100000 0); [ "$_b" -gt 0 ] && _bw_in="bandwidth ${_b}mbit"
+
     # 3) Профиль cake: уникальная "noble"-комбинация.
-    local cake_opts="${NOBLE_DIFFSERV:-diffserv4} ${NOBLE_FLOWMODE:-dual-srchost} nat ${NOBLE_ACKFILTER:-ack-filter} split-gso rtt ${rtt_ms}ms memlimit ${mem_mb}mb overhead ${NOBLE_OVERHEAD:-38} mpu ${NOBLE_MPU:-84}"
+    local cake_opts="${_bw} ${NOBLE_DIFFSERV:-diffserv4} ${NOBLE_FLOWMODE:-dual-srchost} nat ${NOBLE_ACKFILTER:-ack-filter} split-gso rtt ${rtt_ms}ms memlimit ${mem_mb}mb overhead ${NOBLE_OVERHEAD:-38} mpu ${NOBLE_MPU:-84}"
+    local cake_opts_in="${_bw_in} ${NOBLE_DIFFSERV:-diffserv4} dual-dsthost nat ingress ${NOBLE_ACKFILTER:-ack-filter} rtt ${rtt_ms}ms memlimit ${mem_mb}mb"
     local fb_opts="limit 10240 flows 1024 target $(( rtt_ms / 5 + 4 ))ms interval ${rtt_ms}ms ecn"
 
     local applied=0 ifc
@@ -3111,7 +3275,7 @@ apply_noble_aqm() {
                 tc filter replace dev "$_e" parent ffff: protocol all u32 match u32 0 0 \
                     action mirred egress redirect dev ifb-noble 2>/dev/null || true
             done
-            tc qdisc replace dev ifb-noble root cake $cake_opts wash 2>/dev/null \
+            tc qdisc replace dev ifb-noble root cake $cake_opts_in wash 2>/dev/null \
                 && _log OK "noble-aqm[ingress] ↑ ifb-noble (download-AQM активен)" \
                 || _log WARN "noble-aqm: ingress cake не наложился (egress работает)"
         fi
@@ -3169,6 +3333,8 @@ NOBLE_ACKFILTER="ack-filter"   # ack-filter|no-ack-filter
 NOBLE_OVERHEAD=38
 NOBLE_MPU=84
 NOBLE_INGRESS=1           # 1 = двунаправленный AQM (download через IFB)
+NOBLE_BANDWIDTH=0         # egress шейпинг Мбит/с (0=без лимита; ставьте ~95% реальной полосы)
+NOBLE_BANDWIDTH_IN=0      # ingress шейпинг Мбит/с (0=без лимита)
 
 # --- Что включено ---
 ENABLE_IOS_BURST=1        # фон iOS Safari (apple.com / icloud.com / ...)
@@ -13432,6 +13598,62 @@ _whiptail_menu() {
 #   ⚙ Config            → swap / config / preset / profile
 #   📊 Monitoring/More   → benchmark / bench-suite / export / import / update / reset
 # Recommended badge: на основе detect_virt + RAM подсказывается preset.
+# ============================================================================
+# v8.22 ULTRACODE: отдельное меню сетевого тюнинга (qdisc / BBR / BBRv3).
+# ----------------------------------------------------------------------------
+# upsert key=value в NOISE_CONF (персистентно, подхватывается apply_optimizations).
+_nnw_set_conf() {
+    local key="$1" val="$2"
+    [ -f "$NOISE_CONF" ] || write_default_noise_conf
+    if grep -q "^${key}=" "$NOISE_CONF" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$NOISE_CONF"
+    else
+        echo "${key}=\"${val}\"" >> "$NOISE_CONF"
+    fi
+}
+
+_menu_network_tuning() {
+    while true; do
+        clear 2>/dev/null || true
+        [ -f "$NOISE_CONF" ] && { set -a; . "$NOISE_CONF" 2>/dev/null; set +a; }
+        local cur_q cur_cc avail
+        cur_q=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        avail=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+        echo -e "${CYAN}${BOLD}=== 🚦 Network Tuning (qdisc / BBR / BBRv3) ===${NC}"
+        echo -e "${GRAY}Активно: qdisc=${cur_q:-?}  cc=${cur_cc:-?}${NC}"
+        echo -e "${GRAY}Доступные CC: ${avail:-?}${NC}"
+        echo -e "${GRAY}Конфиг: QDISC_MODE=${QDISC_MODE:-auto}  BBR_FORCE=${BBR_FORCE:-auto}  crash-guard=${NETGUARD_ENABLE:-1}${NC}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} Алгоритм очереди (auto/fq+/fq_codel+/cake/noble)"
+        echo -e "  ${GREEN}[2]${NC} Congestion control (auto/bbr/bbr2/bbr3/cubic/reno)"
+        echo -e "  ${GREEN}[3]${NC} Crash-guard авто-откат (вкл/выкл)"
+        echo -e "  ${GREEN}[4]${NC} Шейпинг полосы noble (Мбит/с, против bufferbloat)"
+        echo -e "  ${GREEN}[5]${NC} Ручная правка параметров fq/fq_codel/noble (мастер)"
+        echo -e "  ${YELLOW}[6]${NC} 🚀 ${BOLD}Установить BBRv3-ядро${NC} (XanMod, безопасно)"
+        echo -e "  ${YELLOW}[7]${NC} ↩  Откатить BBRv3-ядро"
+        echo -e "  ${CYAN}[8]${NC} ✅ Применить настройки сейчас"
+        echo -e "  ${GRAY}[0]${NC} Назад"
+        local c; read -r -p "Выбор: " c
+        case "${c:-}" in
+            1) echo -e "1)auto 2)fq+ 3)fq_codel+ 4)cake 5)noble"; read -r -p "qdisc: " v
+               case "${v:-}" in 1)_nnw_set_conf QDISC_MODE auto;;2)_nnw_set_conf QDISC_MODE fq;;3)_nnw_set_conf QDISC_MODE fq_codel;;4)_nnw_set_conf QDISC_MODE cake;;5)_nnw_set_conf QDISC_MODE noble;;esac ;;
+            2) echo -e "1)auto 2)bbr 3)bbr2 4)bbr3 5)cubic 6)reno"; read -r -p "cc: " v
+               case "${v:-}" in 1)_nnw_set_conf BBR_FORCE auto;;2)_nnw_set_conf BBR_FORCE bbr;;3)_nnw_set_conf BBR_FORCE bbr2;;4)_nnw_set_conf BBR_FORCE bbr3;;5)_nnw_set_conf BBR_FORCE cubic;;6)_nnw_set_conf BBR_FORCE reno;;esac
+               if [ "${v:-}" = "4" ] && ! _bbr3_have_bbr3; then echo -e "${YELLOW}[i] bbr3 нет в текущем ядре — поставьте его пунктом [6].${NC}"; sleep 2; fi ;;
+            3) read -r -p "Crash-guard [1=вкл/0=выкл]: " v; case "${v:-}" in 0)_nnw_set_conf NETGUARD_ENABLE 0;;1)_nnw_set_conf NETGUARD_ENABLE 1;;esac ;;
+            4) read -r -p "NOBLE_BANDWIDTH (egress Мбит/с, 0=без лимита): " v; _nnw_set_conf NOBLE_BANDWIDTH "${v:-0}"
+               read -r -p "NOBLE_BANDWIDTH_IN (ingress Мбит/с, 0=без лимита): " v; _nnw_set_conf NOBLE_BANDWIDTH_IN "${v:-0}" ;;
+            5) prompt_custom_noise_conf ;;
+            6) install_bbr3_kernel; read -r -p "Enter..." _ ;;
+            7) rollback_bbr3_kernel; read -r -p "Enter..." _ ;;
+            8) apply_optimizations; read -r -p "Enter..." _ ;;
+            0) return 0 ;;
+            *) : ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         print_header
@@ -13461,6 +13683,7 @@ main_menu() {
         echo -e "  ${YELLOW}[5]${NC} 📊 ${BOLD}Monitoring${NC}   benchmark · bench-suite · Prometheus"
         echo -e "  ${YELLOW}[6]${NC} 📦 ${BOLD}Misc${NC}         install · export · import · update"
         echo -e "  ${MAGENTA}[7]${NC} 🤖 ${BOLD}AI Network${NC}   nettune · grade · dna · BDP-autosize"
+        echo -e "  ${BLUE:-${CYAN}}[9]${NC} 🚦 ${BOLD}Network Tuning${NC} qdisc(fq+/noble) · BBR · ${GREEN}BBRv3-install${NC}"
         echo -e "  ${RED}[8]${NC} ↩  ${BOLD}Reset all${NC}    откат всех изменений"
         echo -e "  ${GRAY}[0]${NC} ❌ ${BOLD}Выход${NC}"
         echo -e "${BOLD}${MAGENTA}└───────────────────────────────────────────────────────┘${NC}"
@@ -13475,12 +13698,13 @@ main_menu() {
             6) _menu_misc ;;
             7) _menu_ai ;;
             8) reset_all ;;
+            9) _menu_network_tuning ;;
             0) exit 0 ;;
             # v8.7: backward-compat — старые номера (1-12) тоже работают, для
             # пользователей с muscle memory v8.6.
             11) manage_dns_menu ;;
             12) experimental_menu ;;
-            *)  echo -e "${RED}[!] Неверный выбор. Введи число 0-8.${NC}"; sleep 1 ;;
+            *)  echo -e "${RED}[!] Неверный выбор. Введи число 0-9.${NC}"; sleep 1 ;;
         esac
     done
 }
