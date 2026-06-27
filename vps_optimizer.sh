@@ -3336,9 +3336,9 @@ prompt_custom_noise_conf() {
     echo ""
     echo -e "${CYAN}-- Алгоритм очереди (qdisc) --${NC}"
     echo -e "  ${BOLD}1${NC}) auto      — интеллектуальный авто-выбор (рекомендуется)"
-    echo -e "  ${BOLD}2${NC}) fq        — pacing-friendly, лучший для BBR"
-    echo -e "  ${BOLD}3${NC}) fq_codel  — классика, минимальный bloat"
-    echo -e "  ${BOLD}4${NC}) cake      — продвинутый shaping/AQM"
+    echo -e "  ${BOLD}2${NC}) fq+       — ${GREEN}улучшенный fq${NC} (EDT-pacing, horizon, L4S ce_threshold)"
+    echo -e "  ${BOLD}3${NC}) fq_codel+ — ${GREEN}улучшенный${NC} (L4S ce/mem, RTT-target, anti-bloat)"
+    echo -e "  ${BOLD}4${NC}) cake      — продвинутый shaping/AQM + двунапр. ingress"
     echo -e "  ${BOLD}5${NC}) noble     — ${GREEN}КАСТОМНЫЙ noble-aqm${NC} (RTT-адаптивный cake + ingress)"
     read -r -p "Выбор [1-5, текущий: ${QDISC_MODE:-auto}]: " v
     case "${v:-}" in
